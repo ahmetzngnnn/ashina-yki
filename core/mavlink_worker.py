@@ -1,0 +1,1052 @@
+"""
+mavlink_worker.py — Telemetri Motoru
+MAVLink bağlantısı: Serial / TCP / UDP
+Yakalanan paketler: HEARTBEAT, VFR_HUD, ATTITUDE, SYS_STATUS,
+                    GLOBAL_POSITION_INT, PARAM_VALUE, LOG_ENTRY
+"""
+import queue
+import time
+import logging
+from typing import Any, Optional
+from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot
+from pymavlink import mavutil
+from core import local_storage
+
+logger = logging.getLogger(__name__)
+
+
+_COPTER_MODES = {
+    0: "STABILIZE", 1: "ACRO", 2: "ALT_HOLD", 3: "AUTO",
+    4: "GUIDED", 5: "LOITER", 6: "RTL", 7: "CIRCLE",
+    9: "LAND", 11: "DRIFT", 13: "SPORT", 14: "FLIP",
+    15: "AUTOTUNE", 16: "POSHOLD", 17: "BRAKE", 18: "THROW",
+    19: "AVOID_ADSB", 20: "GUIDED_NOGPS", 21: "SMART_RTL",
+    23: "FLOWHOLD", 24: "FOLLOW", 25: "ZIGZAG",
+}
+
+_GPS_FIX_NAMES = {0: "No GPS", 1: "No Fix", 2: "2D", 3: "3D", 4: "DGPS", 5: "RTK Float", 6: "RTK Fixed"}
+
+
+class MavlinkWorker(QThread):
+    # Sinyaller
+    telemetry_updated = pyqtSignal(dict)      # 10 Hz
+    param_received = pyqtSignal(str, float)
+    log_entry_received = pyqtSignal(dict)
+    connection_changed = pyqtSignal(bool)
+    error_occurred = pyqtSignal(str)
+    status_text_received = pyqtSignal(str, int)   # text, severity
+    mag_cal_progress = pyqtSignal(int, int, float)  # compass_id, pct, fitness
+    mag_cal_report = pyqtSignal(int, int, float)    # compass_id, cal_status, fitness
+    mission_upload_progress = pyqtSignal(int, int)  # seq, total
+    mission_upload_done = pyqtSignal(bool, str)     # success, message
+    mission_download_done = pyqtSignal(bool, list, str) # success, waypoints, message
+    flight_sequence_status = pyqtSignal(str)        # status text
+    log_download_progress = pyqtSignal(int, int)    # bytes_received, total_bytes
+    log_download_done = pyqtSignal(bool, str, bytes)  # success, filename, raw_data
+    home_position_updated = pyqtSignal(float, float, float)  # lat, lon, alt_m
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.heartbeat_counter: int = 0
+        self._connection_string: str = ""
+        self._baud: int = 57600
+        self._mav: Any = None
+        # queue.Queue thread-safe: UI thread put, worker thread get
+        self._command_queue: queue.Queue = queue.Queue(maxsize=64)
+        self._ned_vel_queue: queue.Queue = queue.Queue(maxsize=32)
+        self._last_heartbeat_time: float = 0.0
+        self._telemetry_accumulator: dict = {}
+        self._telemetry_tick: int = 0
+        # Gerçek autopilot kimliği (is_autopilot heartbeat'inden):
+        # wait_heartbeat target_component=0 (broadcast) yakalayabilir;
+        # bunu kullanırsak komutlar MAVProxy gibi ara komponentlerle de
+        # işlenir → mission upload bozulur. Doğru hedef: autopilot=(1,1).
+        self._autopilot_sys: int = 0
+        self._autopilot_comp: int = 0
+        self._upload_waypoints: Optional[list] = None
+        self._download_mission_pending: bool = False
+        self._flight_seq_pending: bool = False
+        self._stored_flight_alt: float = 15.0
+        self._log_download_pending: int = -1  # -1 = yok
+        # Parametre cache — param_total dolunca batch DB yazımı tetiklenir
+        self._param_cache: dict = {}
+        self._param_total: int = 0   # PARAM_VALUE.param_count'tan doldurulur
+        self._db_conn = None         # set_db_conn() ile atanır
+
+    def set_db_conn(self, db_conn) -> None:
+        """SQLite bağlantısını atar — parametre cache DB'ye yazılır."""
+        self._db_conn = db_conn
+
+    def set_connection(self, conn_str: str, baud: int = 57600) -> None:
+        """Yeni bağlantı dizisi + baudrate atar ve aktif bağlantıyı keser."""
+        self._connection_string = conn_str
+        self._baud = baud
+        if self._mav is not None:
+            try:
+                self._mav.close()
+            except Exception:
+                pass
+            self._mav = None
+
+    def set_connection_string(self, conn_str: str) -> None:
+        """Geriye dönük uyumluluk — baudrate değişmez."""
+        self.set_connection(conn_str, self._baud)
+
+    def run(self) -> None:
+        reconnect_backoff = 1.0
+        while not self.isInterruptionRequested():
+            self.heartbeat_counter += 1  # watchdog: her döngüde artır
+            try:
+                self._connect_and_listen()
+                reconnect_backoff = 1.0  # temiz çıkış → backoff sıfırla
+            except Exception as exc:
+                # 10038 (WSAENOTSOCK) veya 9 (EBADF) bağlantı manuel kesildiğinde olağandır.
+                if "10038" in str(exc) or "Bad file descriptor" in str(exc):
+                    pass
+                else:
+                    logger.error("MavlinkWorker run() exception: %s", exc)
+                    self.error_occurred.emit(str(exc))
+                self.connection_changed.emit(False)
+                # Eski socket'i kapat, ama bağlantı dizesini KORU →
+                # SITL/uçak yeniden açıldığında otomatik tekrar bağlan.
+                if self._mav is not None:
+                    try:
+                        self._mav.close()
+                    except Exception:
+                        pass
+                    self._mav = None
+                # Üstel backoff (1s → 2s → 4s → 8s, max 8s)
+                time.sleep(reconnect_backoff)
+                reconnect_backoff = min(reconnect_backoff * 2.0, 8.0)
+
+    def _connect_and_listen(self) -> None:
+        if not self._connection_string:
+            time.sleep(0.5)
+            return
+
+        logger.info("MAVLink bağlanıyor: %s  baud=%d", self._connection_string, self._baud)
+        try:
+            self._mav = mavutil.mavlink_connection(self._connection_string, baud=self._baud)
+            self._mav.wait_heartbeat(timeout=10)
+        except Exception as exc:
+            raise ConnectionError(f"Bağlantı kurulamadı: {exc}") from exc
+
+        self.connection_changed.emit(True)
+        self._last_heartbeat_time = time.time()
+
+        # Veri akışı iste (SET_MESSAGE_INTERVAL — modern ArduPilot)
+        try:
+            self._request_streams()
+        except Exception:
+            pass
+
+        # Bağlanma anında tüm parametreleri iste
+        try:
+            self._mav.mav.param_request_list_send(
+                self._mav.target_system, self._mav.target_component
+            )
+        except Exception:
+            pass
+
+        while not self.isInterruptionRequested():
+            # Watchdog heartbeat artır
+            self.heartbeat_counter += 1
+
+            # Sistemize heartbeat gönder (1 Hz)
+            try:
+                self._mav.mav.heartbeat_send(
+                    mavutil.mavlink.MAV_TYPE_GCS,
+                    mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                    0, 0, 0,
+                )
+            except Exception:
+                pass
+
+            # Komut kuyruğu işle (thread-safe drain)
+            while True:
+                try:
+                    cmd = self._command_queue.get_nowait()
+                    self._execute_command(cmd)
+                except queue.Empty:
+                    break
+
+            # NED hız komutları (yalnızca en güncel komutu gönder)
+            last_vel = None
+            while True:
+                try:
+                    last_vel = self._ned_vel_queue.get_nowait()
+                except queue.Empty:
+                    break
+            if last_vel is not None:
+                self._execute_ned_velocity(*last_vel)
+
+            # Görev yükleme (bloklar — telemetri geçici olarak durur)
+            if self._upload_waypoints is not None:
+                wps = self._upload_waypoints
+                self._upload_waypoints = None
+                self._do_mission_upload(wps)
+                continue
+                
+            # Görev indirme (bloklar — telemetri geçici olarak durur)
+            if self._download_mission_pending:
+                self._download_mission_pending = False
+                self._do_mission_download()
+                continue
+
+            # Uçuş sekansı (bloklar ~20s)
+            if self._flight_seq_pending:
+                self._flight_seq_pending = False
+                self._do_flight_sequence()
+                continue
+
+            # Log indirme
+            if self._log_download_pending >= 0:
+                log_id = self._log_download_pending
+                self._log_download_pending = -1
+                self._do_log_download(log_id)
+                continue
+
+            # Paket al
+            msg = self._mav.recv_match(blocking=True, timeout=0.1)
+            if msg is None:
+                continue
+
+            msg_type = msg.get_type()
+
+            if msg_type == "HEARTBEAT":
+                # Sadece autopilot'tan gelen heartbeat'leri işle.
+                # Filtre:
+                #   • srcSystem == target_system : doğru araç
+                #   • msg.autopilot != MAV_AUTOPILOT_INVALID : gerçek otopilot
+                #     (MAVProxy / GCS / Companion INVALID gönderir; sadece
+                #      ArduPilot/PX4 gerçek autopilot ID'si gönderir.)
+                #   • type != MAV_TYPE_GCS : GCS loopback koruması
+                # Not: target_component'e BAKMIYORUZ — wait_heartbeat()
+                # MAVProxy'nin (comp=0) heartbeat'ini yakalamış olabilir;
+                # gerçek autopilot ise comp=1'dir.
+                _src_sys  = msg.get_srcSystem()
+                _src_comp = msg.get_srcComponent()
+                is_autopilot = (
+                    _src_sys == self._mav.target_system
+                    and msg.type != mavutil.mavlink.MAV_TYPE_GCS
+                    and getattr(msg, "autopilot", -1) != mavutil.mavlink.MAV_AUTOPILOT_INVALID
+                )
+                if is_autopilot:
+                    self._last_heartbeat_time = time.time()
+                    # Gerçek autopilot sys/comp — mission upload bunu kullanır
+                    self._autopilot_sys  = _src_sys
+                    self._autopilot_comp = _src_comp
+                    armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                    mode_str = _COPTER_MODES.get(msg.custom_mode, f"MODE_{msg.custom_mode}")
+                    self._telemetry_accumulator.update({
+                        "flight_mode": mode_str,
+                        "armed": armed,
+                    })
+            elif msg_type == "GPS_RAW_INT":
+                self._telemetry_accumulator.update({
+                    "gps_fix_type": msg.fix_type,
+                    "gps_fix_name": _GPS_FIX_NAMES.get(msg.fix_type, "?"),
+                    "gps_sats": msg.satellites_visible,
+                    "gps_hdop": msg.eph / 100.0 if msg.eph != 65535 else 99.0,
+                })
+            elif msg_type == "EKF_STATUS_REPORT":
+                self._telemetry_accumulator["ekf_flags"] = msg.flags
+            elif msg_type == "STATUSTEXT":
+                txt = msg.text
+                if isinstance(txt, bytes):
+                    txt = txt.decode("utf-8", errors="replace")
+                txt = txt.rstrip("\x00")
+                self.status_text_received.emit(txt, msg.severity)
+            elif msg_type == "RC_CHANNELS":
+                self._telemetry_accumulator.update({
+                    "rc_1": msg.chan1_raw, "rc_2": msg.chan2_raw,
+                    "rc_3": msg.chan3_raw, "rc_4": msg.chan4_raw,
+                    "rc_5": msg.chan5_raw, "rc_6": msg.chan6_raw,
+                    "rc_7": msg.chan7_raw, "rc_8": msg.chan8_raw,
+                    "rc_rssi": msg.rssi,
+                })
+            elif msg_type == "ATTITUDE":
+                self._telemetry_accumulator.update({
+                    "roll": msg.roll,
+                    "pitch": msg.pitch,
+                    "yaw": msg.yaw,
+                    "rollspeed": msg.rollspeed,
+                    "pitchspeed": msg.pitchspeed,
+                    "yawspeed": msg.yawspeed,
+                })
+            elif msg_type == "VFR_HUD":
+                self._telemetry_accumulator.update({
+                    "airspeed":    msg.airspeed,
+                    "groundspeed": msg.groundspeed,
+                    "heading":     msg.heading,
+                    "throttle":    msg.throttle,
+                    "baro_alt":    msg.alt,   # barometrik irtifa — referans alınmaz
+                    "climb":       msg.climb,
+                })
+            elif msg_type == "SYS_STATUS":
+                # MAV_SYS_STATUS_SENSOR bit tanımları (common.xml)
+                # 3D_ACCEL = 0x02, 3D_MAG = 0x04
+                _sh = msg.onboard_control_sensors_health
+                update: dict = {
+                    "errors_comm":    msg.errors_comm,
+                    "accel_cal_done": bool(_sh & 0x02),
+                    "compass_cal_done": bool(_sh & 0x04),
+                }
+                # BATTERY_STATUS yoksa SYS_STATUS'tan doldur (eski FC fallback)
+                if "battery_voltage" not in self._telemetry_accumulator:
+                    update["battery_voltage"]   = msg.voltage_battery / 1000.0
+                    update["battery_current"]   = (msg.current_battery / 100.0
+                                                   if msg.current_battery != -1 else 0.0)
+                    update["battery_remaining"] = msg.battery_remaining
+                self._telemetry_accumulator.update(update)
+            elif msg_type == "BATTERY_STATUS":
+                # ArduPilot 4.x tercih edilen batarya mesajı — birden fazla batarya destekler
+                # İlk batarya (battery_id=0) kullanılır
+                if getattr(msg, "id", 0) == 0:
+                    voltages = getattr(msg, "voltages", [])
+                    cell_v = [v for v in voltages if v != 65535]
+                    total_v = sum(cell_v) / 1000.0 if cell_v else 0.0
+                    current_a = (msg.current_battery / 100.0
+                                 if msg.current_battery != -1 else 0.0)
+                    mah_used  = (msg.current_consumed
+                                 if msg.current_consumed != -1 else 0)
+                    remaining = (msg.battery_remaining
+                                 if msg.battery_remaining != -1 else -1)
+                    self._telemetry_accumulator.update({
+                        "battery_voltage":   total_v,
+                        "battery_current":   current_a,
+                        "battery_mah_used":  mah_used,
+                        "battery_remaining": remaining,
+                        "battery_cells":     len(cell_v),
+                    })
+            elif msg_type == "GLOBAL_POSITION_INT":
+                # relative_alt = ev noktasına göre GPS-EKF fused irtifa (mm → m)
+                # "alt" anahtarını da buradan güncelliyoruz; Mission Planner ile örtüşür
+                rel = msg.relative_alt / 1000.0
+                self._telemetry_accumulator.update({
+                    "lat":          msg.lat / 1e7,
+                    "lon":          msg.lon / 1e7,
+                    "alt":          rel,        # ← birincil irtifa (relative, MP ile aynı)
+                    "relative_alt": rel,
+                    "vx":           msg.vx / 100.0,
+                    "vy":           msg.vy / 100.0,
+                    "vz":           msg.vz / 100.0,
+                    "hdg":          msg.hdg / 100.0,
+                })
+            elif msg_type == "MAG_CAL_PROGRESS":
+                self.mag_cal_progress.emit(
+                    int(msg.compass_id),
+                    int(msg.completion_pct),
+                    float(getattr(msg, 'fitness', 0.0)),
+                )
+            elif msg_type == "MAG_CAL_REPORT":
+                self.mag_cal_report.emit(
+                    int(msg.compass_id),
+                    int(msg.cal_status),
+                    float(msg.fitness),
+                )
+            elif msg_type == "HOME_POSITION":
+                home_lat = msg.latitude  / 1e7
+                home_lon = msg.longitude / 1e7
+                home_alt = msg.altitude  / 1000.0
+                self._telemetry_accumulator.update({
+                    "home_lat": home_lat,
+                    "home_lon": home_lon,
+                    "home_alt": home_alt,
+                })
+                self.home_position_updated.emit(home_lat, home_lon, home_alt)
+            elif msg_type == "PARAM_VALUE":
+                p_name  = msg.param_id.rstrip("\x00") if isinstance(msg.param_id, str) else msg.param_id
+                p_value = float(msg.param_value)
+                p_count = int(getattr(msg, "param_count", 0))
+                self.param_received.emit(p_name, p_value)
+                # Cache: tüm parametreler gelince toplu DB yazımı
+                self._param_cache[p_name] = p_value
+                if p_count > 0:
+                    self._param_total = p_count
+                if (self._param_total > 0
+                        and len(self._param_cache) >= self._param_total
+                        and self._db_conn is not None):
+                    local_storage.save_params_batch(self._db_conn, self._param_cache)
+                    self._param_total = 0  # tekrar tetiklenmesin
+            elif msg_type == "LOG_ENTRY":
+                self.log_entry_received.emit({
+                    "id": msg.id,
+                    "num_logs": msg.num_logs,
+                    "last_log_num": msg.last_log_num,
+                    "time_utc": msg.time_utc,
+                    "size": msg.size,
+                })
+            elif msg_type == "ESC_TELEMETRY_1_TO_4":
+                # Debug output to verify what's coming in
+                # print(f"DEBUG ESC: RPM={msg.rpm}, V={msg.voltage}, A={msg.current}, T={msg.temperature}")
+                self._telemetry_accumulator.update({
+                    "esc_rpm": list(msg.rpm),
+                    "esc_voltage": [v / 100.0 for v in msg.voltage],
+                    "esc_current": [c / 100.0 for c in msg.current],
+                    "esc_temp": list(msg.temperature),
+                    "esc_mah": list(msg.totalcurrent),
+                })
+            elif msg_type == "VIBRATION":
+                self._telemetry_accumulator["vib_x"] = getattr(msg, "vibration_x", 0.0)
+                self._telemetry_accumulator["vib_y"] = getattr(msg, "vibration_y", 0.0)
+                self._telemetry_accumulator["vib_z"] = getattr(msg, "vibration_z", 0.0)
+            elif msg_type == "PID_TUNING":
+                self._telemetry_accumulator["pid_err"] = getattr(msg, "pe", 0.0)
+
+            # ~20 Hz telemetri yayını (her 5 mesajda bir)
+            self._telemetry_tick += 1
+            if self._telemetry_tick >= 5 and self._telemetry_accumulator:
+                self._telemetry_tick = 0
+                data = dict(self._telemetry_accumulator)
+                data["last_heartbeat_age"] = time.time() - self._last_heartbeat_time
+                self.telemetry_updated.emit(data)
+
+    def _request_streams(self) -> None:
+        """Telemetri akışlarını ister.
+
+        İki yöntem birlikte gönderilir:
+          1. REQUEST_DATA_STREAM (#66)  — ArduPilot ≤3.x (SITL 3.3 dahil)
+          2. SET_MESSAGE_INTERVAL (#511) — ArduPilot ≥4.x (modern)
+
+        Drone kendi desteklediğini yanıtlar; diğerini yoksayar.
+        """
+        if self._mav is None:
+            return
+
+        # ── Yöntem 1: REQUEST_DATA_STREAM (eski ArduPilot / SITL 3.3) ────────
+        # MAV_DATA_STREAM değerleri:
+        #   0=ALL  1=RAW_SENSORS  2=EXTENDED_STATUS  3=RC_CHANNELS
+        #   6=POSITION  10=EXTRA1(ATTITUDE)  11=EXTRA2(VFR_HUD)  12=EXTRA3
+        LEGACY_STREAMS = [
+            (0,  4),   # ALL           4 Hz — güvenli genel istek
+            (6,  5),   # POSITION      5 Hz — GLOBAL_POSITION_INT, GPS_RAW_INT
+            (10, 10),  # EXTRA1       10 Hz — ATTITUDE
+            (11, 10),  # EXTRA2       10 Hz — VFR_HUD
+            (12,  2),  # EXTRA3        2 Hz — EKF_STATUS_REPORT
+            (2,   2),  # EXT_STATUS    2 Hz — SYS_STATUS, BATTERY_STATUS
+            (3,   5),  # RC_CHANNELS   5 Hz
+        ]
+        for stream_id, rate_hz in LEGACY_STREAMS:
+            try:
+                self._mav.mav.request_data_stream_send(
+                    self._mav.target_system,
+                    self._mav.target_component,
+                    stream_id,
+                    rate_hz,
+                    1,   # start
+                )
+            except Exception as exc:
+                logger.warning("REQUEST_DATA_STREAM başarısız (stream=%d): %s", stream_id, exc)
+
+        # ── Yöntem 2: SET_MESSAGE_INTERVAL (modern ArduPilot ≥4.x) ───────────
+        # target_component = 1 (autopilot) — MAVProxy'nin comp=0 broadcast'ini atlıyoruz
+        # (msg_id, interval_us)  — 100_000 µs = 10 Hz, 200_000 = 5 Hz
+        sys_id = self._mav.target_system or 1
+        STREAMS = [
+            (30,  100_000),   # ATTITUDE            10 Hz
+            (74,  100_000),   # VFR_HUD             10 Hz
+            (24,  200_000),   # GPS_RAW_INT          5 Hz
+            (33,  200_000),   # GLOBAL_POSITION_INT  5 Hz
+            (1,   500_000),   # SYS_STATUS           2 Hz
+            (147, 500_000),   # BATTERY_STATUS       2 Hz
+            (193, 500_000),   # EKF_STATUS_REPORT    2 Hz
+            (65,  200_000),   # RC_CHANNELS          5 Hz
+            (242, 500_000),   # HOME_POSITION        2 Hz
+            (11030, 200_000), # ESC_TELEMETRY_1_TO_4 5 Hz
+        ]
+        for msg_id, interval_us in STREAMS:
+            try:
+                self._mav.mav.command_long_send(
+                    sys_id,
+                    1,      # comp=1: doğrudan autopilot'a gönder
+                    511,    # MAV_CMD_SET_MESSAGE_INTERVAL
+                    0,
+                    float(msg_id),
+                    float(interval_us),
+                    0, 0, 0, 0, 0,
+                )
+            except Exception as exc:
+                logger.warning("SET_MESSAGE_INTERVAL başarısız (msg=%d): %s", msg_id, exc)
+
+        logger.info("Telemetri akışları talep edildi (legacy + modern)")
+
+    def _ap_target(self) -> tuple:
+        """Komutlar için gerçek autopilot (sys, comp) — ASLA comp=0 gönderme.
+
+        wait_heartbeat() MAVProxy'nin comp=0 heartbeat'ini yakalamış olabilir;
+        broadcast'e gönderim mission protokolünü ve diğer komutları bozar.
+        Heartbeat handler is_autopilot=True olduğunda _autopilot_sys/comp'u
+        günceller; yoksa ArduPilot konvansiyonu (1, 1)'e düşeriz.
+        """
+        sys_id  = self._autopilot_sys  or self._mav.target_system  or 1
+        comp_id = self._autopilot_comp or 1
+        if comp_id == 0:
+            comp_id = 1
+        return sys_id, comp_id
+
+    def _execute_ned_velocity(self, vx: float, vy: float, vz: float) -> None:
+        """SET_POSITION_TARGET_LOCAL_NED mesajını doğrudan gönder."""
+        if self._mav is None:
+            return
+        try:
+            sys_id, comp_id = self._ap_target()
+            self._mav.mav.set_position_target_local_ned_send(
+                0,                                    # time_boot_ms
+                sys_id, comp_id,
+                mavutil.mavlink.MAV_FRAME_LOCAL_NED,  # frame
+                0b0000_1111_1100_0111,                # type_mask: yalnızca vx,vy,vz
+                0.0, 0.0, 0.0,                        # x,y,z pos (kullanılmıyor)
+                vx, vy, vz,                           # hız m/s
+                0.0, 0.0, 0.0,                        # ivme (kullanılmıyor)
+                0.0, 0.0,                             # yaw, yaw_rate
+            )
+        except Exception as exc:
+            logger.error("NED velocity gönderilemedi: %s", exc)
+
+    @pyqtSlot(float, float, float)
+    def send_ned_velocity(self, vx: float, vy: float, vz: float) -> None:
+        """Dış thread'den çağrılır — kuyruğa ekler (doluysa en eskiyi at)."""
+        try:
+            self._ned_vel_queue.put_nowait((vx, vy, vz))
+        except queue.Full:
+            try:
+                self._ned_vel_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._ned_vel_queue.put_nowait((vx, vy, vz))
+
+    def _execute_command(self, cmd: dict) -> None:
+        try:
+            cmd_id = cmd.get("id")
+            params = cmd.get("params", [0] * 7)
+            while len(params) < 7:
+                params.append(0)
+            sys_id, comp_id = self._ap_target()
+            self._mav.mav.command_long_send(
+                sys_id, comp_id,
+                cmd_id,
+                0,
+                *params[:7],
+            )
+            logger.info("CMD gönderildi: id=%d target=%d/%d params=%s",
+                        cmd_id, sys_id, comp_id, params[:7])
+        except Exception as exc:
+            logger.error("Komut gönderilemedi: %s", exc)
+
+    @pyqtSlot(int, list)
+    def send_command(self, cmd_id: int, params: list) -> None:
+        try:
+            self._command_queue.put_nowait({"id": cmd_id, "params": params})
+        except queue.Full:
+            logger.warning("Komut kuyruğu dolu — cmd_id=%d atlandı", cmd_id)
+
+    @pyqtSlot(str, float)
+    def set_param(self, name: str, value: float) -> None:
+        if self._mav is None:
+            return
+        try:
+            self._mav.mav.param_set_send(
+                self._mav.target_system,
+                self._mav.target_component,
+                name.encode("utf-8"),
+                value,
+                mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
+            )
+        except Exception as exc:
+            logger.error("Parametre gönderilemedi %s: %s", name, exc)
+
+    @pyqtSlot(bytes)
+    def inject_rtcm(self, data: bytes) -> None:
+        if self._mav is None:
+            return
+        try:
+            chunk_size = 180
+            flags = 0
+            for i in range(0, len(data), chunk_size):
+                chunk = data[i:i + chunk_size]
+                self._mav.mav.gps_rtcm_data_send(flags, len(chunk), bytearray(chunk))
+        except Exception as exc:
+            logger.error("RTCM enjeksiyonu başarısız: %s", exc)
+
+    @pyqtSlot()
+    def request_parameters(self) -> None:
+        if self._mav is None:
+            return
+        try:
+            self._mav.mav.param_request_list_send(
+                self._mav.target_system, self._mav.target_component
+            )
+        except Exception as exc:
+            logger.error("Parametre listesi isteği başarısız: %s", exc)
+
+    @pyqtSlot(int, int, int, int, int)
+    def send_manual_control(self, x: int, y: int, z: int, r: int, buttons: int) -> None:
+        """MANUAL_CONTROL mesajı gönderir (joystick için). x,y,z,r: -1000..1000"""
+        if self._mav is None:
+            return
+        try:
+            self._mav.mav.manual_control_send(
+                self._mav.target_system,
+                x, y, z, r, buttons,
+            )
+        except Exception as exc:
+            logger.error("MANUAL_CONTROL gönderilemedi: %s", exc)
+
+    @pyqtSlot()
+    def request_log_list(self) -> None:
+        """Drone'daki log listesini ister (LOG_REQUEST_LIST → LOG_ENTRY yanıtları)."""
+        if self._mav is None:
+            return
+        try:
+            self._mav.mav.log_request_list_send(
+                self._mav.target_system,
+                self._mav.target_component,
+                0,       # start: ilk log
+                0xFFFF,  # end: son log
+            )
+            logger.info("LOG_REQUEST_LIST gönderildi")
+        except Exception as exc:
+            logger.error("Log listesi isteği başarısız: %s", exc)
+
+    @pyqtSlot(int)
+    def download_log(self, log_id: int) -> None:
+        """Belirli bir log dosyasını indirir — ana döngüde _do_log_download() çalıştırır."""
+        self._log_download_pending = log_id
+
+    @pyqtSlot(dict, list)
+    def upload_mission(self, params: dict, waypoints: list) -> None:
+        """Görevi FC'ye MAVLink ile yükler (TCP:5762 — MAVProxy interferansı yok)."""
+        if self._mav is None:
+            self.mission_upload_done.emit(False, "Drone bağlı değil")
+            return
+        alt = float(params.get("flight_altitude_m", 15.0))
+        if waypoints and str(waypoints[0].get("type", "")).upper() == "TAKEOFF":
+            alt = float(waypoints[0].get("alt", alt))
+        self._stored_flight_alt = alt
+        self._upload_waypoints = list(waypoints)
+
+    @pyqtSlot()
+    def request_mission(self) -> None:
+        """Drone'dan görevi indirmeyi talep eder."""
+        if self._mav is None:
+            self.mission_download_done.emit(False, [], "Drone bağlı değil")
+            return
+        self._download_mission_pending = True
+
+    @pyqtSlot()
+    def start_flight_sequence(self) -> None:
+        """GUIDED → ARM → TAKEOFF → AUTO sekansını başlatır."""
+        if self._mav is None:
+            self.flight_sequence_status.emit("Hata: Drone bağlı değil")
+            return
+        self._flight_seq_pending = True
+
+    def _do_mission_upload(self, waypoints: list) -> None:
+        """FC'ye MAVLink mission protokolü ile waypoint yükler."""
+        count = len(waypoints)
+        sys_id, comp_id = self._ap_target()
+        self.mission_upload_progress.emit(0, count)
+        logger.info("Görev yükleniyor: %d WP → sys=%d comp=%d", count, sys_id, comp_id)
+
+        last_hb = time.time()
+
+        def _hb():
+            nonlocal last_hb
+            if time.time() - last_hb > 1.0:
+                try:
+                    self._mav.mav.heartbeat_send(
+                        mavutil.mavlink.MAV_TYPE_GCS,
+                        mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                        0, 0, 0,
+                    )
+                except Exception:
+                    pass
+                last_hb = time.time()
+
+        try:
+            self._mav.mav.mission_clear_all_send(sys_id, comp_id)
+            _hb()
+
+            # ── BUG FIX 1: CLEAR_ALL ACK'ini önceden tüket ──────────────────
+            # ArduPilot, MISSION_CLEAR_ALL'a MISSION_ACK(type=0) ile yanıt verir.
+            # Bu ACK upload döngüsüne girerse "hiç WP gönderilmeden görev kabul edildi"
+            # şeklinde yanlış başarı döner; drone WP bekler ama gelmez → sonraki
+            # denemede drone yanıt vermez → timeout.
+            _clr_dl = time.time() + 1.5
+            while time.time() < _clr_dl:
+                _hb()
+                _clr_ack = self._mav.recv_match(
+                    type=["MISSION_ACK"], blocking=True, timeout=0.3
+                )
+                if _clr_ack is not None:
+                    logger.debug("CLEAR_ALL ACK tüketildi: type=%d", _clr_ack.type)
+                    break
+            time.sleep(0.2)
+
+            self._mav.mav.mission_count_send(sys_id, comp_id, count)
+            logger.info("MISSION_COUNT(%d) gönderildi", count)
+
+            next_seq = 0
+            retries = 0
+            wp_sent_count = 0   # BUG FIX 2: Hiç WP gönderilmeden gelen ACK'i yoksay
+            deadline = time.time() + max(count * 5 + 30, 60)
+
+            while time.time() < deadline:
+                _hb()
+                msg = self._mav.recv_match(
+                    type=["MISSION_REQUEST", "MISSION_REQUEST_INT", "MISSION_ACK"],
+                    blocking=True,
+                    timeout=1.0
+                )
+                if msg is None:
+                    retries += 1
+                    # BUG FIX 3: Retry limiti 5 → 10 (ağ gecikmelerine karşı tolerans)
+                    if retries >= 10:
+                        self.mission_upload_done.emit(
+                            False,
+                            "MISSION_REQUEST zaman aşımı — drone yanıt vermiyor.\n"
+                            "Bağlantıyı ve drone ARM durumunu kontrol edin."
+                        )
+                        return
+                    logger.warning("Upload timeout (%d/10) — MISSION_COUNT tekrar gönderiliyor", retries)
+                    self._mav.mav.mission_count_send(sys_id, comp_id, count)
+                    continue
+
+                retries = 0
+                mtype = msg.get_type()
+
+                # NOT: recv_match(type=[...]) filtresi HEARTBEAT döndürmez;
+                # önceki HEARTBEAT dalı ölü koddu — kaldırıldı (BUG FIX).
+
+                if mtype == "MISSION_ACK":
+                    # BUG FIX 2: Hiç WP gönderilmemişse bu ACK CLEAR_ALL'dan kalan
+                    # artık olabilir (gecikmeli paket). Yoksay, upload'ı sürdür.
+                    if wp_sent_count == 0:
+                        logger.debug(
+                            "Erken MISSION_ACK (type=%d) yoksayıldı "
+                            "— CLEAR_ALL artığı, henüz WP gönderilmedi", msg.type
+                        )
+                        continue
+                    if msg.type == mavutil.mavlink.MAV_MISSION_ACCEPTED:
+                        logger.info("Görev kabul edildi: %d WP", count)
+                        self.mission_upload_done.emit(True, f"{count} WP başarıyla yüklendi")
+                        return
+                    logger.error("Görev reddedildi: MISSION_ACK type=%d", msg.type)
+                    self.mission_upload_done.emit(False, f"Görev reddedildi (type={msg.type})")
+                    return
+
+                if mtype not in ("MISSION_REQUEST", "MISSION_REQUEST_INT"):
+                    continue
+
+                req_seq = getattr(msg, "seq", -1)
+                if req_seq < 0 or req_seq >= count:
+                    continue
+
+                wp = waypoints[req_seq]
+                wp_type = str(wp.get("type", "WAYPOINT")).upper()
+
+                if wp_type == "TAKEOFF":
+                    cmd, p1, p2, p3, p4 = 22, 0.0, 0.0, 0.0, float("nan")
+                elif wp_type == "LAND":
+                    cmd, p1, p2, p3, p4 = 21, 0.0, 0.0, 0.0, float("nan")
+                elif wp_type == "RTL":
+                    cmd, p1, p2, p3, p4 = 20, 0.0, 0.0, 0.0, 0.0
+                elif wp_type == "LOITER":
+                    cmd, p1, p2, p3, p4 = 17, 0.0, 0.0, 0.0, float("nan")
+                elif wp_type == "SPLINE":
+                    cmd = 16
+                    p1 = float(wp.get("hold", 0))
+                    p2 = float(wp.get("accept_radius", 2))
+                    p3, p4 = 0.0, float("nan")
+                else:
+                    cmd = 16
+                    p1 = float(wp.get("hold", 0))
+                    p2 = float(wp.get("accept_radius", 2))
+                    p3 = float(wp.get("pass_radius", 0))
+                    p4 = float(wp.get("yaw", float("nan")))
+
+                lat = float(wp.get("lat", 0))
+                lon = float(wp.get("lon", 0))
+                alt = float(wp.get("alt", 10))
+                current = 1 if req_seq == 0 else 0
+
+                if mtype == "MISSION_REQUEST_INT":
+                    self._mav.mav.mission_item_int_send(
+                        sys_id, comp_id, req_seq,
+                        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                        cmd, current, 1,
+                        p1, p2, p3, p4,
+                        int(lat * 1e7), int(lon * 1e7), alt,
+                        mavutil.mavlink.MAV_MISSION_TYPE_MISSION,
+                    )
+                else:
+                    self._mav.mav.mission_item_send(
+                        sys_id, comp_id, req_seq,
+                        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                        cmd, current, 1,
+                        p1, p2, p3, p4,
+                        lat, lon, alt,
+                    )
+
+                wp_sent_count += 1
+                logger.debug("WP[%d] gönderildi: %s lat=%.6f lon=%.6f alt=%.1f",
+                             req_seq, wp_type, lat, lon, alt)
+                self.mission_upload_progress.emit(req_seq + 1, count)
+                if req_seq >= next_seq:
+                    next_seq = req_seq + 1
+
+            self.mission_upload_done.emit(False, "Yükleme zaman aşımı")
+
+        except Exception as exc:
+            logger.error("Mission upload hatası: %s", exc)
+            self.mission_upload_done.emit(False, str(exc))
+
+    def _do_mission_download(self) -> None:
+        """FC'den görev listesini indirir."""
+        sys_id, comp_id = self._ap_target()
+        logger.info("Görev indiriliyor (MISSION_REQUEST_LIST) sys=%d comp=%d", sys_id, comp_id)
+
+        last_hb = time.time()
+        def _hb():
+            nonlocal last_hb
+            if time.time() - last_hb > 1.0:
+                try:
+                    self._mav.mav.heartbeat_send(
+                        mavutil.mavlink.MAV_TYPE_GCS,
+                        mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                        0, 0, 0,
+                    )
+                except Exception:
+                    pass
+                last_hb = time.time()
+
+        try:
+            self._mav.mav.mission_request_list_send(sys_id, comp_id)
+            
+            # MISSION_COUNT bekle
+            msg = self._mav.recv_match(type=["MISSION_COUNT"], blocking=True, timeout=5.0)
+            if not msg:
+                self.mission_download_done.emit(False, [], "MISSION_COUNT alınamadı (zaman aşımı).")
+                return
+
+            count = msg.count
+            logger.info("Drone %d WP bildirdi. İndirme başlıyor...", count)
+            
+            if count == 0:
+                self.mission_download_done.emit(True, [], "Görev listesi boş.")
+                return
+
+            waypoints = []
+            for seq in range(count):
+                retries = 0
+                while retries < 5:
+                    _hb()
+                    self._mav.mav.mission_request_int_send(sys_id, comp_id, seq)
+                    item_msg = self._mav.recv_match(type=["MISSION_ITEM_INT", "MISSION_ITEM"], blocking=True, timeout=2.0)
+                    
+                    if item_msg and getattr(item_msg, "seq", -1) == seq:
+                        wp_lat = getattr(item_msg, "x", 0)
+                        wp_lon = getattr(item_msg, "y", 0)
+                        if item_msg.get_type() == "MISSION_ITEM_INT":
+                            wp_lat = wp_lat / 1e7
+                            wp_lon = wp_lon / 1e7
+                            
+                        wp = {
+                            "idx": seq + 1,
+                            "lat": wp_lat,
+                            "lon": wp_lon,
+                            "alt": getattr(item_msg, "z", 0),
+                            "cmd_id": getattr(item_msg, "command", 16),
+                            "delay": getattr(item_msg, "param1", 0)  # Delay genellikle param1'de tutulur
+                        }
+                        waypoints.append(wp)
+                        logger.debug("WP[%d] alındı", seq)
+                        break
+                    else:
+                        retries += 1
+                        logger.warning("WP[%d] alınamadı, tekrar deneniyor (%d/5)", seq, retries)
+                
+                if retries >= 5:
+                    self.mission_download_done.emit(False, [], f"WP[{seq}] alınamadı, iptal ediliyor.")
+                    return
+
+            self._mav.mav.mission_ack_send(sys_id, comp_id, mavutil.mavlink.MAV_MISSION_ACCEPTED)
+            self.mission_download_done.emit(True, waypoints, f"{count} WP başarıyla indirildi.")
+
+        except Exception as exc:
+            logger.error("Mission download hatası: %s", exc)
+            self.mission_download_done.emit(False, [], str(exc))
+
+    def _do_flight_sequence(self) -> None:
+        """GUIDED → ARM → TAKEOFF → bekle → AUTO sekansı."""
+        sys_id, comp_id = self._ap_target()
+        alt = self._stored_flight_alt
+        logger.info("Uçuş sekansı: GUIDED → ARM → TAKEOFF(%.0fm) → AUTO", alt)
+
+        last_hb = time.time()
+
+        def _hb():
+            nonlocal last_hb
+            if time.time() - last_hb > 1.0:
+                try:
+                    self._mav.mav.heartbeat_send(
+                        mavutil.mavlink.MAV_TYPE_GCS,
+                        mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                        0, 0, 0,
+                    )
+                except Exception:
+                    pass
+                last_hb = time.time()
+
+        def _cmd(cmd_id, p1=0.0, p2=0.0, p3=0.0, p4=0.0, p5=0.0, p6=0.0, p7=0.0):
+            self._mav.mav.command_long_send(
+                sys_id, comp_id, cmd_id, 0,
+                p1, p2, p3, p4, p5, p6, p7,
+            )
+
+        try:
+            self.flight_sequence_status.emit("GUIDED moduna geçiliyor...")
+            _cmd(mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+                 float(mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED), 4.0)
+            time.sleep(1.5)
+
+            self.flight_sequence_status.emit("ARM komutu gönderiliyor...")
+            _cmd(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 1.0)
+            time.sleep(1.5)
+
+            self.flight_sequence_status.emit("Motorlara takeoff öncesi hafif gaz veriliyor...")
+            try:
+                self._mav.mav.rc_channels_override_send(
+                    sys_id, comp_id,
+                    0, 0, 1150, 0, 0, 0, 0, 0
+                )
+                time.sleep(1.0)
+                # RC override iptal
+                self._mav.mav.rc_channels_override_send(
+                    sys_id, comp_id,
+                    0, 0, 0, 0, 0, 0, 0, 0
+                )
+                time.sleep(0.5)
+            except Exception as e:
+                logger.error(f"Gaz verme basarisiz: {e}")
+
+            self.flight_sequence_status.emit(f"Kalkış ({alt:.0f}m) komutu gönderiliyor...")
+            _cmd(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, p7=float(alt))
+
+            # İrtifa bekle (maks 40s, alt > %85 hedef)
+            self.flight_sequence_status.emit(f"İrtifa bekleniyor ({alt:.0f}m)...")
+            deadline = time.time() + 40
+            while time.time() < deadline:
+                _hb()
+                m = self._mav.recv_match(blocking=True, timeout=0.5)
+                if m and m.get_type() == "GLOBAL_POSITION_INT":
+                    if m.relative_alt / 1000.0 >= alt * 0.85:
+                        break
+
+            time.sleep(1.0)
+
+            self.flight_sequence_status.emit("AUTO moduna geçiliyor...")
+            for attempt in range(1, 4):
+                _cmd(mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+                     float(mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED), 3.0)
+                # 2s içinde AUTO onayı bekle
+                dl = time.time() + 2.0
+                while time.time() < dl:
+                    _hb()
+                    m = self._mav.recv_match(blocking=True, timeout=0.2)
+                    if m and m.get_type() == "HEARTBEAT":
+                        src = m.get_srcSystem()
+                        if (src == self._mav.target_system
+                                and getattr(m, "autopilot", -1) != mavutil.mavlink.MAV_AUTOPILOT_INVALID):
+                            if _COPTER_MODES.get(m.custom_mode, "") == "AUTO":
+                                self.flight_sequence_status.emit("Görev başladı — AUTO modu aktif")
+                                logger.info("AUTO modu onaylandı — görev aktif")
+                                return
+                logger.warning("AUTO modu yok (deneme %d/3)", attempt)
+
+            self.flight_sequence_status.emit("UYARI: AUTO moduna geçilemedi")
+            logger.error("AUTO moduna geçilemedi (3 deneme)")
+
+        except Exception as exc:
+            logger.error("Uçuş sekansı hatası: %s", exc)
+            self.flight_sequence_status.emit(f"Hata: {exc}")
+
+    def _do_log_download(self, log_id: int) -> None:
+        """MAVLink LOG_REQUEST_DATA / LOG_DATA protokolü ile log indirir."""
+        if self._mav is None:
+            self.log_download_done.emit(False, "", b"")
+            return
+
+        sys_id, comp_id = self._ap_target()
+        logger.info("Log indiriliyor: id=%d", log_id)
+
+        # Önce log listesinden boyutu öğrenmek için LOG_REQUEST_LIST gönder
+        try:
+            self._mav.mav.log_request_list_send(sys_id, comp_id, log_id, log_id)
+        except Exception as exc:
+            logger.error("Log listesi isteği başarısız: %s", exc)
+            self.log_download_done.emit(False, "", b"")
+            return
+
+        total_size = 0
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            m = self._mav.recv_match(blocking=True, timeout=0.5)
+            if m and m.get_type() == "LOG_ENTRY" and getattr(m, "id", -1) == log_id:
+                total_size = m.size
+                break
+
+        if total_size == 0:
+            self.log_download_done.emit(False, f"log_{log_id}.bin", b"")
+            return
+
+        # LOG_REQUEST_DATA ile veri iste
+        CHUNK = 90   # MAVLink LOG_DATA max payload (90 byte)
+        buf = bytearray(total_size)
+        received_offsets: set = set()
+
+        try:
+            self._mav.mav.log_request_data_send(
+                sys_id, comp_id, log_id, 0, total_size
+            )
+        except Exception as exc:
+            logger.error("LOG_REQUEST_DATA başarısız: %s", exc)
+            self.log_download_done.emit(False, f"log_{log_id}.bin", b"")
+            return
+
+        deadline = time.time() + max(total_size / 1000 + 30, 60)
+        while time.time() < deadline and not self.isInterruptionRequested():
+            m = self._mav.recv_match(blocking=True, timeout=0.5)
+            if m is None:
+                continue
+            if m.get_type() == "LOG_DATA" and getattr(m, "id", -1) == log_id:
+                ofs  = m.ofs
+                data = bytes(m.data[:m.count])
+                end  = min(ofs + len(data), total_size)
+                buf[ofs:end] = data[:end - ofs]
+                received_offsets.add(ofs)
+                self.log_download_progress.emit(len(received_offsets) * CHUNK, total_size)
+                if end >= total_size:
+                    break
+
+        # Log bitiş sinyali
+        try:
+            self._mav.mav.log_request_end_send(sys_id, comp_id)
+        except Exception:
+            pass
+
+        filename = f"log_{log_id:04d}.bin"
+        self.log_download_done.emit(True, filename, bytes(buf))
+        logger.info("Log indirildi: %s (%d bayt)", filename, total_size)
+
+    def stop(self) -> None:
+        self.requestInterruption()
+        # Socket'i hemen kapat → recv_match(blocking) bloke çözülür
+        if self._mav is not None:
+            try:
+                self._mav.close()
+            except Exception:
+                pass
+            self._mav = None
+        self.wait(5000)  # Maks 5 saniye bekle; donmuşsa devam et

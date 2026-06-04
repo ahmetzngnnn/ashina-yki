@@ -1,0 +1,214 @@
+/* 
+  MAVIOS-GCS Professional Dark Theme 
+  Typography: Segoe UI (Windows)
+  Colors: 
+    Bg-Main: #1e1e24
+    Bg-Panel: #25252b
+    Border: #3b3b45
+    Accent: #3daee9
+    Danger: #e24c4c
+    Text: #d1d5db
+    Text-Muted: #9ca3af
+*/
+
+QWidget {
+    background-color: #1e1e24;
+    color: #d1d5db;
+    font-family: "Segoe UI", sans-serif;
+    font-size: 12px;
+}
+
+/* ── Panel ve Kapsayıcılar ── */
+QFrame, QGroupBox {
+    background-color: #25252b;
+    border: 1px solid #3b3b45;
+    border-radius: 4px;
+}
+
+QGroupBox {
+    margin-top: 18px;
+    padding-top: 12px;
+    font-weight: bold;
+    color: #3daee9;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    padding: 0 4px;
+    left: 8px;
+    top: 6px;
+    color: #3daee9;
+}
+
+/* ── Ana Pencere (MainWindow) ── */
+QMainWindow {
+    background-color: #1e1e24;
+}
+
+/* ── Butonlar ── */
+QPushButton {
+    background-color: #3b3b45;
+    color: #f3f4f6;
+    border: 1px solid #4b4b56;
+    border-radius: 4px;
+    padding: 4px 12px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background-color: #4b4b56;
+    border: 1px solid #5c5c68;
+}
+QPushButton:pressed {
+    background-color: #2a2a32;
+}
+QPushButton:disabled {
+    background-color: #25252b;
+    color: #6b7280;
+    border: 1px solid #3b3b45;
+}
+
+/* Özel Buton Class'ları */
+QPushButton#primaryButton {
+    background-color: #3daee9;
+    color: white;
+    border: 1px solid #2389bd;
+}
+QPushButton#primaryButton:hover {
+    background-color: #2389bd;
+}
+QPushButton#dangerButton {
+    background-color: #e24c4c;
+    color: white;
+    border: 1px solid #b73232;
+}
+QPushButton#dangerButton:hover {
+    background-color: #b73232;
+}
+QPushButton#successButton {
+    background-color: #10b981;
+    color: white;
+    border: 1px solid #059669;
+}
+QPushButton#successButton:hover {
+    background-color: #059669;
+}
+
+/* ── Girdi Kutuları (QLineEdit, QSpinBox vb.) ── */
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+    background-color: #1a1a20;
+    color: #e5e7eb;
+    border: 1px solid #3b3b45;
+    border-radius: 3px;
+    padding: 4px 8px;
+    min-height: 22px;
+}
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
+    border: 1px solid #3daee9;
+    background-color: #1e1e24;
+}
+QComboBox::drop-down {
+    border: none;
+    width: 20px;
+}
+QComboBox::down-arrow {
+    image: none;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 4px solid #9ca3af;
+    margin-right: 6px;
+}
+QComboBox QAbstractItemView {
+    background-color: #25252b;
+    border: 1px solid #3b3b45;
+    selection-background-color: #3daee9;
+    selection-color: white;
+}
+
+/* ── Sekmeler (QTabWidget) ── */
+QTabWidget::pane {
+    border: 1px solid #3b3b45;
+    background-color: #1e1e24;
+    border-radius: 4px;
+    border-top-left-radius: 0;
+}
+QTabBar::tab {
+    background-color: #25252b;
+    color: #9ca3af;
+    border: 1px solid #3b3b45;
+    border-bottom: none;
+    border-top-left-radius: 3px;
+    border-top-right-radius: 3px;
+    padding: 6px 16px;
+    margin-right: 1px;
+}
+QTabBar::tab:selected {
+    background-color: #1e1e24;
+    color: #3daee9;
+    font-weight: bold;
+    border-top: 2px solid #3daee9;
+}
+QTabBar::tab:hover:!selected {
+    background-color: #3b3b45;
+    color: #d1d5db;
+}
+
+/* ── Scrollbar ── */
+QScrollBar:vertical {
+    background-color: #1e1e24;
+    width: 10px;
+    margin: 0px 0px 0px 0px;
+}
+QScrollBar::handle:vertical {
+    background-color: #4b4b56;
+    min-height: 20px;
+    border-radius: 3px;
+    margin: 1px;
+}
+QScrollBar::handle:vertical:hover {
+    background-color: #5c5c68;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+QScrollBar:horizontal {
+    background-color: #1e1e24;
+    height: 10px;
+    margin: 0px 0px 0px 0px;
+}
+QScrollBar::handle:horizontal {
+    background-color: #4b4b56;
+    min-width: 20px;
+    border-radius: 3px;
+    margin: 1px;
+}
+QScrollBar::handle:horizontal:hover {
+    background-color: #5c5c68;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0px;
+}
+
+/* ── Progress Bar ── */
+QProgressBar {
+    background-color: #25252b;
+    border: 1px solid #3b3b45;
+    border-radius: 3px;
+    text-align: center;
+    color: white;
+    font-weight: bold;
+}
+QProgressBar::chunk {
+    background-color: #3daee9;
+    border-radius: 2px;
+}
+
+/* ── Durum Çubuğu (StatusBar) ── */
+QStatusBar {
+    background-color: #25252b;
+    border-top: 1px solid #3b3b45;
+    color: #9ca3af;
+}
+QStatusBar::item {
+    border: none;
+}
+
