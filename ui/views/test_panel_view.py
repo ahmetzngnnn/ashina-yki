@@ -502,8 +502,18 @@ class TestPanelView(QWidget):
             )
             self._log_line("   → Adım 1/3: GUIDED moduna geçiliyor...")
 
+            # GÜVENLİK (C5): _do_arm/_do_takeoff gecikmeli (singleShot) çalışır ve
+            # singleShot İPTAL EDİLEMEZ. Test bu aralıkta iptal edilir/bitirilirse
+            # (_active_test != 0 olur) drone yine de ARM+TAKEOFF yapıyordu. Artık her
+            # adım, testin HÂLÂ aktif kalkış testi (idx=0) olduğunu doğrular; değilse
+            # komut gönderilmez.
+            _takeoff_idx = idx  # = 0
+
             # Adım 2: 800 ms sonra ARM
             def _do_arm():
+                if self._active_test != _takeoff_idx:
+                    self._log_line("   ⚠  Kalkış testi iptal edildi — ARM gönderilmedi.")
+                    return
                 self.send_command.emit(
                     mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
                     [1, 0, 0, 0, 0, 0, 0]
@@ -512,6 +522,9 @@ class TestPanelView(QWidget):
 
             # Adım 3: 2.5 sn sonra TAKEOFF (20 m)
             def _do_takeoff():
+                if self._active_test != _takeoff_idx:
+                    self._log_line("   ⚠  Kalkış testi iptal edildi — TAKEOFF gönderilmedi.")
+                    return
                 self.send_command.emit(
                     mavlink.MAV_CMD_NAV_TAKEOFF,
                     [0, 0, 0, 0, 0, 0, 20]

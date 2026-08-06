@@ -2,7 +2,6 @@
 tuning_view.py — Modül 4
 PID Tuning + pyqtgraph PlotWidget + Failsafe ayarları.
 """
-from PyQt5.QtWidgets import QMessageBox
 import logging
 import math
 import os as _os
@@ -11,7 +10,7 @@ from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QGroupBox, QFormLayout, QDoubleSpinBox, QComboBox,
-    QPushButton,
+    QPushButton, QMessageBox,
 )
 
 try:

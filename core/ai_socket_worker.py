@@ -49,9 +49,13 @@ _MISSION_TYPE_NORMALIZE = {
     "TEKNOFEST_TASK2_3":   "TEKNOFEST_TASK2",
     "TEKNOFEST_GÖREV_2":   "TEKNOFEST_TASK2",
     "PAYLOAD_DROP":        "TEKNOFEST_TASK2",   # eski isim → yeni
-    "TARGET_DROP":         "TARGET_DROP",       # korunur
+    # TARGET_DROP görevi IHA'da kaldırıldı; yük bırakma artık TEKNOFEST_TASK2'nin
+    # parçası (bkz. missions/executor.py). Ardılına eşle (PAYLOAD_DROP gibi) ki
+    # eski isimle gelen istek IHA'da "unknown mission_type" ile reddedilmesin.
+    "TARGET_DROP":         "TEKNOFEST_TASK2",
     "INFINITY_FLIGHT":     "INFINITY_FLIGHT",   # korunur
-    "AI_DETECTION":        "AI_DETECTION",      # korunur
+    # NOT: AI_DETECTION IHA'da kayıtlı bir görev DEĞİL ve YKİ'de başka yerde
+    # kullanılmıyordu → ölü eşleme kaldırıldı (gönderilse IHA reddederdi).
 }
 
 
@@ -158,8 +162,9 @@ class AISocketWorker(QThread):
         mt = params.get("mission_type", "")
         params["mission_type"] = _MISSION_TYPE_NORMALIZE.get(mt, mt)
 
-        # PAYLOAD_DROP param isimleri uyarla
-        if params.get("mission_type") in ("TEKNOFEST_TASK2", "TARGET_DROP"):
+        # PAYLOAD_DROP param isimleri uyarla (TARGET_DROP artık TEKNOFEST_TASK2'ye
+        # normalize edildiği için tek değeri kontrol etmek yeterli).
+        if params.get("mission_type") == "TEKNOFEST_TASK2":
             if "drop_altitude_m" in params and "drop_duration_s" not in params:
                 params["drop_duration_s"] = 0.5
             if "drop_slot" not in params:

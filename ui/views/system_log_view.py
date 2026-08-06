@@ -6,7 +6,7 @@ import logging
 import math
 import time
 import collections
-from PyQt6.QtCore import pyqtSignal, pyqtSlot, Qt, QTimer, QPointF
+from PyQt6.QtCore import pyqtSignal, pyqtSlot, Qt, QTimer, QPointF, QObject
 from PyQt6.QtGui import QFont, QPainter, QPen, QColor
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -147,31 +147,56 @@ class SystemLogView(QWidget):
         splitter.addWidget(right_w)
         layout.addWidget(splitter)
 
-        # Logging Handler for YKI
+        # Logging Handler for YKI (C6: THREAD-GÜVENLİ)
+        # logging worker thread'lerden (ör. MavlinkWorker QThread) de çağrılır.
+        # ÖNCEDEN emit() doğrudan QTextEdit.append yapıyordu → GUI widget'ına
+        # GUI-DIŞI thread'den erişim → aralıklı çökme. Artık handler yalnızca bir
+        # Qt sinyali yayar; sinyal (thread sınırında otomatik QUEUED bağlantı ile)
+        # GUI thread'indeki _append_yki_log slot'unda widget'a yazılır.
+        class _LogSignalBridge(QObject):
+            message = pyqtSignal(str)
+
         class QTextEditLogger(logging.Handler):
-            def __init__(self, widget):
+            def __init__(self, bridge):
                 super().__init__()
-                self.widget = widget
+                self.bridge = bridge
                 self.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s - %(message)s', '%H:%M:%S'))
 
             def emit(self, record):
-                msg = self.format(record)
-                # Ensure thread safety by using QTimer or invokeMethod in a real app, 
-                # but since most logs are on main thread, this is okay for UI logs.
-                color = "#aaa"
-                if record.levelno >= logging.ERROR: color = "#ff4444"
-                elif record.levelno >= logging.WARNING: color = "#f0a500"
-                
-                html = f'<span style="color:{color}">{msg}</span>'
-                self.widget.append(html)
-                sb = self.widget.verticalScrollBar()
-                if sb:
-                    sb.setValue(sb.maximum())
+                try:
+                    msg = self.format(record)
+                    color = "#aaa"
+                    if record.levelno >= logging.ERROR: color = "#ff4444"
+                    elif record.levelno >= logging.WARNING: color = "#f0a500"
+                    html = f'<span style="color:{color}">{msg}</span>'
+                    self.bridge.message.emit(html)   # → GUI thread'e marshal
+                except Exception:
+                    pass
 
-        self._handler = QTextEditLogger(self._yki_log)
+        self._log_bridge = _LogSignalBridge()
+        self._log_bridge.message.connect(self._append_yki_log)
+        self._handler = QTextEditLogger(self._log_bridge)
         logging.getLogger().addHandler(self._handler)
 
         return w
+
+    @pyqtSlot(str)
+    def _append_yki_log(self, html: str) -> None:
+        """Log satırını GUI thread'inde YKİ log kutusuna ekler (C6)."""
+        self._yki_log.append(html)
+        sb = self._yki_log.verticalScrollBar()
+        if sb:
+            sb.setValue(sb.maximum())
+
+    def closeEvent(self, event):
+        """Kapanışta log handler'ı root logger'dan kaldır (sızıntı/çift satır önle)."""
+        try:
+            if getattr(self, "_handler", None) is not None:
+                logging.getLogger().removeHandler(self._handler)
+                self._handler = None
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     # ── Kullanıcı Yönetimi Sekmesi ────────────────────────────────────────────
     def _user_mgmt_tab(self) -> QWidget:

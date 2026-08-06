@@ -83,6 +83,12 @@ class MavlinkWorker(QThread):
         # queue.Queue thread-safe: UI thread put, worker thread get
         self._command_queue: queue.Queue = queue.Queue(maxsize=64)
         self._ned_vel_queue: queue.Queue = queue.Queue(maxsize=32)
+        # Genel aksiyon kuyruğu — GUI thread'inden gelen slot çağrılarının (set_param,
+        # inject_rtcm, request_parameters, send_manual_control, request_log_list) SOKETE
+        # DOKUNAN gövdesi burada birikir ve run() döngüsünde (worker thread) çalışır.
+        # ÖNCEDEN bu slotlar soketi doğrudan GUI thread'inde kullanıyordu ve run()'ın
+        # recv_match'iyle AYNI bağlantıya eşzamanlı erişip MAVLink akışını bozabiliyordu.
+        self._action_queue: queue.Queue = queue.Queue(maxsize=64)
         self._last_heartbeat_time: float = 0.0
         self._telemetry_accumulator: dict = {}
         self._telemetry_tick: int = 0
@@ -209,6 +215,18 @@ class MavlinkWorker(QThread):
                     self._execute_command(cmd)
                 except queue.Empty:
                     break
+
+            # Genel aksiyon kuyruğu (set_param/inject_rtcm/... gövdeleri) — worker
+            # thread'de çalışır, soket erişimi recv_match ile serileşir.
+            while True:
+                try:
+                    action = self._action_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    action()
+                except Exception as exc:
+                    logger.error("Aksiyon çalıştırılamadı: %s", exc)
 
             # NED hız komutları (yalnızca en güncel komutu gönder)
             last_vel = None
@@ -587,8 +605,24 @@ class MavlinkWorker(QThread):
         except queue.Full:
             logger.warning("Komut kuyruğu dolu — cmd_id=%d atlandı", cmd_id)
 
+    def _enqueue_action(self, fn) -> None:
+        """GUI thread'inden gelen SOKET-ERİŞİMLİ işi worker thread'e aktarır.
+
+        Aşağıdaki slotlar UI thread'inde çağrılır (worker QThread nesnesi UI
+        thread'ine ait; yalnızca run() worker thread'de koşar). Soket işini
+        doğrudan yapmak yerine kuyruğa koyarlar → run() döngüsü çalıştırır,
+        recv_match ile aynı bağlantıya eşzamanlı erişim (C4) ortadan kalkar.
+        """
+        try:
+            self._action_queue.put_nowait(fn)
+        except queue.Full:
+            logger.warning("Aksiyon kuyruğu dolu — istek atlandı")
+
     @pyqtSlot(str, float)
     def set_param(self, name: str, value: float) -> None:
+        self._enqueue_action(lambda: self._do_set_param(name, value))
+
+    def _do_set_param(self, name: str, value: float) -> None:
         if self._mav is None:
             return
         try:
@@ -604,6 +638,9 @@ class MavlinkWorker(QThread):
 
     @pyqtSlot(bytes)
     def inject_rtcm(self, data: bytes) -> None:
+        self._enqueue_action(lambda: self._do_inject_rtcm(data))
+
+    def _do_inject_rtcm(self, data: bytes) -> None:
         if self._mav is None:
             return
         try:
@@ -617,6 +654,9 @@ class MavlinkWorker(QThread):
 
     @pyqtSlot()
     def request_parameters(self) -> None:
+        self._enqueue_action(self._do_request_parameters)
+
+    def _do_request_parameters(self) -> None:
         if self._mav is None:
             return
         try:
@@ -629,6 +669,9 @@ class MavlinkWorker(QThread):
     @pyqtSlot(int, int, int, int, int)
     def send_manual_control(self, x: int, y: int, z: int, r: int, buttons: int) -> None:
         """MANUAL_CONTROL mesajı gönderir (joystick için). x,y,z,r: -1000..1000"""
+        self._enqueue_action(lambda: self._do_manual_control(x, y, z, r, buttons))
+
+    def _do_manual_control(self, x: int, y: int, z: int, r: int, buttons: int) -> None:
         if self._mav is None:
             return
         try:
@@ -642,6 +685,9 @@ class MavlinkWorker(QThread):
     @pyqtSlot()
     def request_log_list(self) -> None:
         """Drone'daki log listesini ister (LOG_REQUEST_LIST → LOG_ENTRY yanıtları)."""
+        self._enqueue_action(self._do_request_log_list)
+
+    def _do_request_log_list(self) -> None:
         if self._mav is None:
             return
         try:
