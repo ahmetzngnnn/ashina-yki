@@ -104,6 +104,9 @@ class MainWindow(QMainWindow):
         else:
             _MavCls, _VidCls, _RpiCls = MavlinkWorker, VideoStreamWorker, RpiStatusWorker
 
+        # Video kaynağı değişiminde (_apply_video_source) yeniden yaratmak için sakla.
+        self._video_cls = _VidCls
+
         self.mavlink_worker = _MavCls(self)
         self.mavlink_worker.set_db_conn(self._db_conn)
         # FIX P1-4: Timeout değerlerini config'den al
@@ -709,7 +712,10 @@ class MainWindow(QMainWindow):
         old_worker.requestInterruption()
         # UI thread'ini bloke etme — eski worker'ı arka planda bitir
         old_worker.finished.connect(old_worker.deleteLater)
-        self.video_worker = VideoStreamWorker(source=source, parent=self)
+        # sim modunda FakeVideoWorker kullanılmalı — _init_workers'ta seçilen sınıfı
+        # kullan (önceden burada sabit VideoStreamWorker vardı → sim'de gerçek worker
+        # ağa bağlanmaya çalışıyordu).
+        self.video_worker = self._video_cls(source=source, parent=self)
         self.video_worker.frame_ready.connect(self._dashboard.update_video)
         self.video_worker.error_occurred.connect(self._on_error)
         self.video_worker.start()
