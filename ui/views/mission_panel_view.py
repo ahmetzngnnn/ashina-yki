@@ -230,8 +230,10 @@ class MissionMapWidget(QWidget):
 
   def _load_html(self):
     from PyQt6.QtCore import QUrl
-    # setHtml + qrc:/// → Qt bu origin'den dış CDN'e erişime izin verir
-    self._view.setHtml(_MAP_HTML, QUrl("qrc:///"))
+    from ui.map_assets import localize_leaflet
+    # setHtml + qrc:/// → Qt bu origin'den dış CDN'e erişime izin verir.
+    # localize_leaflet: vendored Leaflet varsa inline gömer (çevrimdışı çalışır).
+    self._view.setHtml(localize_leaflet(_MAP_HTML), QUrl("qrc:///"))
 
   def _on_load(self, ok: bool):
     self._ready = ok

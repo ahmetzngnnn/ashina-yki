@@ -677,7 +677,8 @@ class MapWidget(QWidget):
     def _load_map(self) -> None:
         self._map_ready = False
         # qrc:// origin ile CDN tile isteklerine izin verilir
-        self._web.setHtml(_MAP_HTML, QUrl("qrc:///"))
+        from ui.map_assets import localize_leaflet
+        self._web.setHtml(localize_leaflet(_MAP_HTML), QUrl("qrc:///"))
 
     def _on_load_finished(self, ok: bool) -> None:
         self._map_ready = ok

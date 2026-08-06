@@ -386,7 +386,8 @@ class MissionPlanView(QWidget):
         tmp = tempfile.NamedTemporaryFile(
             suffix=".html", delete=False, mode="w", encoding="utf-8"
         )
-        tmp.write(_MISSION_MAP_HTML)
+        from ui.map_assets import localize_leaflet
+        tmp.write(localize_leaflet(_MISSION_MAP_HTML))
         tmp.close()
         self._map_ready = False
         self._web.load(QUrl.fromLocalFile(tmp.name))

@@ -16,9 +16,9 @@ import logging
 import multiprocessing
 from pathlib import Path
 
-# Yazılabilir uygulama veri klasörü (%APPDATA%\ASHINA-YKI)
-_APP_DATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / "ASHINA-YKI"
-_APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+# Yazılabilir uygulama veri klasörü (platforma göre — Win:%APPDATA%, Linux:XDG)
+from core.apppaths import app_data_dir
+_APP_DATA_DIR = app_data_dir()
 
 from PyQt6.QtWidgets import QApplication, QMessageBox
 from PyQt6.QtCore import Qt
@@ -80,7 +80,17 @@ def main() -> None:
     app.setApplicationName("ASHİNA YKİ")
     app.setApplicationVersion("2.0")
     app.setOrganizationName("ASHİNA")
-    app.setFont(QFont("Segoe UI", 10))
+    # Cross-platform arayüz fontu: Windows'ta Segoe UI, Linux/RPi'de yaygın sans
+    # fontlar (Noto/DejaVu); ilk bulunan kullanılır. Segoe UI Linux'ta YOKtur →
+    # önceden sessiz sübstitüsyon UI hizalamasını bozabiliyordu.
+    _ui_font = QFont()
+    _ui_font.setPointSize(10)
+    _ui_font.setFamilies([
+        "Segoe UI",          # Windows
+        "Noto Sans", "DejaVu Sans", "Cantarell", "Ubuntu",  # Linux/RPi
+        "Helvetica Neue", "Arial", "sans-serif",             # macOS/genel
+    ])
+    app.setFont(_ui_font)
     app.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
 
     style_path = Path(__file__).parent / "assets" / "style.qss"

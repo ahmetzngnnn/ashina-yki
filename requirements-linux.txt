@@ -1,0 +1,23 @@
+# ASHİNA YKİ — Linux / Raspberry Pi bağımlılıkları
+# Kurulum:  pip install -r requirements-linux.txt   (run.sh bunu otomatik yapar)
+#
+# Windows requirements.txt'ten farkları:
+#   • pyinstaller YOK (Windows .exe paketleme aracı — Linux'ta gereksiz)
+#   • TTS: pyttsx3 Linux'ta espeak-ng SİSTEM paketini kullanır:
+#         sudo apt install -y espeak-ng
+#   • Qt6/WebEngine sistem gereksinimi: sudo apt install -y libxcb-cursor0
+#   • RPi'de opencv-python yerine sistem paketi tercih edilebilir:
+#         sudo apt install -y python3-opencv   (o durumda buradaki satırı çıkarın)
+
+PyQt6>=6.5.0
+PyQt6-WebEngine>=6.5.0
+pymavlink>=2.4.41
+pyzmq>=25.1.0
+paho-mqtt>=2.0.0
+opencv-python>=4.8.0
+pyqtgraph>=0.13.3
+pyttsx3>=2.90
+folium>=0.14.0
+requests>=2.31.0
+cryptography>=41.0.0
+pyserial>=3.5

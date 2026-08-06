@@ -15,7 +15,7 @@ binaries  = []
 hiddenimports = []
 
 for pkg in ['pymavlink', 'cv2', 'pyttsx3', 'pyqtgraph', 'cryptography',
-            'folium', 'requests', 'serial', 'paho', 'zmq', 'pygame']:
+            'folium', 'requests', 'serial', 'paho', 'zmq']:
     try:
         d, b, h = collect_all(pkg)
         datas    += d
@@ -78,7 +78,6 @@ hiddenimports += [
     'cryptography.hazmat.backends',
     'cryptography.hazmat.backends.openssl',
     # Misc
-    'pygame',
     'PIL',
     'numpy',
 ]

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ASHİNA YKİ
+Comment=ASHİNA Yer Kontrol İstasyonu (Ground Control Station)
+# NOT: Exec yolunu kurulum konumunuza göre düzenleyin (run.sh mutlak yolu).
+Exec=bash -c "cd %k/../.. && ./run.sh"
+Icon=utilities-terminal
+Terminal=false
+Categories=Utility;Science;
+StartupNotify=true

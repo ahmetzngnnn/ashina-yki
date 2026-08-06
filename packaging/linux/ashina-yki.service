@@ -1,0 +1,26 @@
+# ASHİNA YKİ — systemd kullanıcı servisi (opsiyonel, kiosk/otomatik başlatma)
+#
+# Kurulum:
+#   mkdir -p ~/.config/systemd/user
+#   cp packaging/linux/ashina-yki.service ~/.config/systemd/user/
+#   # WorkingDirectory'yi kurulum yolunuza göre düzenleyin
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ashina-yki
+#
+# NOT: GUI uygulaması olduğundan grafik oturumu gerekir (Wayland/X). Kiosk için
+# ASHINA_YKI_KIOSK=1 ile otomatik giriş (bkz. main.py).
+[Unit]
+Description=ASHİNA YKİ Yer Kontrol İstasyonu
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ASHINA-YKI/YKI
+Environment=ASHINA_YKI_KIOSK=1
+ExecStart=/usr/bin/env bash run.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

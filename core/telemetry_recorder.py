@@ -34,9 +34,9 @@ class TelemetryRecorder(QObject):
         self._max_roll = 0.0
         self._max_pitch = 0.0
 
-        # Save directory
-        self._save_dir = Path(os.environ.get("APPDATA", Path.home())) / "ASHINA-YKI" / "telemetry_logs"
-        self._save_dir.mkdir(parents=True, exist_ok=True)
+        # Save directory (platforma göre yazılabilir veri klasörü)
+        from core.apppaths import app_data_dir
+        self._save_dir = app_data_dir("telemetry_logs")
 
         self._last_armed = False
 

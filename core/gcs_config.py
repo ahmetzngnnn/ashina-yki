@@ -12,9 +12,10 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # PyInstaller paketlemesinde __file__ _MEIPASS geçici dizinine işaret eder
-# (yazılamaz). Ayar dosyası her zaman %APPDATA%\ASHINA-YKI'da tutulur.
-_APP_DATA_DIR  = Path(os.environ.get("APPDATA", Path.home())) / "ASHINA-YKI"
-_APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+# (yazılamaz). Ayar dosyası platforma göre yazılabilir veri klasöründe tutulur
+# (Win:%APPDATA%, Linux:XDG ~/.local/share, macOS:App Support).
+from core.apppaths import app_data_dir
+_APP_DATA_DIR  = app_data_dir()
 _SETTINGS_FILE = str(_APP_DATA_DIR / "settings.json")
 
 # Geliştirme ortamı: proje kökündeki settings.json varsa onu oku ama

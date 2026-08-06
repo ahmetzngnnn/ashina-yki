@@ -12,9 +12,9 @@ from PyQt6.QtCore import QMutex, QMutexLocker, pyqtSignal, QObject
 
 logger = logging.getLogger(__name__)
 
-# Yazılabilir uygulama veri klasörü — Program Files altına yazılamaz
-_APP_DATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / "ASHINA-YKI"
-_APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+# Yazılabilir uygulama veri klasörü (platforma göre — Program Files/root altına yazmaz)
+from core.apppaths import app_data_dir
+_APP_DATA_DIR = app_data_dir()
 DB_PATH = _APP_DATA_DIR / "ashina_yki.db"
 WRITE_MUTEX = QMutex()
 
