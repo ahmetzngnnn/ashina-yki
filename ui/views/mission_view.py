@@ -134,13 +134,88 @@ _CMD_TYPES = [
     ("LOITER_UNLIM", 17),
     ("LOITER_TURNS", 18),
     ("LOITER_TIME",  19),
+    ("SPLINE_WP",    82),
     ("DELAY",        93),
     ("CHANGE_ALT",   186),
 ]
 _CMD_NAMES = {v: k for k, v in _CMD_TYPES}
 
+# Konum (lat/lon) tasiyan, harita/tabloda gösterilebilen komutlar (NAV_*)
+_POSITIONAL_CMDS = {16, 17, 18, 19, 20, 21, 22, 82}
+
 # Varsayilan yükseklik
 _DEFAULT_ALT = 30.0
+
+
+# ── Mission Planner / QGC WPL 110 dosya format (.waypoints) ─────────────────
+def _parse_qgc_wpl(text: str) -> tuple[list[dict], int, tuple[float, float] | None]:
+    """QGC WPL 110 (Mission Planner .waypoints) metnini waypoint listesine çevirir.
+    Satir 0 (seq=0) HOME noktasidir; waypoint olarak eklenmez ama kaydedilirken
+    geri yazilabilsin diye ayrica döndürülür. Konumsuz DO_* komutlari
+    (ör. DO_CHANGE_SPEED) bu görünümün harita/tablo modeli konum gerektirdiginden
+    atlanir; atlanan komut sayisi ikinci eleman olarak döner.
+    Dönüş: (waypoints, atlanan_komut_sayisi, home_latlon)
+    """
+    waypoints: list[dict] = []
+    skipped = 0
+    home: tuple[float, float] | None = None
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for line in lines:
+        if line.upper().startswith("QGC WPL"):
+            continue
+        parts = line.split()
+        if len(parts) < 12:
+            continue
+        try:
+            seq = int(parts[0])
+            command = int(parts[3])
+            param1 = float(parts[4])
+            lat = float(parts[8])
+            lon = float(parts[9])
+            alt = float(parts[10])
+        except ValueError:
+            continue
+        if seq == 0:
+            if lat != 0.0 or lon != 0.0:
+                home = (lat, lon)
+            continue  # HOME
+        if command not in _POSITIONAL_CMDS:
+            skipped += 1
+            continue
+        waypoints.append({
+            "lat": lat,
+            "lon": lon,
+            "alt": alt,
+            "cmd_id": command,
+            "delay": param1,
+        })
+    return waypoints, skipped, home
+
+
+def _build_qgc_wpl(waypoints: list[dict], home: tuple[float, float] | None = None) -> str:
+    """Waypoint listesinden Mission Planner uyumlu QGC WPL 110 metni üretir."""
+    lines = ["QGC WPL 110"]
+    if home is not None:
+        home_lat, home_lon = home
+    else:
+        home_lat, home_lon = 0.0, 0.0
+        for wp in waypoints:
+            if wp["lat"] != 0.0 or wp["lon"] != 0.0:
+                home_lat, home_lon = wp["lat"], wp["lon"]
+                break
+    # HOME — seq 0, frame 0 (GLOBAL), cmd 16
+    lines.append(
+        f"0\t1\t0\t16\t0\t0\t0\t0\t{home_lat:.8f}\t{home_lon:.8f}\t0.000000\t1"
+    )
+    for i, wp in enumerate(waypoints, start=1):
+        cmd = int(wp.get("cmd_id", 16))
+        delay = float(wp.get("delay", 0))
+        lat, lon, alt = wp["lat"], wp["lon"], wp["alt"]
+        lines.append(
+            f"{i}\t0\t3\t{cmd}\t{delay:.6f}\t0\t0\t0\t"
+            f"{lat:.8f}\t{lon:.8f}\t{alt:.6f}\t1"
+        )
+    return "\n".join(lines) + "\n"
 
 
 class MissionPlanView(QWidget):
@@ -152,6 +227,7 @@ class MissionPlanView(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._waypoints: list = []
+        self._home_latlon: tuple[float, float] | None = None
         self._map_ready = False
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(400)
@@ -196,15 +272,15 @@ class MissionPlanView(QWidget):
 
         b_clear  = btn("Temizle",  "#444", "Tüm waypointleri sil")
         b_undo   = btn("Geri Al",  "#333", "Son waypointti sil")
-        b_save   = btn("JSON Kaydet", "#0f3460", "Görevi dosyaya kaydet")
-        b_load   = btn("JSON Yükle",  "#0f3460", "Dosyadan görev yükle")
+        b_save   = btn("Kaydet", "#0f3460", "Görevi dosyaya kaydet (.waypoints / .json)")
+        b_load   = btn("Yükle",  "#0f3460", "Dosyadan görev yükle (.waypoints / .json)")
         b_read   = btn("Drone Oku",   "#2a6496", "Drone bellegindeki görevi al")
         b_write  = btn("Drone Yaz",   "#e94560", "Görevi drone bellegi'ne yaz")
 
         b_clear.clicked.connect(self._clear_all)
         b_undo.clicked.connect(self._undo_last)
-        b_save.clicked.connect(self._save_json)
-        b_load.clicked.connect(self._load_json)
+        b_save.clicked.connect(self._save_mission)
+        b_load.clicked.connect(self._load_mission)
         b_read.clicked.connect(self.read_mission)
         b_write.clicked.connect(self._write_to_drone)
 
@@ -469,6 +545,7 @@ class MissionPlanView(QWidget):
 
     def _clear_all(self) -> None:
         self._waypoints.clear()
+        self._home_latlon = None
         if _WE and hasattr(self, "_web"):
             page = self._web.page()
             if page is not None:
@@ -485,32 +562,77 @@ class MissionPlanView(QWidget):
                 page.runJavaScript("removeLastWaypoint()")
         self._refresh_table()
 
-    def _save_json(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Görevi Kaydet", "", "JSON (*.json)"
+    def _save_mission(self) -> None:
+        path, sel_filter = QFileDialog.getSaveFileName(
+            self, "Görevi Kaydet", "",
+            "Mission Planner Waypoints (*.waypoints);;JSON (*.json)"
         )
-        if path:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self._waypoints, f, indent=2, ensure_ascii=False)
+        if not path:
+            return
+        is_wpl = path.lower().endswith((".waypoints", ".txt")) or (
+            "Waypoints" in sel_filter and not path.lower().endswith(".json")
+        )
+        try:
+            if is_wpl:
+                if not path.lower().endswith((".waypoints", ".txt")):
+                    path += ".waypoints"
+                with open(path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(_build_qgc_wpl(self._waypoints, self._home_latlon))
+            else:
+                if not path.lower().endswith(".json"):
+                    path += ".json"
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(self._waypoints, f, indent=2, ensure_ascii=False)
+        except OSError as e:
+            QMessageBox.warning(self, "Hata", f"Görev dosyasi kaydedilemedi:\n{e}")
 
-    def _load_json(self) -> None:
+    def _load_mission(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Görevi Yükle", "", "JSON (*.json)"
+            self, "Görevi Yükle", "",
+            "Görev Dosyalari (*.waypoints *.txt *.json);;"
+            "Mission Planner Waypoints (*.waypoints *.txt);;JSON (*.json)"
         )
         if not path:
             return
         try:
             with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            self._clear_all()
-            for wp in data:
-                self._add_waypoint(float(wp["lat"]), float(wp["lon"]))
-                if self._waypoints:
-                    self._waypoints[-1]["alt"]    = float(wp.get("alt", _DEFAULT_ALT))
-                    self._waypoints[-1]["cmd_id"] = int(wp.get("cmd_id", 16))
-                    self._waypoints[-1]["delay"]  = int(wp.get("delay", 0))
-            self._refresh_table()
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
+                content = f.read()
+
+            if path.lower().endswith(".json"):
+                data = json.loads(content)
+                self._clear_all()
+                self._home_latlon = None
+                for wp in data:
+                    self._add_waypoint(float(wp["lat"]), float(wp["lon"]))
+                    if self._waypoints:
+                        self._waypoints[-1]["alt"]    = float(wp.get("alt", _DEFAULT_ALT))
+                        self._waypoints[-1]["cmd_id"] = int(wp.get("cmd_id", 16))
+                        self._waypoints[-1]["delay"]  = float(wp.get("delay", 0))
+                self._refresh_table()
+            else:
+                waypoints, skipped, home = _parse_qgc_wpl(content)
+                if not waypoints:
+                    QMessageBox.warning(
+                        self, "Hata",
+                        "Dosyada geçerli waypoint bulunamadi (QGC WPL 110 formati bekleniyor)."
+                    )
+                    return
+                self._clear_all()
+                self._home_latlon = home
+                for wp in waypoints:
+                    self._add_waypoint(wp["lat"], wp["lon"])
+                    if self._waypoints:
+                        self._waypoints[-1]["alt"]    = wp["alt"]
+                        self._waypoints[-1]["cmd_id"] = wp["cmd_id"]
+                        self._waypoints[-1]["delay"]  = wp["delay"]
+                self._refresh_table()
+                if skipped:
+                    QMessageBox.information(
+                        self, "Bilgi",
+                        f"{skipped} adet konumsuz komut (ör. DO_CHANGE_SPEED) atlandi;"
+                        " yalnizca haritada gösterilebilen waypoint'ler yüklendi."
+                    )
+        except (json.JSONDecodeError, KeyError, ValueError, OSError) as e:
             QMessageBox.warning(self, "Hata", f"Görev dosyasi okunamadi:\n{e}")
 
     def _write_to_drone(self) -> None:

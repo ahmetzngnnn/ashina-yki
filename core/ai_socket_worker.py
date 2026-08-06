@@ -4,6 +4,7 @@ Protokol: Plain TCP JSON, Port 5601 (MissionReceiver ile uyumlu)
 
 Her satır bir JSON mesajıdır (\n ile sonlandırılır).
 """
+import itertools
 import json
 import logging
 import queue
@@ -74,14 +75,28 @@ class AISocketWorker(QThread):
         # FIX P1-4: Timeout değerleri artık parametre — gcs_config'den beslenebilir
         self._connect_timeout  = connect_timeout
         self._response_timeout = response_timeout
-        self._send_queue: queue.Queue = queue.Queue(maxsize=10)
+        # ÖNCEDEN düz FIFO queue.Queue idi: high_priority bayrağı SADECE kuyruk
+        # DOLUYKEN bir şey yapıyordu (en eski öğeyi atıp yer açma) — normal
+        # (dolu olmayan) durumda abort/servo gibi "yüksek öncelikli" komutlar
+        # kuyruğun EN SONUNA ekleniyor, önündeki (ör. yavaş/askıda kalmış bir
+        # mission-load) komutların bitmesini bekliyordu. Flaky bir bağlantıda
+        # her item connect+response timeout kadar (varsayılan 5+5=10s) sürebilir
+        # — yani DURDUR/RTL komutu, önünde 1-2 sıradan komut varsa 10-20s
+        # gecikebiliyordu. PriorityQueue ile artık abort/servo/drop_now GERÇEKTEN
+        # öne geçiyor. seq sayacı aynı öncelikteki öğeler arasında FIFO sırasını
+        # korur (PriorityQueue eşit öncelikte dict'leri karşılaştırmaya
+        # çalışırsa TypeError atar — bu yüzden tie-breaker şart).
+        self._send_queue: queue.PriorityQueue = queue.PriorityQueue(maxsize=10)
+        self._seq_counter = itertools.count()
+        self._PRIO_HIGH = 0
+        self._PRIO_NORMAL = 10
         self.heartbeat_counter: int = 0
 
     def run(self) -> None:
         while not self.isInterruptionRequested():
             self.heartbeat_counter += 1
             try:
-                mission = self._send_queue.get(timeout=1.0)
+                _prio, _seq, mission = self._send_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
 
@@ -177,6 +192,16 @@ class AISocketWorker(QThread):
         """RPi'ye görev başlatma komutu gönderir."""
         self._enqueue({"action": "start"})
 
+    @pyqtSlot()
+    def send_abort(self) -> None:
+        """RPi'ye görev iptal komutu gönderir (yüksek öncelik — kuyruğu beklemez)."""
+        self._enqueue({"action": "abort"}, high_priority=True)
+
+    @pyqtSlot()
+    def send_drop_now(self) -> None:
+        """Manuel yük bırakma (Görev 2/3 manuel mod) — yüksek öncelik."""
+        self._enqueue({"action": "drop_now"}, high_priority=True)
+
     @pyqtSlot(str, str, int)
     def send_servo_command(self, target: str, state: str = "", angle: int = 0) -> None:
         """Manuel servo ve gimbal kontrolünü Companion PC'ye iletir."""
@@ -196,21 +221,28 @@ class AISocketWorker(QThread):
 
     def _enqueue(self, item: dict, high_priority: bool = False) -> None:
         """
-        Kuyruğa güvenli ekleme.
+        Kuyruğa güvenli ekleme (PriorityQueue — bkz. __init__ notu).
         FIX P0-1: Queue dolu ise kullanıcıya error_occurred sinyali gönderir.
-        high_priority=True ise önce en eski non-priority öğeyi atmayı dener.
+        high_priority=True → abort/servo/drop_now gibi komutlar kuyrukta
+        BEKLEYEN normal komutların ÖNÜNE geçer (dolu olsun olmasın).
         """
+        prio = self._PRIO_HIGH if high_priority else self._PRIO_NORMAL
+        entry = (prio, next(self._seq_counter), item)
         try:
-            self._send_queue.put_nowait(item)
-            logger.info("Kuyruğa eklendi: action=%s mission=%s",
+            self._send_queue.put_nowait(entry)
+            logger.info("Kuyruğa eklendi (öncelik=%s): action=%s mission=%s",
+                        "yüksek" if high_priority else "normal",
                         item.get("action"), item.get("mission_type"))
         except queue.Full:
             if high_priority:
-                # Yüksek öncelikli komutlar (servo, acil) için kuyruğu temizle
+                # Yüksek öncelikli komut için yer aç — PriorityQueue'da "en eski
+                # düşük öncelikli"yi hedeflemek yerine mevcut en-önde-bekleyeni
+                # çıkarıp yerine bunu koyuyoruz (dolu olmak zaten dejenere bir
+                # durum; kritik olan komutun GİRMESİ, kimin çıktığı değil).
                 try:
-                    self._send_queue.get_nowait()   # en eski öğeyi çıkar
-                    self._send_queue.put_nowait(item)
-                    logger.warning("Kuyruk dolu — en eski öğe atılarak yer açıldı")
+                    self._send_queue.get_nowait()
+                    self._send_queue.put_nowait(entry)
+                    logger.warning("Kuyruk dolu — yer açılıp yüksek öncelikli komut eklendi")
                     return
                 except queue.Empty:
                     pass

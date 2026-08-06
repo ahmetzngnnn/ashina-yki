@@ -12,6 +12,14 @@ logger = logging.getLogger(__name__)
 _RECONNECT_DELAY     = 5.0
 # FIX P1-5: Ardışık JSON hata eşiği — bu kadar hatadan sonra reconnect
 _JSON_ERROR_THRESHOLD = 5
+# Bu kadar süre GEÇERLİ veri (başarılı JSON parse) gelmezse bağlantı "donmuş"
+# sayılır ve yeniden kurulur. Önceden `except socket.timeout: continue` sonsuza
+# dek dönüyordu — soket açık kalıp companion sessizce yanıt vermeyi kessin
+# (ör. companion süreci kilitlendi/çöktü ama TCP bağlantısı hâlâ ayakta), UI
+# son bilinen değerleri CANLIYMIŞ GİBİ göstermeye devam ediyordu. Broadcaster
+# normalde ~1s'de bir yayın yapar (status_server.py); 10s bu değerin güvenli
+# bir katı — normal jitter'ı tolere eder ama gerçek donmayı hızlı yakalar.
+_STALE_TIMEOUT_S = 10.0
 
 
 class RpiStatusWorker(QThread):
@@ -43,6 +51,13 @@ class RpiStatusWorker(QThread):
         self._active         = False
         self._reconnect_flag = False
         self.heartbeat_counter: int = 0
+        # Aynı failsafe mesajının tekrar tekrar gösterilmesini engelle
+        self._alert_last_emit: dict = {}   # key=(subsystem,level,message) → timestamp
+        self._ALERT_COOLDOWN = 30.0        # saniye
+        # GERÇEK LAN gecikmesi (ping) — companion'a TCP RTT ölçümü, throttle'lı
+        self._last_ping_ms: float | None = None
+        self._last_ping_at: float = 0.0
+        self._PING_INTERVAL = 8.0          # saniye (companion log gürültüsünü sınırlar)
 
     # ── Kontrol metodları (main thread'den çağrılır) ───────────────────────────
 
@@ -125,6 +140,8 @@ class RpiStatusWorker(QThread):
             buf = b""
             # FIX P1-5: Ardışık JSON hata sayacı
             json_error_count = 0
+            # Sessiz-donma tespiti: son GEÇERLİ veri ne zaman geldi (bkz. _STALE_TIMEOUT_S)
+            last_data_ts = time.monotonic()
 
             while not self.isInterruptionRequested():
                 with self._addr_lock:
@@ -136,6 +153,14 @@ class RpiStatusWorker(QThread):
                 try:
                     chunk = sock.recv(4096)
                 except socket.timeout:
+                    if time.monotonic() - last_data_ts > _STALE_TIMEOUT_S:
+                        logger.warning(
+                            "RPi status bağlantısı %.0fs süredir veri vermiyor "
+                            "(soket açık ama sessiz) — yeniden bağlanılıyor",
+                            _STALE_TIMEOUT_S)
+                        self.error_occurred.emit(
+                            f"RPi bağlantısı {_STALE_TIMEOUT_S:.0f}s süredir sessiz — yeniden bağlanılıyor")
+                        break   # dış döngü reconnect yapar (self._active=False + rpi_connected(False) asagida)
                     continue
 
                 if not chunk:
@@ -151,17 +176,36 @@ class RpiStatusWorker(QThread):
                     try:
                         data = json.loads(line)
                         json_error_count = 0          # Başarılı parse → sayacı sıfırla
+                        last_data_ts = time.monotonic()  # sessiz-donma tespiti için
+                        # GERÇEK LAN gecikmesi: throttle'lı TCP RTT ölçümü ekle
+                        now_p = time.monotonic()
+                        if now_p - self._last_ping_at >= self._PING_INTERVAL:
+                            self._last_ping_at = now_p
+                            p = self._measure_ping(host, port)
+                            if p is not None:
+                                self._last_ping_ms = p
+                        if self._last_ping_ms is not None:
+                            data["ping_ms"] = self._last_ping_ms
                         self.rpi_status_updated.emit(data)
 
                         # ── Health Alerts (FAILED/CRITICAL) ──────────────────
+                        now = time.monotonic()
+                        active_keys: set = set()
                         for alert in data.get("health_alerts", []):
                             lvl = alert.get("level", "")
                             if lvl in ("FAILED", "CRITICAL"):
-                                self.health_alert.emit(
-                                    alert.get("subsystem", "?"),
-                                    lvl,
-                                    alert.get("message", ""),
-                                )
+                                sub = alert.get("subsystem", "?")
+                                msg = alert.get("message", "")
+                                key = (sub, lvl, msg)
+                                active_keys.add(key)
+                                last = self._alert_last_emit.get(key, 0.0)
+                                if now - last >= self._ALERT_COOLDOWN:
+                                    self._alert_last_emit[key] = now
+                                    self.health_alert.emit(sub, lvl, msg)
+                        # Düzelen alertlerin cache'ini temizle (tekrar oluşursa anında göster)
+                        for key in list(self._alert_last_emit):
+                            if key not in active_keys:
+                                del self._alert_last_emit[key]
 
                         # ── Mission Notifications ─────────────────────────────
                         for notif in data.get("notifications", []):
@@ -195,6 +239,21 @@ class RpiStatusWorker(QThread):
 
         self._active = False
         self.rpi_connected.emit(False)
+
+    def _measure_ping(self, host: str, port: int) -> float | None:
+        """Companion'a GERÇEK TCP RTT (LAN gecikmesi, ms). TCP el sıkışma süresini
+        ölçer — yeni kısa bağlantı açıp kapatır. Throttle'lı çağrılır."""
+        try:
+            t0 = time.perf_counter()
+            s = socket.create_connection((host, port), timeout=2.0)
+            dt = (time.perf_counter() - t0) * 1000.0
+            try:
+                s.close()
+            except Exception:
+                pass
+            return round(dt, 1)
+        except Exception:
+            return None
 
     def stop(self) -> None:
         self.requestInterruption()

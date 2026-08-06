@@ -220,12 +220,25 @@ class VideoSourceDialog(QDialog):
         # self.setStyleSheet() kaldırıldı, global style kullanılacak.
         self._build()
 
+    # Kaynak tipi index'leri (combo sırasıyla aynı)
+    _T_AUTO  = 0   # Otomatik — görev durumuna göre ham/işlenmiş
+    _T_RAW   = 1   # İHA ham kamera (port 8080)
+    _T_PROC  = 2   # İHA işlenmiş görüntü (port 8081)
+    _T_CAM   = 3   # PC kamera (index)
+    _T_URL   = 4   # URL / RTSP / HTTP
+    _T_IP    = 5   # IP kamera (ethernet)
+
     def _build(self) -> None:
         root = QVBoxLayout(self)
 
         form = QFormLayout()
         self._type_cb = QComboBox()
+        raw_p  = config.companion_video_raw_port
+        proc_p = config.companion_video_port
         self._type_cb.addItems([
+            "Otomatik (görev durumuna göre)",
+            f"İHA Ham Kamera (port {raw_p})",
+            f"İHA İşlenmiş Görüntü (port {proc_p})",
             "PC Kamera (Index)",
             "URL / RTSP / HTTP",
             "IP Kamera (Ethernet)",
@@ -233,9 +246,15 @@ class VideoSourceDialog(QDialog):
         self._type_cb.currentIndexChanged.connect(self._on_type_changed)
         form.addRow("Kaynak Tipi:", self._type_cb)
 
+        # Bilgi etiketi (Otomatik/Ham/İşlenmiş seçilince çözülen adresi gösterir)
+        self._info_lbl = QLabel()
+        self._info_lbl.setStyleSheet("color:#8ab4f8;")
+        form.addRow("", self._info_lbl)
+
         self._cam_idx = QSpinBox()
         self._cam_idx.setRange(0, 8)
         self._cam_idx.setValue(0)
+        self._cam_idx.setVisible(False)
         form.addRow("Kamera İndex:", self._cam_idx)
 
         self._url_edit = QLineEdit()
@@ -244,8 +263,7 @@ class VideoSourceDialog(QDialog):
         form.addRow("URL:", self._url_edit)
 
         self._ip_edit = QLineEdit()
-        default_port = config.companion_video_port
-        self._ip_edit.setPlaceholderText(f"192.168.1.200 (port {default_port} otomatik)")
+        self._ip_edit.setPlaceholderText(f"192.168.1.200 (port {proc_p} otomatik)")
         self._ip_edit.setVisible(False)
         form.addRow("IP (Port Otomatik):", self._ip_edit)
 
@@ -259,22 +277,42 @@ class VideoSourceDialog(QDialog):
         btns.rejected.connect(self.reject)
         root.addWidget(btns)
 
+        self._on_type_changed(self._T_AUTO)   # başlangıç bilgisini göster
+
     def _on_type_changed(self, idx: int) -> None:
-        self._cam_idx.setVisible(idx == 0)
-        self._url_edit.setVisible(idx == 1)
-        self._ip_edit.setVisible(idx == 2)
+        self._cam_idx.setVisible(idx == self._T_CAM)
+        self._url_edit.setVisible(idx == self._T_URL)
+        self._ip_edit.setVisible(idx == self._T_IP)
+
+        host   = config.companion_host
+        raw_p  = config.companion_video_raw_port
+        proc_p = config.companion_video_port
+        if idx == self._T_AUTO:
+            self._info_lbl.setText(
+                "Görev çalışırken işlenmiş, dururken ham görüntüye otomatik geçer.")
+        elif idx == self._T_RAW:
+            self._info_lbl.setText(f"→ http://{host}:{raw_p}/video")
+        elif idx == self._T_PROC:
+            self._info_lbl.setText(f"→ http://{host}:{proc_p}/video")
+        else:
+            self._info_lbl.setText("")
 
     def _on_ok(self) -> None:
-        idx = self._type_cb.currentIndex()
-        if idx == 0:
+        idx  = self._type_cb.currentIndex()
+        host = config.companion_host
+        if idx == self._T_AUTO:
+            src = "auto"   # main_window otomatik geçişi yeniden açar
+        elif idx == self._T_RAW:
+            src = f"http://{host}:{config.companion_video_raw_port}/video"
+        elif idx == self._T_PROC:
+            src = f"http://{host}:{config.companion_video_port}/video"
+        elif idx == self._T_CAM:
             src = str(self._cam_idx.value())
-        elif idx == 1:
+        elif idx == self._T_URL:
             src = self._url_edit.text().strip()
-        else:
+        else:  # _T_IP
             ip = self._ip_edit.text().strip()
-            # Ethernet kamera: HTTP MJPEG varsayım
             if not ip.startswith("http"):
-                # IP'ye port numarası ekle (companion_video_port config'ten alındı)
                 port = config.companion_video_port
                 src = f"http://{ip}:{port}/video"
             else:
@@ -306,6 +344,7 @@ class HUDWidget(QWidget):
         self._batt_v = 0.0
         self._batt_a = 0.0
         self._batt_r = 0
+        self._cell_voltages: list = []   # bireysel hücre voltajları (V)
         # GPS
         self._gps_name = "---"
         self._gps_sats = 0
@@ -330,6 +369,7 @@ class HUDWidget(QWidget):
         self._batt_v      = float(data.get("battery_voltage",   0.0))
         self._batt_a      = float(data.get("battery_current",   0.0))
         self._batt_r      = int(  data.get("battery_remaining", 0  ))
+        self._cell_voltages = list(data.get("battery_cell_voltages", []))
         self._gps_name    = str(  data.get("gps_fix_name", "---"))
         self._gps_sats    = int(  data.get("gps_sats",     0  ))
         self._hdop        = float(data.get("gps_hdop",     99.0))
@@ -499,10 +539,15 @@ class HUDWidget(QWidget):
         p.setPen(QColor(bcol))
         p.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
         p.drawText(4, by + 16, f"Bat {self._batt_v:.1f}v {self._batt_a:.1f}A {self._batt_r}%")
-        cv = self._batt_v / 3.0 if self._batt_v > 0 else 0.0
         p.setPen(QColor("#aaa"))
         p.setFont(QFont("Courier New", 8))
-        p.drawText(4, by + 30, f"Cell ~{cv:.2f}v")
+        if self._cell_voltages:
+            min_c = min(self._cell_voltages)
+            cells_str = " ".join(f"{v:.2f}" for v in self._cell_voltages)
+            p.drawText(4, by + 30, f"Hücre: {cells_str}  min:{min_c:.2f}v")
+        else:
+            cv = self._batt_v / 3.0 if self._batt_v > 0 else 0.0
+            p.drawText(4, by + 30, f"Cell ~{cv:.2f}v")
 
         # Mod + Arm (orta)
         mc = "#ff4444" if self._armed else "#4ade80"
@@ -934,6 +979,14 @@ class DashboardView(QWidget):
         rpi_tab = QWidget()
         rtl = QVBoxLayout(rpi_tab)
         rtl.setContentsMargins(2, 2, 2, 2)
+        # İHA canlı durum özeti (hedef tespit / yük / servo) — companion'dan gelir
+        self._iha_status_lbl = QLabel("İHA durumu bekleniyor...")
+        self._iha_status_lbl.setWordWrap(True)
+        self._iha_status_lbl.setStyleSheet(
+            "color:#8ab4f8;font-size:11px;padding:4px;"
+            "background:#0d1117;border:1px solid #1f2733;border-radius:3px;"
+        )
+        rtl.addWidget(self._iha_status_lbl)
         self._rpi_msg_log = QTextEdit()
         self._rpi_msg_log.setReadOnly(True)
         self._rpi_msg_log.setStyleSheet(
@@ -1160,7 +1213,7 @@ class DashboardView(QWidget):
         self._loss_bar = QProgressBar()
         self._loss_bar.setRange(0, 100)
         self._loss_bar.setValue(0)
-        self._loss_bar.setFormat("%v p/s")
+        self._loss_bar.setFormat("%v%")
         self._loss_bar.setStyleSheet("QProgressBar { background-color:#1a1a24; border:1px solid #2a2a35; border-radius:3px; text-align:center; color:#fff; font-weight:bold; height:18px; }"
                                      "QProgressBar::chunk { background-color:#c62828; }")
                                      
@@ -1363,17 +1416,21 @@ class DashboardView(QWidget):
                 float(lat), float(lon), float(hdg_val)
             )
 
-        # ── Donanım Sağlığı Canlı Güncellemesi ───────────────────────────────
+        # ── Kablosuz Bağlantı Kalitesi: GERÇEK veriler ───────────────────────
+        # NOT: CPU/RAM/Sıcaklık gerçek companion akışından update_rpi_status()'ta,
+        # Ping ise LAN RTT ölçümünden (RpiStatusWorker) gelir. Burada FC telemetrisi:
         try:
-            import random
-            # Gecikme 6-12ms arası dalgalanır
-            self._ping_bar.setValue(int(6 + (data.get("battery_voltage", 16.0) * 10) % 6 + random.randint(-1, 1)))
-            # RSSI %91-96 arası dalgalanır
-            self._rssi_bar.setValue(int(91 + (data.get("gps_status", 5) * 3) % 5 + random.randint(-1, 1)))
-            # CPU %26-34 arası dalgalanır
-            self._cpu_bar.setValue(int(30 + random.randint(-4, 4)))
-            # Sıcaklık 41-47°C arası dalgalanır
-            self._temp_bar.setValue(int(44 + random.randint(-3, 3)))
+            # RSSI — RC alıcısının GERÇEK sinyal gücü (RC_CHANNELS.rssi, 0-254; 255=veri yok)
+            rssi_raw = data.get("rc_rssi")
+            if rssi_raw is not None:
+                if rssi_raw == 255:
+                    self._rssi_bar.setValue(0)   # RC sinyali yok (ör. tezgâhta verici kapalı)
+                else:
+                    self._rssi_bar.setValue(int(max(0, min(100, rssi_raw / 254.0 * 100))))
+            # Paket Kaybı — FC'nin bildirdiği GERÇEK haberleşme düşme oranı (% = c%/100)
+            drop = data.get("drop_rate_comm")
+            if drop is not None:
+                self._loss_bar.setValue(int(max(0, min(100, drop / 100.0))))
         except Exception:
             pass
 
@@ -1521,9 +1578,92 @@ class DashboardView(QWidget):
         if sb is not None:
             sb.setValue(sb.maximum())
 
+    @pyqtSlot(dict)
+    def update_rpi_status(self, data: dict) -> None:
+        """Companion durum JSON'undan İHA canlı durumunu görselleştir:
+        TOF mesafeleri (TofWidget), hedef tespit, yük, servo durumları."""
+        # ── Sağlık paneli: GERÇEK companion sistem metrikleri (psutil, 5602) ──
+        # cpu_pct/mem_pct/temp_c companion status_server._sys_stats()'tan gelir.
+        # ping_ms RpiStatusWorker'ın LAN RTT ölçümünden eklenir.
+        try:
+            cpu = data.get("cpu_pct")
+            mem = data.get("mem_pct")
+            tmp = data.get("temp_c")
+            png = data.get("ping_ms")
+            if cpu is not None:
+                self._cpu_bar.setValue(int(max(0, min(100, round(cpu)))))
+            if mem is not None:
+                self._ram_bar.setValue(int(max(0, min(100, round(mem)))))
+            if tmp is not None:
+                self._temp_bar.setValue(int(max(0, min(120, round(tmp)))))
+            if png is not None:
+                self._ping_bar.setValue(int(max(0, min(100, round(png)))))
+        except Exception:
+            pass
+
+        # ── TOF widget'ı besle (Görev 3 yük alma görselleştirmesi) ──────────
+        tof = data.get("tof_distances", {})
+        if tof and getattr(self, "_tof_widget", None) is not None:
+            try:
+                self._tof_widget.update_tof_data(tof)
+            except Exception:
+                pass
+
+        # ── Hedef tespit / yük / servo özeti ────────────────────────────────
+        vis     = data.get("vision_status", {}) or {}
+        servo   = data.get("servo_state", {}) or {}
+        payload = data.get("payload_loaded", False)
+
+        detected = bool(vis.get("target_detected", False))
+        cam_ok   = bool(vis.get("connected", False))
+        det_txt  = "🎯 HEDEF VAR"   if detected else "hedef yok"
+        det_col  = "#10b981"        if detected else "#888"
+        cam_txt  = "kamera ✓"       if cam_ok   else "<span style='color:#ef4444'>kamera ✗</span>"
+        pl_txt   = ("<span style='color:#f59e0b'>YÜK VAR</span>" if payload else "yük yok")
+
+        def _s(v):
+            return "—" if v is None else str(v)
+        gim  = _s(servo.get("gimbal_angle"))
+        grab = _s(servo.get("grabber"))
+        rdr  = _s(servo.get("red_drop"))
+        bdr  = _s(servo.get("blue_drop"))
+
+        # ── FC görev belleği sahipliği (E2) ─────────────────────────────────
+        fc = data.get("fc_mission") or {}
+        fc_line = ""
+        if fc:
+            fc_line = (f"<br><span style='color:#aaa'>FC görevi:</span> "
+                       f"{fc.get('type','?')} {fc.get('wp_count','?')} WP "
+                       f"<span style='color:#888'>({fc.get('source','?')})</span>")
+
+        # ── Companion MAVLink görüşü (E6) — çapraz kontrol / radyo-kopuk fallback ──
+        mav = data.get("mav", {}) or {}
+        mav_line = ""
+        if mav:
+            batt = mav.get("battery", {}) or {}
+            bv = batt.get("v")
+            armed = mav.get("armed")
+            arm_txt = ("<span style='color:#ef4444'>ARMED</span>" if armed
+                       else "DISARM")
+            mav_line = (f"<br><span style='color:#666'>İHA(companion): "
+                        f"{mav.get('mode','?')} {arm_txt} "
+                        f"{('%.1fV' % bv) if isinstance(bv,(int,float)) else ''}</span>")
+
+        self._iha_status_lbl.setText(
+            f"<b style='color:{det_col}'>{det_txt}</b> &nbsp;|&nbsp; {cam_txt} "
+            f"&nbsp;|&nbsp; {pl_txt}<br>"
+            f"<span style='color:#aaa'>Gimbal:</span>{gim}° "
+            f"<span style='color:#aaa'>Grab:</span>{grab} "
+            f"<span style='color:#aaa'>Kırmızı:</span>{rdr} "
+            f"<span style='color:#aaa'>Mavi:</span>{bdr}"
+            f"{fc_line}{mav_line}"
+        )
+
     @pyqtSlot(QImage)
     def update_video(self, q_img: QImage) -> None:
         if q_img.isNull():
+            self._video_label.setPixmap(QPixmap())
+            self._video_label.setText("Yeniden baglaniyor...")
             return
             
         px = QPixmap.fromImage(q_img)

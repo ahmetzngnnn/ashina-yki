@@ -5,7 +5,7 @@ Watchdog QTimer (5 sn) ile worker heartbeat'lerini izler.
 """
 import logging
 from PyQt6.QtCore import QTimer, pyqtSlot
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QShortcut, QKeySequence
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QTabWidget,
     QStatusBar, QLabel,
@@ -40,6 +40,15 @@ from core.telemetry_recorder import TelemetryRecorder
 logger = logging.getLogger(__name__)
 
 WATCHDOG_INTERVAL_MS = 5000
+# Kaç ardışık "sayaç değişmedi" örneğinden sonra worker GERÇEKTEN "takıldı"
+# sayılsın. ÖNCEDEN tek örnekte (5s) karar veriliyordu — ama AISocketWorker'ın
+# tek bir gönderimi (connect+response timeout, varsayılan 5+5=10s) veya
+# MavlinkWorker'ın ilk bağlantıdaki wait_heartbeat(timeout=10) çağrısı gibi
+# MEŞRU bloklayan işlemler bu pencereyi rahatça aşıyor — tam da "flaky bağlantı"
+# senaryosunda (kullanıcının asıl endişesi) sahte "takıldı/yeniden başlatıldı"
+# alarmı üretiyordu. 3 ardışık örnek (15s) bu meşru gecikmeleri güvenle tolere
+# ederken gerçek bir kilitlenmeyi hâlâ makul sürede yakalar.
+HANG_CONFIRM_TICKS = 3
 
 
 class MainWindow(QMainWindow):
@@ -48,6 +57,7 @@ class MainWindow(QMainWindow):
         self._db_conn = db_conn
         self._auth = auth_manager
         self._hb_snapshots: dict = {}
+        self._hb_stale_count: dict = {}   # ardışık "değişmedi" örnek sayısı (bkz. HANG_CONFIRM_TICKS)
         self._prev_rpi_state: dict = {}   # önceki RPi durumu — değişim tespiti için
 
         self.setWindowTitle("ASHİNA YKİ  |  Taktiksel Yer Kontrol İstasyonu v2.0")
@@ -60,11 +70,21 @@ class MainWindow(QMainWindow):
         self._apply_rbac()
         self._start_workers()
 
+        # Tam ekrandan çıkış / tam ekrana geçiş (kiosk modunda pencere çerçevesi yok)
+        self._fullscreen_shortcut = QShortcut(QKeySequence("F11"), self)
+        self._fullscreen_shortcut.activated.connect(self._toggle_fullscreen)
+
         # Watchdog
         self._watchdog = QTimer(self)
         self._watchdog.setInterval(WATCHDOG_INTERVAL_MS)
         self._watchdog.timeout.connect(self._check_workers)
         self._watchdog.start()
+
+    def _toggle_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
 
     def _apply_style(self) -> None:
         # Global style.qss üzerinden yönetiliyor.
@@ -89,6 +109,10 @@ class MainWindow(QMainWindow):
         self._video_url_raw = f"http://{config.companion_host}:{config.companion_video_raw_port}/video"
         self._video_url_processed = f"http://{config.companion_host}:{config.companion_video_port}/video"
         self._current_video_source = "none"
+        # Kullanıcı diyalogdan Ham/İşlenmiş seçerse görev-bazlı otomatik geçiş durur.
+        # "Otomatik" seçilince tekrar açılır.
+        self._video_manual_override = False
+        self._last_mission_running = False   # son RPi status'tan görev aktif mi
         self.video_worker = VideoStreamWorker(
             source="none",
             open_timeout=config.video_open_timeout,
@@ -188,77 +212,51 @@ class MainWindow(QMainWindow):
 
     # ── Sinyal Bağlamaları ───────────────────────────────────────────────────
     def _connect_signals(self) -> None:
-        # Ayarlar → Worker'ları yeniden yapılandır
+        # ── MAVLink worker ↔ UI bağlantıları (TEK KAYNAK) ────────────────────
+        # Hem burada hem worker yeniden yaratılınca (_on_disconnect_requested)
+        # _wire_mavlink_worker() çağrılır → iki ayrı liste tutarsızlığı imkânsız.
+        self._wire_mavlink_worker()
+
+        # ── MAVLink dışı, kalıcı bağlantılar (yalnızca bir kez) ──────────────
+        # Ayarlar
         self._settings_view.settings_changed.connect(self._on_settings_changed)
 
-        # TopBar ↔ MAVLink
+        # TopBar ↔ bağlan/kes
         self.top_bar.connect_requested.connect(self._on_connect_requested)
         self.top_bar.disconnect_requested.connect(self._on_disconnect_requested)
 
-        # MAVLink → UI
-        self.mavlink_worker.telemetry_updated.connect(self.top_bar.update_telemetry)
-        self.mavlink_worker.telemetry_updated.connect(self._dashboard.update_telemetry)
-        self.mavlink_worker.telemetry_updated.connect(self._tuning_view.update_telemetry)
-        # Anten takip: İHA konumunu tracker'a besle (otomatik takip)
-        self.mavlink_worker.telemetry_updated.connect(self.antenna_tracker.update_drone_position)
+        # Anten Takip Paneli ↔ Worker (antenna_tracker kalıcı)
         self.antenna_tracker.error_occurred.connect(self._on_error)
-        # Anten Takip Paneli ↔ Worker
         self.antenna_tracker.tracker_status.connect(self._antenna_view.update_status)
         self.antenna_tracker.connection_changed.connect(self._antenna_view.set_connection)
         self._antenna_view.enable_requested.connect(self._on_antenna_enable)
         self._antenna_view.disable_requested.connect(self._on_antenna_disable)
         self._antenna_view.set_home_from_drone.connect(self._on_antenna_home_drone)
         self._antenna_view.set_home_manual.connect(self.antenna_tracker.set_antenna_home)
-        self.mavlink_worker.connection_changed.connect(self.top_bar.set_connection_status)
-        self.mavlink_worker.connection_changed.connect(self._on_connection_changed)
-        self.mavlink_worker.param_received.connect(self._advanced_view.update_param)
-        self.mavlink_worker.param_received.connect(self._tuning_view.update_param)
-        self.mavlink_worker.log_entry_received.connect(self._syslog_view.on_log_entry)
-        self.mavlink_worker.error_occurred.connect(self._on_error)
-        self.mavlink_worker.mag_cal_progress.connect(self._calib_view.on_mag_cal_progress)
-        self.mavlink_worker.mag_cal_report.connect(self._calib_view.on_mag_cal_report)
 
-        # UI → MAVLink
-        self._calib_view.send_command.connect(self.mavlink_worker.send_command)
-        self._tuning_view.send_command.connect(self.mavlink_worker.send_command)
-        self._tuning_view.set_param.connect(self.mavlink_worker.set_param)
-        self._advanced_view.set_param.connect(self.mavlink_worker.set_param)
-        self._advanced_view.request_params.connect(self.mavlink_worker.request_parameters)
-        self._dashboard.send_command.connect(self.mavlink_worker.send_command)
-        self._dashboard.ned_velocity_cmd.connect(self.mavlink_worker.send_ned_velocity)
+        # Dashboard → AI worker (servo) — mavlink değil
         self._dashboard.send_servo_action.connect(self.ai_worker.send_servo_command)
 
-        # Görev Paneli — JSON companion'a, MAVLink yüklemesi devre dışı
-        # MissionView bağlantısı (Telemetri)
-        self._mission_view.write_mission.connect(self.mavlink_worker.upload_mission)
-        self._mission_view.read_mission.connect(self.mavlink_worker.request_mission)
-        self.mavlink_worker.mission_download_done.connect(self._on_mission_download_done)
-        self.mavlink_worker.telemetry_updated.connect(self._mission_view.update_telemetry)
+        # Görev oku/yaz ilerleme kutusu (UI→UI, worker'dan bağımsız)
+        self._mission_view.read_mission.connect(self._on_read_mission)
 
-        # RPi Görev bağlantısı
+        # RPi Görev (companion)
         self._mission_panel.mission_ready_to_send.connect(self.ai_worker.send_mission_with_waypoints)
-        self._mission_panel.send_command.connect(self.mavlink_worker.send_command)
-        self.mavlink_worker.telemetry_updated.connect(self._mission_panel.update_telemetry)
-        self.mavlink_worker.mission_upload_done.connect(self._on_mission_upload_done)
-        self.mavlink_worker.flight_sequence_status.connect(self._status_label.setText)
 
-        # TopBar — görev başlatma companion'a gider (ai_worker)
+        # TopBar — görev başlatma companion'a (ai_worker)
         self.top_bar.start_mission_requested.connect(self.ai_worker.send_start_command)
-        # BUG FIX: fcu_start_mission_requested hiç bağlanmamıştı → FCU butonu çalışmıyordu
-        self.top_bar.fcu_start_mission_requested.connect(self.mavlink_worker.start_flight_sequence)
-
-        # Test Paneli
-        self._test_panel.send_command.connect(self.mavlink_worker.send_command)
-        self.mavlink_worker.telemetry_updated.connect(self._test_panel.update_telemetry)
+        # E3/E4: görevi durdur (companion abort + doğrudan RTL) ve manuel bırakma
+        # — handler'a yönlendirilir ki worker yeniden yaratılsa da güncel olanı kullansın
+        self.top_bar.abort_mission_requested.connect(self._on_abort_mission)
+        self.top_bar.drop_now_requested.connect(self._on_drop_now)
 
         # AI Worker ↔ UI
         self.ai_worker.ai_detection_alert.connect(self._on_ai_detection)
         self.ai_worker.mission_accepted.connect(lambda: self.top_bar.set_mission_ready(True))
         self.ai_worker.error_occurred.connect(self._on_error)
-        # FIX P0-1/P0-2: Companion görevi reddedince kullanıcıya bildir
         self.ai_worker.mission_rejected.connect(self._on_mission_rejected)
 
-        # NTRIP: sinyal bağlantıları (worker başlatılınca _on_start_ntrip'te kurulur)
+        # NTRIP (worker başlatılınca _on_start_ntrip'te de bağlanır)
         self._advanced_view.start_ntrip.connect(self._on_start_ntrip)
         self._advanced_view.stop_ntrip.connect(self._on_stop_ntrip)
 
@@ -267,24 +265,15 @@ class MainWindow(QMainWindow):
         self.video_worker.error_occurred.connect(self._on_error)
         self._dashboard.video_source_changed.connect(self._on_video_source_changed)
 
-        # Drone mesajları + Kalibrasyon telemetri
-        self.mavlink_worker.status_text_received.connect(self._dashboard.add_status_message)
-        self.mavlink_worker.status_text_received.connect(self._syslog_view.on_status_text)
-        self.mavlink_worker.telemetry_updated.connect(self._calib_view.update_telemetry)
-        self.mavlink_worker.telemetry_updated.connect(self._syslog_view.update_telemetry_for_analysis)
-        self.mavlink_worker.telemetry_updated.connect(self.telemetry_recorder.on_telemetry)
-
-        # RPi Companion Bağlantı
+        # RPi Companion
         self.top_bar.rpi_connect_requested.connect(self._on_rpi_connect_requested)
         self.top_bar.rpi_disconnect_requested.connect(self._on_rpi_disconnect_requested)
         self.top_bar.rpi_battery_config.connect(self.ai_worker.send_battery_config)
         self.rpi_worker.rpi_connected.connect(self.top_bar.set_rpi_connection_status)
         self.rpi_worker.rpi_connected.connect(self._on_rpi_connection_changed)
         self.rpi_worker.rpi_status_updated.connect(self._on_rpi_status)
-        # Yeni: Failsafe & Görev bildirimleri
         self.rpi_worker.health_alert.connect(self._on_health_alert)
         self.rpi_worker.mission_notification.connect(self._on_mission_notification)
-        # İHA Test Paneli bağlantıları
         self._iha_test_panel.run_test_requested.connect(self.ai_worker.send_run_test)
         self.rpi_worker.rpi_status_updated.connect(self._iha_test_panel.update_test_status)
         self.rpi_worker.mission_notification.connect(self._iha_test_panel.append_log)
@@ -292,11 +281,82 @@ class MainWindow(QMainWindow):
         # Auth
         self._auth.logout_required.connect(self._on_logout_required)
 
-        # Log indirme
+        # Log indirme (UI→handler; request_log_list→worker _wire'da)
         self._syslog_view.download_log.connect(self._on_download_log)
-        self._syslog_view.request_log_list.connect(self.mavlink_worker.request_log_list)
-        self.mavlink_worker.log_download_done.connect(self._on_log_download_done)
-        self.mavlink_worker.log_download_progress.connect(self._syslog_view.on_download_progress)
+
+    def _wire_mavlink_worker(self) -> None:
+        """TÜM MAVLink worker ↔ UI bağlantıları TEK YERDE.
+
+        Hem ilk kurulumda (_connect_signals) hem worker yeniden yaratıldığında
+        (_on_disconnect_requested) çağrılır. Böylece iki ayrı bağlantı listesi
+        arasındaki tutarsızlıktan doğan hatalar (çift gönderim, ölü oku/yaz butonu,
+        bağlanmayan progress vb.) kökten imkânsız hale gelir.
+
+        NOT: Yalnızca BİR ucu self.mavlink_worker olan bağlantılar buraya girer.
+        UI→UI veya UI→ai_worker gibi worker'dan bağımsız bağlantılar _connect_signals'ta.
+        """
+        w = self.mavlink_worker
+        w.set_db_conn(self._db_conn)
+
+        # worker → UI
+        # Telemetri TEK dispatcher'a gider → sürekli tüketiciler + YALNIZCA görünür
+        # sekme güncellenir (gizli sekmelerin haritası/HUD'u boşa çalışmaz).
+        w.telemetry_updated.connect(self._dispatch_telemetry)
+        w.connection_changed.connect(self.top_bar.set_connection_status)
+        w.connection_changed.connect(self._on_connection_changed)
+        w.param_received.connect(self._advanced_view.update_param)
+        w.param_received.connect(self._tuning_view.update_param)
+        w.log_entry_received.connect(self._syslog_view.on_log_entry)
+        w.error_occurred.connect(self._on_error)
+        w.mag_cal_progress.connect(self._calib_view.on_mag_cal_progress)
+        w.mag_cal_report.connect(self._calib_view.on_mag_cal_report)
+        w.status_text_received.connect(self._dashboard.add_status_message)
+        w.status_text_received.connect(self._syslog_view.on_status_text)
+        w.mission_download_done.connect(self._on_mission_download_done)
+        w.mission_download_progress.connect(self._on_mission_download_progress)
+        w.mission_upload_progress.connect(self._on_mission_upload_progress)
+        w.mission_upload_done.connect(self._on_mission_upload_done)
+        w.flight_sequence_status.connect(self._status_label.setText)
+        w.log_download_done.connect(self._on_log_download_done)
+        w.log_download_progress.connect(self._syslog_view.on_download_progress)
+
+        # UI → worker
+        self._calib_view.send_command.connect(w.send_command)
+        self._tuning_view.send_command.connect(w.send_command)
+        self._tuning_view.set_param.connect(w.set_param)
+        self._advanced_view.set_param.connect(w.set_param)
+        self._advanced_view.request_params.connect(w.request_parameters)
+        self._dashboard.send_command.connect(w.send_command)
+        self._dashboard.ned_velocity_cmd.connect(w.send_ned_velocity)
+        self._mission_view.write_mission.connect(w.upload_mission)
+        self._mission_view.read_mission.connect(w.request_mission)
+        self._mission_panel.send_command.connect(w.send_command)
+        self._test_panel.send_command.connect(w.send_command)
+        self.top_bar.fcu_start_mission_requested.connect(w.start_flight_sequence)
+        self._syslog_view.request_log_list.connect(w.request_log_list)
+
+        # NTRIP → worker (varsa)
+        if self.ntrip_worker is not None:
+            self.ntrip_worker.rtcm_ready.connect(w.inject_rtcm)
+
+    @pyqtSlot(dict)
+    def _dispatch_telemetry(self, data: dict) -> None:
+        """Telemetriyi dağıt: SÜREKLİ tüketiciler her zaman + YALNIZCA görünür sekme.
+
+        Performans: 3 web-harita + HUD repaint'leri eskiden gizli sekmelerde de
+        20Hz çalışıyordu. Artık yalnızca aktif sekmenin update_telemetry'si çağrılır.
+        """
+        # Sürekli gerekli olanlar (gizli sekmede de): durum çubuğu, kayıt, anten takip
+        self.top_bar.update_telemetry(data)
+        self.telemetry_recorder.on_telemetry(data)
+        self.antenna_tracker.update_drone_position(data)
+        self._syslog_view.update_telemetry_for_analysis(data)  # kendi içinde gate'li
+
+        # Yalnızca AKTİF sekme (pahalı: harita JS / HUD repaint)
+        cur = self._tabs.currentWidget()
+        fn = getattr(cur, "update_telemetry", None)
+        if callable(fn):
+            fn(data)
 
     # ── RBAC Erişim Kontrolü ─────────────────────────────────────────────────
     def _apply_rbac(self) -> None:
@@ -351,7 +411,7 @@ class MainWindow(QMainWindow):
 
         # Yeni boş worker — bağlantı dizesi yok, sadece bekler
         self.mavlink_worker = MavlinkWorker(self)
-        self._reconnect_mavlink_signals()
+        self._wire_mavlink_worker()   # TÜM worker↔UI bağlantıları (tek kaynak)
         self.mavlink_worker.start()
 
         # UI'yi hemen güncelle — yeni worker sinyal atmayacak
@@ -359,50 +419,9 @@ class MainWindow(QMainWindow):
         state.set_connection_status(False)
         self._status_label.setText("Bağlantı kesildi")
 
-    def _reconnect_mavlink_signals(self) -> None:
-        self.mavlink_worker.set_db_conn(self._db_conn)
-        self.mavlink_worker.telemetry_updated.connect(self.top_bar.update_telemetry)
-        self.mavlink_worker.telemetry_updated.connect(self._dashboard.update_telemetry)
-        self.mavlink_worker.telemetry_updated.connect(self._tuning_view.update_telemetry)
-        self.mavlink_worker.connection_changed.connect(self.top_bar.set_connection_status)
-        self.mavlink_worker.connection_changed.connect(self._on_connection_changed)
-        self.mavlink_worker.param_received.connect(self._advanced_view.update_param)
-        self.mavlink_worker.param_received.connect(self._tuning_view.update_param)
-        self.mavlink_worker.log_entry_received.connect(self._syslog_view.on_log_entry)
-        self.mavlink_worker.error_occurred.connect(self._on_error)
-        self.mavlink_worker.mag_cal_progress.connect(self._calib_view.on_mag_cal_progress)
-        self.mavlink_worker.mag_cal_report.connect(self._calib_view.on_mag_cal_report)
-        self._calib_view.send_command.connect(self.mavlink_worker.send_command)
-        self._tuning_view.send_command.connect(self.mavlink_worker.send_command)
-        self._tuning_view.set_param.connect(self.mavlink_worker.set_param)
-        self._advanced_view.set_param.connect(self.mavlink_worker.set_param)
-        self._advanced_view.request_params.connect(self.mavlink_worker.request_parameters)
-        self._dashboard.send_command.connect(self.mavlink_worker.send_command)
-        self._dashboard.ned_velocity_cmd.connect(self.mavlink_worker.send_ned_velocity)
-        self._dashboard.send_servo_action.connect(self.ai_worker.send_servo_command)
-        self.mavlink_worker.status_text_received.connect(self._dashboard.add_status_message)
-        self.mavlink_worker.status_text_received.connect(self._syslog_view.on_status_text)
-        self.mavlink_worker.telemetry_updated.connect(self._calib_view.update_telemetry)
-        self.mavlink_worker.telemetry_updated.connect(self._syslog_view.update_telemetry_for_analysis)
-        self.mavlink_worker.telemetry_updated.connect(self.telemetry_recorder.on_telemetry)
-        self.mavlink_worker.telemetry_updated.connect(self._mission_panel.update_telemetry)
-        self.mavlink_worker.telemetry_updated.connect(self._test_panel.update_telemetry)
-        self._mission_panel.send_command.connect(self.mavlink_worker.send_command)
-        self._mission_panel.mission_ready_to_send.connect(self.ai_worker.send_mission_with_waypoints)
-        self.mavlink_worker.mission_upload_done.connect(self._on_mission_upload_done)
-        self.mavlink_worker.flight_sequence_status.connect(self._status_label.setText)
-        # BUG FIX: FCU başlatma sinyali reconnect'te de bağlanmalı
-        self.top_bar.fcu_start_mission_requested.connect(self.mavlink_worker.start_flight_sequence)
-        self._test_panel.send_command.connect(self.mavlink_worker.send_command)
-        # NTRIP sinyali yalnızca _on_start_ntrip içinde bağlanır
-        if self.ntrip_worker is not None:
-            self.ntrip_worker.rtcm_ready.connect(self.mavlink_worker.inject_rtcm)
-        self.mavlink_worker.log_download_done.connect(self._on_log_download_done)
-        self.mavlink_worker.log_download_progress.connect(self._syslog_view.on_download_progress)
-        self._syslog_view.request_log_list.connect(self.mavlink_worker.request_log_list)
-
     @pyqtSlot(bool, str)
     def _on_mission_upload_done(self, success: bool, message: str) -> None:
+        self._close_mission_progress()
         self.top_bar.set_mission_ready(success)
         self._status_label.setText(f"Görev yükleme: {message}")
         if success:
@@ -416,6 +435,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(bool, list, str)
     def _on_mission_download_done(self, success: bool, waypoints: list, message: str) -> None:
+        self._close_mission_progress()
         self._status_label.setText(f"Görev indirme: {message}")
         if success:
             self._mission_view.load_from_drone(waypoints)
@@ -428,10 +448,85 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Görev Okuma Hatası", message)
 
     @pyqtSlot()
+    def _on_abort_mission(self) -> None:
+        """E3: Görevi durdur — companion abort + doğrudan FC RTL.
+        İki başlatma yolunu da (companion / FCU-direct) kapsar."""
+        logger.warning("GÖREV DURDUR/RTL — companion abort + doğrudan RTL")
+        try:
+            self.ai_worker.send_abort()          # companion görevini iptal et
+        except Exception as exc:
+            logger.error("Companion abort gönderilemedi: %s", exc)
+        try:
+            # MAV_CMD_DO_SET_MODE=176, base=1(CUSTOM_MODE_ENABLED), custom=6(ArduCopter RTL)
+            self.mavlink_worker.send_command(176, [1, 6, 0, 0, 0, 0, 0])
+        except Exception as exc:
+            logger.error("Doğrudan RTL gönderilemedi: %s", exc)
+        self._status_label.setText("GÖREV DURDURULDU — RTL gönderildi")
+        try:
+            self.tts_worker.speak("Görev durduruldu, eve dönülüyor")
+        except Exception:
+            pass
+
+    @pyqtSlot()
+    def _on_drop_now(self) -> None:
+        """E4: Manuel yük bırakma komutu (companion'a)."""
+        logger.info("Manuel bırakma (drop_now) gönderiliyor")
+        try:
+            self.ai_worker.send_drop_now()
+        except Exception as exc:
+            logger.error("drop_now gönderilemedi: %s", exc)
+        self._status_label.setText("Manuel bırakma komutu gönderildi")
+
+    @pyqtSlot()
     def _on_read_mission(self) -> None:
-        """Drone bellekten görevi okur."""
+        """Drone Oku tıklandı — ilerleme kutusunu hemen aç (busy)."""
         logger.info("Drone'dan görev okunuyor...")
         self._status_label.setText("Drone'dan görev okunuyor...")
+        self._show_mission_progress("Görev İndiriliyor", "Drone'dan görev okunuyor...")
+
+    # ── Görev İlerleme Kutusu (oku/yaz) ──────────────────────────────────────
+    def _show_mission_progress(self, title: str, label: str) -> None:
+        from PyQt6.QtWidgets import QProgressDialog
+        from PyQt6.QtCore import Qt
+        old = getattr(self, "_mission_progress_dlg", None)
+        if old is not None:
+            old.close()
+        dlg = QProgressDialog(label, "", 0, 0, self)   # 0,0 = belirsiz (başlangıç)
+        dlg.setWindowTitle(title)
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setCancelButton(None)        # indirme/yükleme kesilemez — iptal yok
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setValue(0)
+        dlg.show()
+        self._mission_progress_dlg = dlg
+
+    def _update_mission_progress(self, current: int, total: int, what: str) -> None:
+        dlg = getattr(self, "_mission_progress_dlg", None)
+        if dlg is None:
+            self._show_mission_progress("Görev", f"{what}...")
+            dlg = self._mission_progress_dlg
+        if total > 0:
+            if dlg.maximum() != total:
+                dlg.setMaximum(total)
+            pct = int(current / total * 100)
+            dlg.setLabelText(f"{what}: {current}/{total}  (%{pct})")
+            dlg.setValue(current)
+
+    def _close_mission_progress(self) -> None:
+        dlg = getattr(self, "_mission_progress_dlg", None)
+        if dlg is not None:
+            dlg.close()
+            self._mission_progress_dlg = None
+
+    @pyqtSlot(int, int)
+    def _on_mission_download_progress(self, current: int, total: int) -> None:
+        self._update_mission_progress(current, total, "Görev indiriliyor")
+
+    @pyqtSlot(int, int)
+    def _on_mission_upload_progress(self, current: int, total: int) -> None:
+        self._update_mission_progress(current, total, "Görev yükleniyor")
 
     @pyqtSlot(bool)
     def _on_connection_changed(self, connected: bool) -> None:
@@ -451,57 +546,44 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(dict)
     def _on_settings_changed(self, new_settings: dict) -> None:
-        """Ayarlar kaydedilince worker'ları yeni adreslerle yeniden yapılandır."""
+        """Ayarlar kaydedilince companion adreslerini YERİNDE güncelle.
+
+        ÖNEMLİ: ai_worker'ı artık YENİDEN YARATMIYORUZ. Eski kod yeniden yaratıyor
+        ama bazı sinyalleri (send_servo_action, run_test_requested) yeni worker'a
+        BAĞLAMIYORDU → servo/gimbal/grabber komutları durdurulmuş eski worker'a
+        gidip kuyruğunu dolduruyor, "kuyruk dolu" hatası veriyordu ve hiç
+        gönderilmiyordu. _send_mission her gönderimde self._host/self._port
+        okuduğu için yerinde güncelleme yeterli, güvenli ve tüm sinyaller korunur.
+        """
         from core.gcs_config import config as cfg
         host = cfg.companion_host
-        logger.info("Ayarlar değişti — AI worker yeniden başlatılıyor: %s:%d",
-                    host, cfg.companion_mission_port)
-
-        # ── 1. Eski worker'ın sinyallerini kopar ─────────────────────────
-        old = self.ai_worker
-        for disconnect in [
-            lambda: self._mission_panel.mission_ready_to_send.disconnect(old.send_mission_with_waypoints),
-            lambda: self.top_bar.start_mission_requested.disconnect(old.send_start_command),
-            lambda: self.top_bar.rpi_battery_config.disconnect(old.send_battery_config),
-            lambda: old.ai_detection_alert.disconnect(self._on_ai_detection),
-            lambda: old.error_occurred.disconnect(self._on_error),
-        ]:
-            try:
-                disconnect()
-            except Exception:
-                pass  # Zaten bağlı değilse sessizce geç
-
-        # mission_accepted lambda ile bağlandığı için tüm bağlantıları kes
+        # Komut worker'ını (5601) yerinde yeni adrese yönlendir
+        self.ai_worker._host            = host
+        self.ai_worker._port            = cfg.companion_mission_port
+        self.ai_worker._connect_timeout = cfg.ai_connect_timeout
+        self.ai_worker._response_timeout = cfg.ai_response_timeout
+        # Durum worker'ını (5602) da yeni adrese yönlendir (bağlıysa)
         try:
-            old.mission_accepted.disconnect()
+            self.rpi_worker.reconnect(host, cfg.companion_status_port)
         except Exception:
             pass
+        # Video kaynak URL'lerini yeni host'a göre tazele
+        self._video_url_raw       = f"http://{host}:{cfg.companion_video_raw_port}/video"
+        self._video_url_processed = f"http://{host}:{cfg.companion_video_port}/video"
+        logger.info("Ayarlar değişti — companion adresleri güncellendi: komut %s:%d, "
+                    "durum %s:%d", host, cfg.companion_mission_port,
+                    host, cfg.companion_status_port)
 
-        # ── 2. Eski worker'ı durdur ───────────────────────────────────────
-        old.requestInterruption()
-        old.wait(2000)
-
-        # ── 3. Yeni worker'ı oluştur ve başlat ───────────────────────────
-        from core.ai_socket_worker import AISocketWorker
-        self.ai_worker = AISocketWorker(
-            host=host,
-            port=cfg.companion_mission_port,
-            connect_timeout=cfg.ai_connect_timeout,
-            response_timeout=cfg.ai_response_timeout,
-            parent=self,
-        )
-        self.ai_worker.start()
-
-        # ── 4. Sinyalleri yeni worker'a bağla ────────────────────────────
-        self._mission_panel.mission_ready_to_send.connect(self.ai_worker.send_mission_with_waypoints)
-        self.top_bar.start_mission_requested.connect(self.ai_worker.send_start_command)
-        self.top_bar.rpi_battery_config.connect(self.ai_worker.send_battery_config)
-        self.ai_worker.ai_detection_alert.connect(self._on_ai_detection)
-        self.ai_worker.mission_accepted.connect(lambda: self.top_bar.set_mission_ready(True))
-        self.ai_worker.error_occurred.connect(self._on_error)
-        self.ai_worker.mission_rejected.connect(self._on_mission_rejected)
-
-        logger.info("AI worker yeniden başlatıldı: %s:%d", host, cfg.companion_mission_port)
+        # ── 4b. Video URL'lerini yeni host'a güncelle ─────────────────────
+        self._video_url_raw = f"http://{host}:{cfg.companion_video_raw_port}/video"
+        self._video_url_processed = f"http://{host}:{cfg.companion_video_port}/video"
+        # Aktif video kaynağı eski host'u gösteriyorsa yeni host'a taşı
+        # (override durumunu değiştirme — sadece adresi güncelle)
+        if self._current_video_source not in ("none", ""):
+            new_src = (self._video_url_processed
+                       if self._current_video_source.endswith(f":{cfg.companion_video_port}/video")
+                       else self._video_url_raw)
+            self._apply_video_source(new_src)
 
         # ── 5. RPi durum worker'ını güncelle ─────────────────────────────
         self.rpi_worker.reconnect(host, cfg.companion_status_port)
@@ -580,14 +662,41 @@ class MainWindow(QMainWindow):
             self._status_label.setText("Log indirme iptal edildi")
 
     @pyqtSlot(str)
-    def _on_video_source_changed(self, source: str) -> None:
-        """Video kaynağını değiştir — worker'ı yeniden başlat."""
+    def _on_video_source_changed(self, source: str, _user: bool = True) -> None:
+        """Video kaynağını değiştir — UI thread'ini bloklamadan worker'ı yeniden başlat.
+
+        source == "auto"  → görev-bazlı otomatik geçişi yeniden aç.
+        Aksi halde kullanıcı seçimi → manuel override (otomatik geçiş durur).
+        _user=False yalnızca otomatik geçiş mantığı tarafından çağrılır (override'ı bozmaz).
+        """
+        # "Otomatik" seçimi: override'ı kapat, mevcut görev durumuna göre kaynağı uygula
+        if source == "auto":
+            self._video_manual_override = False
+            logger.info("Video kaynağı: OTOMATİK mod (görev durumuna göre geçiş)")
+            desired = self._video_url_processed if self._mission_video_active() else self._video_url_raw
+            self._apply_video_source(desired)
+            return
+
+        # Kullanıcı diyalogdan elle seçti → otomatik geçişi durdur
+        if _user:
+            self._video_manual_override = True
+
+        self._apply_video_source(source)
+
+    def _mission_video_active(self) -> bool:
+        """Son RPi status'a göre görev çalışıyor mu (otomatik video geçişi için)."""
+        return self._last_mission_running
+
+    def _apply_video_source(self, source: str) -> None:
+        """Video worker'ı verilen kaynağa geçir (gerçek değişim)."""
         if source == self._current_video_source and self.video_worker.isRunning():
-            return   # zaten bu kaynakta — gereksiz yeniden başlatma yok
+            return
         logger.info("Video kaynağı değiştiriliyor: %s", source)
         self._current_video_source = source
-        self.video_worker.requestInterruption()
-        self.video_worker.wait(2000)
+        old_worker = self.video_worker
+        old_worker.requestInterruption()
+        # UI thread'ini bloke etme — eski worker'ı arka planda bitir
+        old_worker.finished.connect(old_worker.deleteLater)
         self.video_worker = VideoStreamWorker(source=source, parent=self)
         self.video_worker.frame_ready.connect(self._dashboard.update_video)
         self.video_worker.error_occurred.connect(self._on_error)
@@ -616,11 +725,12 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(bool)
     def _on_rpi_connection_changed(self, connected: bool) -> None:
-        """Yardımcı Bilgisayar bağlantısı koptuğunda kamerayı kapat.
-        Bağlanınca kamera _on_rpi_status (gelen ilk status) ile otomatik açılır."""
+        """RPi status port bağlantı değişimi.
+        Video akışı status porttan BAĞIMSIZ çalışır — status port kopsa da video durdurmaz.
+        Video yalnızca kullanıcı manuel bağlantıyı kesince durur (_on_disconnect_requested)."""
         if not connected:
-            logger.info("Yardımcı Bilgisayar bağlantısı kesildi → kamera kapatılıyor")
-            self._on_video_source_changed("none")
+            logger.info("Yardımcı Bilgisayar status bağlantısı kesildi (video etkilenmez)")
+            # Video burada DURDURULMAZ — VideoStreamWorker kendi retry'ını yapar
 
     @pyqtSlot(dict)
     def _on_rpi_status(self, data: dict) -> None:
@@ -633,15 +743,18 @@ class MainWindow(QMainWindow):
         m_state = mission_data.get("state", "BEKLEMEDE")
 
         # ── Video kaynağı otomatik geçiş ─────────────────────────────────────
-        # Görev aktifse işlenmiş video (8080), değilse ham kamera (8081).
+        # Görev aktifse işlenmiş video (8081), değilse ham kamera (8080).
+        # Kullanıcı diyalogdan elle Ham/İşlenmiş seçtiyse (override) dokunma.
         mission_running = bool(m_active) and str(m_state).upper() not in (
             "COMPLETED", "ABORTED", "IDLE", "BEKLEMEDE", "ERROR"
         )
-        desired_video = self._video_url_processed if mission_running else self._video_url_raw
-        if desired_video != self._current_video_source:
-            logger.info("Video kaynağı otomatik değişiyor → %s (görev durumu=%s)",
-                        "İŞLENMİŞ" if mission_running else "HAM", m_state)
-            self._on_video_source_changed(desired_video)
+        self._last_mission_running = mission_running
+        if not self._video_manual_override:
+            desired_video = self._video_url_processed if mission_running else self._video_url_raw
+            if desired_video != self._current_video_source:
+                logger.info("Video kaynağı otomatik değişiyor → %s (görev durumu=%s)",
+                            "İŞLENMİŞ" if mission_running else "HAM", m_state)
+                self._apply_video_source(desired_video)
 
         # Durum çubuğu etiketi (sağ köşe)
         conn_icon = "🟢"
@@ -652,19 +765,23 @@ class MainWindow(QMainWindow):
             f"Yardımcı Bilgisayar {conn_icon}: {state_str} | CPU:%{cpu} | RAM:%{mem} | Sıc:{temp}C"
         )
 
-        # Yeni durum alanları (payload_loaded, servo_state, vision_status, tof_distances, mav)
-        # Bu alanlar log'a kaydedilir ancak şimdilik UI'de görüntülenmez
-        payload_loaded = data.get("payload_loaded", False)
-        servo_state = data.get("servo_state", {})
-        vision_status = data.get("vision_status", {})
-        tof_distances = data.get("tof_distances", {})
-        mav = data.get("mav", {})
+        # İHA canlı durumu (payload/servo/vision/TOF) → Dashboard'da görselleştir
+        # (E5: eskiden yalnızca DEBUG'a yazılıyordu; veri zaten geliyordu)
+        try:
+            self._dashboard.update_rpi_status(data)
+        except Exception as exc:
+            logger.debug("Dashboard İHA durumu güncellenemedi: %s", exc)
 
-        if payload_loaded or servo_state or vision_status or tof_distances or mav:
-            logger.debug(
-                "RPi yardımcı durum: payload_loaded=%s, servo_state=%s, vision=%s, tof=%s, mav=%s",
-                payload_loaded, servo_state, vision_status, tof_distances, mav
-            )
+        # E2: FC görev belleği companion tarafından değiştiyse operatörü uyar
+        # (manuel yüklenen görevin üzerine yazılmış olabilir)
+        fc = data.get("fc_mission") or {}
+        fc_ts = fc.get("ts")
+        if fc_ts and fc_ts != getattr(self, "_prev_fc_mission_ts", None):
+            self._prev_fc_mission_ts = fc_ts
+            msg = (f"FC görevi güncellendi: {fc.get('type','?')} "
+                   f"{fc.get('wp_count','?')} WP (companion yükledi)")
+            self._dashboard.add_rpi_mission_message(msg)
+            self._status_label.setText(msg)
 
         # Değişim tespiti ➔ Yardımcı Bilgisayar Görev paneline mesaj yaz
         prev = getattr(self, "_prev_rpi_state", {})
@@ -693,6 +810,10 @@ class MainWindow(QMainWindow):
     def _on_rpi_disconnect_requested(self) -> None:
         self.rpi_worker.disable()
         self._rpi_status_label.setText("Yardımcı Bilgisayar: bağlı değil")
+        # Bağlantı kesildi: manuel override'ı sıfırla, videoyu durdur (yeniden
+        # bağlanınca otomatik mod devam etsin)
+        self._video_manual_override = False
+        self._apply_video_source("none")
         logger.info("Yardımcı Bilgisayar bağlantısı devre dışı bırakıldı")
 
     @pyqtSlot(str)
@@ -733,7 +854,7 @@ class MainWindow(QMainWindow):
             )
         elif level == "FAILED":
             # Statusbar'da görünür hata, dialog çıkarmıyoruz (dikkat dağıtmasın)
-            self._dashboard.add_status_message(f"[FAILSAFE] {subsystem}: {message}")
+            self._dashboard.add_status_message(f"[FAILSAFE] {subsystem}: {message}", 3)
 
     @pyqtSlot(str)
     def _on_mission_notification(self, msg: str) -> None:
@@ -756,7 +877,15 @@ class MainWindow(QMainWindow):
             "tts":     self.tts_worker,
         }
         # NTRIP opsiyonel — None ise watchdog'a dahil etme
-        optional_workers = {}
+        # rpi_worker/antenna_tracker ÖNCEDEN watchdog'a hiç dahil değildi — gerçek
+        # bir thread çökmesi (Python seviyesinde run()'dan kaçan istisna) fark
+        # edilmiyordu. Her ikisi de her zaman oluşturulur (kullanıcı etkinleştirmese
+        # de thread "idle" halde isRunning()=True kalır) — bu yüzden ntrip gibi
+        # None kontrolüne gerek yok, sadece çöküş tespiti (hang değil) yeterli.
+        optional_workers = {
+            "rpi":     self.rpi_worker,
+            "antenna": self.antenna_tracker,
+        }
         if self.ntrip_worker is not None:
             optional_workers["ntrip"] = self.ntrip_worker
 
@@ -769,10 +898,18 @@ class MainWindow(QMainWindow):
                 current = 0
 
             last = self._hb_snapshots.get(name, -1)
+            unchanged = last != -1 and current == last
 
             if name in critical_workers:
-                # Kritik worker: takılma VE çökme tespiti
-                hung    = last != -1 and current == last and worker.isRunning()
+                # Kritik worker: takılma VE çökme tespiti. Takılma tespiti
+                # HANG_CONFIRM_TICKS ardışık örnek gerektirir (bkz. üstteki not) —
+                # tek bir meşru uzun bloklama (ör. flaky bağlantıda 10s'lik bir
+                # gönderim) artık sahte "takıldı" alarmı üretmiyor.
+                if unchanged and worker.isRunning():
+                    self._hb_stale_count[name] = self._hb_stale_count.get(name, 0) + 1
+                else:
+                    self._hb_stale_count[name] = 0
+                hung    = self._hb_stale_count.get(name, 0) >= HANG_CONFIRM_TICKS
                 crashed = last != -1 and not worker.isRunning()
             else:
                 # Opsiyonel worker: sadece çöküş tespiti (idle = normal)
@@ -784,7 +921,9 @@ class MainWindow(QMainWindow):
                 logger.warning("Worker %s: %s — yeniden başlatılıyor", name, reason)
                 try:
                     worker.requestInterruption()
-                    worker.wait(3000)
+                    # UI thread'ini uzun süre bloke etme — kısa bekle (takılı worker
+                    # zaten timeout'a kadar bitmez; uzun wait sadece UI'yi dondurur).
+                    worker.wait(800)
                 except Exception:
                     pass
                 try:
@@ -794,6 +933,7 @@ class MainWindow(QMainWindow):
                 # TTS sadece kritik çöküşlerde (idle restart'larda konuşmasın)
                 if crashed:
                     self.tts_worker.speak(f"Alt sistem yeniden başlatıldı: {name}")
+                self._hb_stale_count[name] = 0   # yeniden başlattık — sayaç sıfırlansın
 
             self._hb_snapshots[name] = current
 

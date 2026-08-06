@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
   QTableWidget, QTableWidgetItem, QGroupBox, QComboBox, QDoubleSpinBox,
   QSpinBox, QHeaderView, QTextEdit, QTabWidget, QCheckBox, QMessageBox,
   QFormLayout, QLineEdit, QScrollArea, QListWidget, QListWidgetItem,
-  QAbstractItemView, QRadioButton, QButtonGroup, QFrame,
+  QAbstractItemView, QRadioButton, QButtonGroup, QFrame, QFileDialog,
 )
 
 try:
@@ -344,6 +344,301 @@ def _offset_point(lat: float, lon: float, bearing_deg: float, dist_m: float):
   lo2 = lo1 + math.atan2(math.sin(brng) * math.sin(d) * math.cos(la1),
               math.cos(d) - math.sin(la1) * math.sin(la2))
   return math.degrees(la2), math.degrees(lo2)
+
+
+# ── ∞ (Sonsuz) Rota Üretici — companion (İHA) ile BİREBİR AYNI ────────────────
+# NOT: Bu fonksiyonlar IHA/missions/infinity_flight.py içindeki üretimin aynısıdır.
+# Amaç: "WP İndir" ile Mission Planner'da test edilen rota = araca uçuşta gidenle
+# birebir aynı olsun. Matematik değişirse İKİ tarafı da güncelle.
+
+def _gen_lemniscate_pts(p1: dict, p2: dict, num_laps: int, turn_radius_m: float,
+                        max_chord_m: float = 10.0, max_turn_deg: float = 18.0,
+                        min_chord_m: float = 5.0,
+                        min_pts: int = 10, max_pts: int = 120) -> list:
+  """
+  Gerono lemniskatı, EĞRİLİĞE UYARLI örnekleme ("kalemle sekiz çizer gibi").
+  Ardışık noktalar arası ne mesafe max_chord_m'yi ne dönüş açısı max_turn_deg'i
+  aşar → apekste (dar viraj) köşe kesme, merkez geçişinde uzun düz bacak olmaz.
+  min_chord_m: FC'nin WP_RADIUS_M kabul yarıçapının (~2 m) güvenli katı — apeks
+  bölgesinde noktalar bundan yakınlaşmaz, kabul çemberleri üst üste binmez.
+  → [(lat,lon), ...]. (IHA/missions/infinity_flight.py ile birebir aynı algoritma.)
+  """
+  lat1, lon1 = float(p1["lat"]), float(p1["lon"])
+  lat2, lon2 = float(p2["lat"]), float(p2["lon"])
+  mid_lat = (lat1 + lat2) / 2.0
+  mid_lon = (lon1 + lon2) / 2.0
+  D = _haversine(lat1, lon1, lat2, lon2)
+  c = D / 2.0
+  R = min(turn_radius_m, D / 2.1)
+  a = c + R
+  s = c / a
+  b_exact = R / (s * math.sqrt(1 - s ** 2))
+  b = max(b_exact, math.sqrt(R * a))
+  beta_deg = _bearing(lat1, lon1, lat2, lon2)  # derece (kuzey=0)
+
+  def _xy(t):
+    return a * math.sin(t), b * math.sin(t) * math.cos(t)
+
+  def _ang_diff(x):
+    while x > math.pi:
+      x -= 2 * math.pi
+    while x < -math.pi:
+      x += 2 * math.pi
+    return x
+
+  DENSE = 2880
+  max_turn_rad = math.radians(max_turn_deg)
+  tg = [(k / DENSE) * 2 * math.pi for k in range(DENSE + 1)]
+  xg = [_xy(t) for t in tg]
+  thg = [math.atan2(b * math.cos(2 * t), a * math.cos(t)) for t in tg]
+  cum = [0.0]
+  for k in range(1, DENSE + 1):
+    dx = xg[k][0] - xg[k - 1][0]
+    dy = xg[k][1] - xg[k - 1][1]
+    ds = math.hypot(dx, dy)
+    dth = abs(_ang_diff(thg[k] - thg[k - 1]))
+    raw = ds / max_chord_m + dth / max_turn_rad
+    cum.append(cum[-1] + min(raw, ds / min_chord_m))
+  total_budget = cum[-1]
+
+  n = int(round(total_budget))
+  n = max(min_pts, min(max_pts, n))
+  if n % 2:
+    n += 1
+
+  def _t_at(target):
+    lo, hi = 0, DENSE
+    while lo < hi:
+      m = (lo + hi) // 2
+      if cum[m] < target:
+        lo = m + 1
+      else:
+        hi = m
+    if lo == 0:
+      return 0.0
+    c0, c1 = cum[lo - 1], cum[lo]
+    fr = 0.0 if c1 == c0 else (target - c0) / (c1 - c0)
+    return tg[lo - 1] + fr * (tg[lo] - tg[lo - 1])
+
+  pts = [(mid_lat, mid_lon)]  # M (merkez)
+  for _ in range(num_laps):
+    for i in range(1, n + 1):
+      t = _t_at((i / n) * total_budget)
+      x, y = _xy(t)
+      r = math.hypot(x, y)
+      brng = beta_deg + math.degrees(math.atan2(y, x))
+      wlat, wlon = _offset_point(mid_lat, mid_lon, brng, r)
+      pts.append((wlat, wlon))
+  return pts
+
+
+def _gen_dubins_pts(p1: dict, p2: dict, num_laps: int, turn_radius_m: float,
+                    max_chord_m: float = 10.0, max_turn_deg: float = 18.0,
+                    min_chord_m: float = 5.0,
+                    loop_speed_ms: float = None, cross_speed_ms: float = None,
+                    decel_mps2: float = 2.0) -> list:
+  """
+  İKİ ÇEMBER + İÇ TEĞET tabanlı "yuvarlak sekiz" →
+  [{"cmd":82,"lat":..,"lon":..}, {"cmd":178,"params":(p1,p2,p3,p4)}, ...].
+  (IHA/missions/infinity_flight.py generate_dubins_waypoints ile birebir aynı
+  algoritma — bkz. oradaki docstring için tasarım gerekçesi.)
+
+  loop_speed_ms verilirse WP-bazlı hız profili eklenir: döngü boyunca sabit
+  loop_speed, düz geçişte daha hızlı cross_speed; yavaşlama komutu döngü
+  başlamadan frenleme mesafesi kadar erken eklenir (bkz. companion tarafı).
+  """
+  lat1, lon1 = float(p1["lat"]), float(p1["lon"])
+  lat2, lon2 = float(p2["lat"]), float(p2["lon"])
+  mid_lat = (lat1 + lat2) / 2.0
+  mid_lon = (lon1 + lon2) / 2.0
+  D = _haversine(lat1, lon1, lat2, lon2)
+  R = min(turn_radius_m, D / 2.1)
+  alpha = math.acos(2 * R / D)
+  beta = math.radians(_bearing(lat1, lon1, lat2, lon2))
+  sweep = 2 * math.pi - 2 * alpha
+  arc_len = R * sweep
+  tangent_len = math.sqrt(max(0.0, D * D - 4 * R * R))
+
+  def _n_for(length, lo=3):
+    if length <= 0:
+      return lo
+    raw = length / max_chord_m
+    cap_low = length / min_chord_m
+    return max(lo, min(round(cap_low), max(round(raw), lo)))
+
+  def _n_for_arc(length, sweep_rad, lo=6):
+    if length <= 0:
+      return lo
+    raw_chord = length / max_chord_m
+    raw_turn = math.degrees(sweep_rad) / max_turn_deg
+    raw_n = max(raw_chord, raw_turn) + 1
+    cap_low = length / min_chord_m + 1
+    return max(lo, min(round(cap_low), round(raw_n)))
+
+  n_arc = _n_for_arc(arc_len, sweep, lo=6)
+  n_cross_full = _n_for(tangent_len, lo=2)
+  n_cross_half = _n_for(tangent_len / 2.0, lo=1)
+
+  def _arc(clat, clon, start, cw):
+    out = []
+    for i in range(n_arc):
+      frac = i / (n_arc - 1) if n_arc > 1 else 0
+      ang = start + frac * sweep if cw else start - frac * sweep
+      wlat, wlon = _offset_point(clat, clon, math.degrees(ang), R)
+      out.append((wlat, wlon))
+    return out
+
+  def _cross(flat, flon, tlat, tlon, n):
+    out = []
+    for i in range(1, n):
+      frac = i / n
+      out.append((flat + (tlat - flat) * frac, flon + (tlon - flon) * frac))
+    return out
+
+  pts = [(mid_lat, mid_lon)]  # M
+  tags = ["cross"]
+  ta2 = _offset_point(lat2, lon2, math.degrees(beta + math.pi - alpha), R)
+  ta1 = _offset_point(lat1, lon1, math.degrees(beta + alpha), R)
+
+  def _addp(new_pts, tag):
+    pts.extend(new_pts)
+    tags.extend([tag] * len(new_pts))
+
+  for lap in range(num_laps):
+    if lap == 0:
+      _addp(_cross(mid_lat, mid_lon, ta2[0], ta2[1], n_cross_half), "cross")
+    p2_arc = _arc(lat2, lon2, beta + math.pi - alpha, cw=False)
+    _addp(p2_arc, "arc")
+    _addp(_cross(p2_arc[-1][0], p2_arc[-1][1], ta1[0], ta1[1], n_cross_full), "cross")
+    p1_arc = _arc(lat1, lon1, beta + alpha, cw=True)
+    _addp(p1_arc, "arc")
+    if lap < num_laps - 1:
+      _addp(_cross(p1_arc[-1][0], p1_arc[-1][1], mid_lat, mid_lon, n_cross_half), "cross")
+      _addp([(mid_lat, mid_lon)], "cross")
+
+  nav_items = [{"cmd": 82, "lat": la, "lon": lo} for (la, lo) in pts]
+
+  if loop_speed_ms is None:
+    return nav_items
+
+  cross_speed_ms = max(cross_speed_ms or loop_speed_ms, loop_speed_ms)
+  n = len(pts)
+  brake_dist = max(0.0, (cross_speed_ms ** 2 - loop_speed_ms ** 2) / (2.0 * decel_mps2))
+  insertions = {0: cross_speed_ms}
+  for i in range(1, n):
+    if tags[i] == "arc" and tags[i - 1] == "cross":
+      back = i
+      acc = 0.0
+      while back > 0 and acc < brake_dist:
+        acc += _haversine(pts[back - 1][0], pts[back - 1][1], pts[back][0], pts[back][1])
+        back -= 1
+      insertions[back] = loop_speed_ms
+    elif tags[i] == "cross" and tags[i - 1] == "arc":
+      insertions[i] = cross_speed_ms
+
+  def _speed_item(speed):
+    return {"cmd": 178, "params": (1.0, float(speed), -1.0, 0.0)}
+
+  out = []
+  for idx in range(n):
+    if idx in insertions:
+      out.append(_speed_item(insertions[idx]))
+    out.append(nav_items[idx])
+  return out
+
+
+def compute_optimal_turn_radius(D: float, turn_radius_override: float = 0.0) -> float:
+  """R'yi DOĞRUDAN direk mesafesinden (D) türetir — companion _build_route ile
+  AYNI mantık. D/R≈2.75 sweet spot: en akıcı + en çok sekize benzeyen oran."""
+  TARGET_D_R_RATIO = 2.75
+  if turn_radius_override > 0:
+    return turn_radius_override
+  return max(8.0, min(60.0, D / TARGET_D_R_RATIO))
+
+
+def compute_ideal_cruise(R: float, bank_design_deg: float = 20.0) -> float:
+  """Verilen R'nin bank_design_deg bankta karşılığı olan ideal tur hızı (m/s)."""
+  return math.sqrt(9.81 * R * math.tan(math.radians(bank_design_deg)))
+
+
+def build_infinity_route(p1: dict, p2: dict, cruise_ms: float, num_laps: int,
+                         algorithm: str = "DUBINS",
+                         max_chord_m: float = 10.0,
+                         max_turn_deg: float = 18.0,
+                         min_chord_m: float = 5.0,
+                         turn_radius_override: float = 0.0,
+                         cross_speed_mult: float = 1.3,
+                         decel_mps2: float = 2.0) -> tuple:
+  """
+  _build_route (companion) ile AYNI parametre seçimi:
+  R DOĞRUDAN direk mesafesinden (D) türetilir (D/R≈2.75 sweet spot) — girilen
+  mesafe ne olursa olsun şekil aynı oranda kalır. Bu R'nin 20° bankta karşılığı
+  olan İDEAL DÖNGÜ hızı (loop_speed) hesaplanır ve döngü boyunca DAİMA kullanılır.
+  DUBINS'te ayrıca düz geçişte daha hızlı cross_speed hedeflenir (loop_speed ile
+  loop_speed×cross_speed_mult arasında, cruise_ms sadece bunu kelepçeler) ve
+  yavaşlama komutu frenleme mesafesi kadar erken (decel_mps2'ye göre) eklenir.
+
+  Dönüş: (route_items, loop_speed, cross_speed, turn_radius)
+  route_items: [{"cmd":82,"lat":..,"lon":..}, {"cmd":178,"params":(..)}, ...]
+
+  Varsayılan DUBINS ("yuvarlak sekiz"): sabit eğrilikli döngüler → AKICI uçuş,
+  önceliği tam matematiksel ∞ şekli değil. LEMNISCATE isteğe bağlı (daha keskin
+  apeks ama gerçek Gerono ∞ eğrisi; WP-bazlı hız profili LEMNISCATE'te uygulanmaz).
+  """
+  lat1, lon1 = float(p1["lat"]), float(p1["lon"])
+  lat2, lon2 = float(p2["lat"]), float(p2["lon"])
+  D = _haversine(lat1, lon1, lat2, lon2)
+  turn_radius = compute_optimal_turn_radius(D, turn_radius_override)
+  loop_speed = compute_ideal_cruise(turn_radius)
+  cross_speed_ceiling = loop_speed * cross_speed_mult
+  cruise_requested = cruise_ms if cruise_ms > 0 else cross_speed_ceiling
+  cross_speed = min(max(cruise_requested, loop_speed), cross_speed_ceiling)
+
+  if algorithm == "LEMNISCATE":
+    pts = _gen_lemniscate_pts(p1, p2, num_laps, turn_radius, max_chord_m, max_turn_deg, min_chord_m)
+    route = [{"cmd": 82, "lat": la, "lon": lo} for (la, lo) in pts]
+    return route, loop_speed, loop_speed, turn_radius
+
+  route = _gen_dubins_pts(p1, p2, num_laps, turn_radius, max_chord_m, max_turn_deg, min_chord_m,
+                          loop_speed_ms=loop_speed, cross_speed_ms=cross_speed, decel_mps2=decel_mps2)
+  return route, loop_speed, cross_speed, turn_radius
+
+
+def infinity_to_qgc_wpl(tkf_lat: float, tkf_lon: float, route_items: list,
+                        alt_m: float, return_to_home: bool = True) -> str:
+  """
+  ∞ rotasından Mission Planner uyumlu QGC WPL 110 metni üretir.
+  Sıra: HOME(0) → TAKEOFF(1) → [SPLINE(82) | DO_CHANGE_SPEED(178)]×N → [RTL(20)].
+  route_items: build_infinity_route'un döndürdüğü zengin liste —
+  {"cmd":82,"lat":..,"lon":..} (NAV) veya {"cmd":178,"params":(p1,p2,p3,p4)} (DO_).
+  NOT: HOME ve TAKEOFF yalnızca MP'de tek başına test edilebilsin diye eklenir;
+  companion uçuşta kalkışı GUIDED yapar, rota noktaları ise birebir aynıdır.
+  """
+  lines = ["QGC WPL 110"]
+  seq = 0
+  # HOME (kalkış noktası) — frame 0 (GLOBAL), cmd 16
+  lines.append(f"{seq}\t1\t0\t16\t0\t0\t0\t0\t"
+               f"{tkf_lat:.8f}\t{tkf_lon:.8f}\t0.000000\t1")
+  seq += 1
+  # TAKEOFF — frame 3 (GLOBAL_RELATIVE_ALT), cmd 22
+  lines.append(f"{seq}\t0\t3\t22\t0\t0\t0\t0\t0.00000000\t0.00000000\t"
+               f"{alt_m:.6f}\t1")
+  seq += 1
+  # ∞ rota maddeleri — NAV (82) veya DO_CHANGE_SPEED (178)
+  for item in route_items:
+    if item["cmd"] == 178:
+      p1, p2, p3, p4 = item["params"]
+      lines.append(f"{seq}\t0\t3\t178\t{p1:.6f}\t{p2:.6f}\t{p3:.6f}\t{p4:.6f}\t"
+                   f"0.00000000\t0.00000000\t0.000000\t1")
+    else:
+      lines.append(f"{seq}\t0\t3\t{item['cmd']}\t0\t0\t0\t0\t"
+                   f"{item['lat']:.8f}\t{item['lon']:.8f}\t{alt_m:.6f}\t1")
+    seq += 1
+  # RTL — cmd 20
+  if return_to_home:
+    lines.append(f"{seq}\t0\t3\t20\t0\t0\t0\t0\t0.00000000\t0.00000000\t0.000000\t1")
+    seq += 1
+  return "\n".join(lines) + "\n"
 
 
 def _estimate_battery(wps: list, cruise_ms: float, avg_A: float, bat_mah: float) -> dict:
@@ -984,11 +1279,13 @@ class TargetDropMissionTab(_BaseMissionTab):
     # ── Donanım / Servo Kanalları ─────────────────────────────────────────
     pin_grp = QGroupBox("Donanım / Servo Kanalları")
     pin_form = QFormLayout(pin_grp); pin_form.setSpacing(4)
-    self._pin_drop1 = _isb(1, 16, 9)
-    self._pin_drop2 = _isb(1, 16, 10)
-    self._pin_grabL = _isb(1, 16, 11)
-    self._pin_grabR = _isb(1, 16, 12)
-    self._pin_gimbal = _isb(1, 16, 13)
+    # Varsayılanlar config.json "servos" ile hizalı (gerçek kablolama):
+    # gimbal=1, red_drop=2, blue_drop=3, grabber_left=4, grabber_right=5
+    self._pin_drop1 = _isb(1, 16, 2)
+    self._pin_drop2 = _isb(1, 16, 3)
+    self._pin_grabL = _isb(1, 16, 4)
+    self._pin_grabR = _isb(1, 16, 5)
+    self._pin_gimbal = _isb(1, 16, 1)
     pin_form.addRow("Kırmızı Yük (red_drop):", self._pin_drop1)
     pin_form.addRow("Mavi Yük (blue_drop):", self._pin_drop2)
     pin_form.addRow("Sol Kapak (grab_L):", self._pin_grabL)
@@ -1169,9 +1466,12 @@ class InfinityMissionTab(_BaseMissionTab):
     form.setSpacing(6)
 
     self._inf_algo = QComboBox()
+    # Yuvarlak Sekiz varsayılan (ilk sıra): sabit yarıçaplı iki döngü — dönüş
+    # açısı HER noktada aynı, en akıcı/yumuşak seçenek, sert dönüş yapmaz.
+    # Lemniscate: matematiksel olarak tam ∞ eğrisi ama apekste daha keskin.
     self._inf_algo.addItems([
-        "Dubins Path (Maksimum Hız)",
-        "Lemniscate (Maksimum Pürüzsüzlük)"
+        "Yuvarlak Sekiz (Akıcı — Önerilen)",
+        "Lemniscate (Tam ∞ Şekli — Daha Keskin Apeks)"
     ])
     _lbl_algo = QLabel("Algoritma:"); _lbl_algo.setStyleSheet(_SL)
     form.addRow(_lbl_algo, self._inf_algo)
@@ -1198,8 +1498,87 @@ class InfinityMissionTab(_BaseMissionTab):
 
     lay.addLayout(form)
 
+    # WP'leri bilgisayara indir (Mission Planner'da test için)
+    self._btn_dl = QPushButton("📥 WP'leri İndir (.waypoints — Mission Planner)")
+    self._btn_dl.setStyleSheet(
+      "QPushButton{background:#0f3460;color:#e6edf3;padding:7px;border-radius:4px;"
+      "font-weight:bold;} QPushButton:hover{background:#16508f;}")
+    self._btn_dl.clicked.connect(self._on_download_wp)
+    lay.addWidget(self._btn_dl)
 
     self._right_lay.insertWidget(0, grp)
+
+  # ── WP'leri QGC .waypoints olarak indir ───────────────────────────────────
+  def _on_download_wp(self):
+    """Üretilen ∞ rotasını (uçuşta gidenle birebir aynı) dosyaya kaydeder."""
+    try:
+      p1 = {"lat": float(self._p1_lat.text()), "lon": float(self._p1_lon.text())}
+      p2 = {"lat": float(self._p2_lat.text()), "lon": float(self._p2_lon.text())}
+    except ValueError:
+      QMessageBox.warning(
+        self, "Eksik Koordinat",
+        "Direk 1 ve Direk 2 koordinatları eksiksiz girilmelidir.\n"
+        "Haritada 'Direk 1' / 'Direk 2' seçerek noktalara tıklayın.")
+      return
+
+    dist = _haversine(p1["lat"], p1["lon"], p2["lat"], p2["lon"])
+    if dist < 5.0:
+      QMessageBox.warning(
+        self, "Direkler Çok Yakın",
+        f"Direkler arası mesafe {dist:.1f} m — en az 5 m olmalı.")
+      return
+
+    # Kalkış noktası: girildiyse onu, yoksa direklerin ortasını kullan.
+    try:
+      tkf_lat = float(self._tkf_lat.text()); tkf_lon = float(self._tkf_lon.text())
+    except ValueError:
+      tkf_lat = (p1["lat"] + p2["lat"]) / 2.0
+      tkf_lon = (p1["lon"] + p2["lon"]) / 2.0
+
+    alt_m    = float(self._inf_alt.value())
+    num_laps = int(self._inf_laps.value())
+    cruise   = float(self._sp_crz.value())
+    algo     = "LEMNISCATE" if "Lemniscate" in self._inf_algo.currentText() else "DUBINS"
+    rth      = bool(self._rth_cb.isChecked())
+
+    try:
+      route, loop_speed, cross_speed, turn_radius = build_infinity_route(
+        p1, p2, cruise, num_laps, algo)
+      text = infinity_to_qgc_wpl(tkf_lat, tkf_lon, route, alt_m, rth)
+    except Exception as exc:
+      QMessageBox.critical(self, "Üretim Hatası", f"Rota üretilemedi:\n{exc}")
+      return
+
+    path, _ = QFileDialog.getSaveFileName(
+      self, "WP'leri Kaydet", "gorev1_sonsuz.waypoints",
+      "Waypoints (*.waypoints);;Tüm Dosyalar (*)")
+    if not path:
+      return
+    try:
+      with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    except OSError as exc:
+      QMessageBox.critical(self, "Kayıt Hatası", f"Dosya yazılamadı:\n{exc}")
+      return
+
+    nav_count = sum(1 for it in route if it["cmd"] == 82)
+    spd_count = sum(1 for it in route if it["cmd"] == 178)
+    if algo == "DUBINS" and spd_count > 0:
+      hiz_notu = (f"Döngü (viraj) hızı: {loop_speed:.1f} m/s  |  Düz geçiş hızı: "
+                 f"{cross_speed:.1f} m/s\n"
+                 f"Rotaya {spd_count} adet WP-bazlı hız komutu (DO_CHANGE_SPEED) "
+                 f"gömüldü — dönüşten önce otomatik yavaşlar, düz geçişte hızlanır. "
+                 f"Bu mission'ı uçuran her GCS (MP dahil) bu komutları uygular.")
+    else:
+      hiz_notu = f"Tur hızı: {loop_speed:.1f} m/s (bu mesafe için 20° bank veren ideal hız)."
+    QMessageBox.information(
+      self, "İndirildi",
+      f"∞ rota kaydedildi:\n{path}\n\n"
+      f"Algoritma: {algo}\nDirek mesafesi: {dist:.1f} m  →  Dönüş yarıçapı: {turn_radius:.1f} m "
+      f"(D/R={dist/turn_radius:.2f})\n"
+      f"∞ nokta sayısı: {nav_count}  ({num_laps} tur)\n"
+      f"İrtifa: {alt_m:.0f} m\n{hiz_notu}\n\n"
+      "Mission Planner → Flight Plan → Load WP File ile açıp test edebilirsiniz.")
 
   # ── Harita tıklama — hedef seçime göre yönlendir ──────────────────────────
   @pyqtSlot(float, float)

@@ -226,7 +226,17 @@ class Drone3DWidget(QWidget):
         
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
-        self._timer.start(40)
+        # Timer yalnızca widget görünürken çalışır (gizli Kalibrasyon sekmesinde
+        # 25Hz animasyon CPU yakmasın). showEvent/hideEvent ile gated.
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._timer.isActive():
+            self._timer.start(40)
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._timer.stop()
 
     def set_target_attitude(self, r, p, y):
         self._target_roll = r

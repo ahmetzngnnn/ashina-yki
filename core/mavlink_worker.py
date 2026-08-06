@@ -26,6 +26,34 @@ _COPTER_MODES = {
 
 _GPS_FIX_NAMES = {0: "No GPS", 1: "No Fix", 2: "2D", 3: "3D", 4: "DGPS", 5: "RTK Float", 6: "RTK Fixed"}
 
+# ── Telemetri akış aralıkları (µs) — mesaj_id → aralık ────────────────────────
+# Radyo (telemetri COM, ~57600 baud) bant genişliğine uygun seçildi. Eskiden
+# REQUEST_DATA_STREAM(ALL@4Hz) + yüksek SET_MESSAGE_INTERVAL birlikte radyoyu
+# doyuruyordu (mission indirme 500ms/WP). 100_000µs=10Hz, 500_000=2Hz, 1e6=1Hz.
+_MSG_INTERVALS_NORMAL = {
+    30:    100_000,    # ATTITUDE            10 Hz
+    74:    200_000,    # VFR_HUD              5 Hz
+    24:    250_000,    # GPS_RAW_INT          4 Hz
+    33:    200_000,    # GLOBAL_POSITION_INT  5 Hz
+    1:     500_000,    # SYS_STATUS           2 Hz
+    147:   500_000,    # BATTERY_STATUS       2 Hz
+    193: 1_000_000,    # EKF_STATUS_REPORT    1 Hz
+    65:    250_000,    # RC_CHANNELS          4 Hz
+    242: 2_000_000,    # HOME_POSITION        0.5 Hz
+    11030: 500_000,    # ESC 1-4              2 Hz
+    11031: 500_000,    # ESC 5-8             2 Hz
+    11032: 500_000,    # ESC 9-12            2 Hz
+    11033: 500_000,    # ESC 13-16           2 Hz
+}
+# Mission upload/download sırasında: ağır akışları kıs → radyo MISSION_ITEM'a açılır.
+_MSG_INTERVALS_TRANSFER = {
+    30:    500_000,    # ATTITUDE 2Hz (HUD yine de oynar)
+    74:  1_000_000,    33:    500_000,   24: 1_000_000,
+    1:   1_000_000,    147: 1_000_000,   193: 2_000_000,
+    65:  2_000_000,    242: 2_000_000,
+    11030: 2_000_000,  11031: 2_000_000, 11032: 2_000_000, 11033: 2_000_000,
+}
+
 
 class MavlinkWorker(QThread):
     # Sinyaller
@@ -39,6 +67,7 @@ class MavlinkWorker(QThread):
     mag_cal_report = pyqtSignal(int, int, float)    # compass_id, cal_status, fitness
     mission_upload_progress = pyqtSignal(int, int)  # seq, total
     mission_upload_done = pyqtSignal(bool, str)     # success, message
+    mission_download_progress = pyqtSignal(int, int)  # current, total
     mission_download_done = pyqtSignal(bool, list, str) # success, waypoints, message
     flight_sequence_status = pyqtSignal(str)        # status text
     log_download_progress = pyqtSignal(int, int)    # bytes_received, total_bytes
@@ -57,6 +86,9 @@ class MavlinkWorker(QThread):
         self._last_heartbeat_time: float = 0.0
         self._telemetry_accumulator: dict = {}
         self._telemetry_tick: int = 0
+        # Zaman tabanlı telemetri throttle — mesaj seli olsa da UI ≤15Hz alır
+        self._last_telemetry_emit: float = 0.0
+        self._telemetry_min_interval: float = 1.0 / 15.0   # ~66 ms = 15 Hz
         # Gerçek autopilot kimliği (is_autopilot heartbeat'inden):
         # wait_heartbeat target_component=0 (broadcast) yakalayabilir;
         # bunu kullanırsak komutlar MAVProxy gibi ara komponentlerle de
@@ -72,6 +104,14 @@ class MavlinkWorker(QThread):
         self._param_cache: dict = {}
         self._param_total: int = 0   # PARAM_VALUE.param_count'tan doldurulur
         self._db_conn = None         # set_db_conn() ile atanır
+        # 16 kanallık ESC tamponu — tüm ESC_TELEMETRY mesajları buraya yazılır
+        self._esc_all = {
+            'rpm':  [0]   * 16,
+            'volt': [0.0] * 16,
+            'curr': [0.0] * 16,
+            'temp': [0]   * 16,
+            'mah':  [0]   * 16,
+        }
 
     def set_db_conn(self, db_conn) -> None:
         """SQLite bağlantısını atar — parametre cache DB'ye yazılır."""
@@ -289,6 +329,9 @@ class MavlinkWorker(QThread):
                 _sh = msg.onboard_control_sensors_health
                 update: dict = {
                     "errors_comm":    msg.errors_comm,
+                    # FC'nin bildirdiği GERÇEK haberleşme düşme oranı (MAVLink SYS_STATUS
+                    # drop_rate_comm, birim c% = %×100). Paket Kaybı göstergesini besler.
+                    "drop_rate_comm": msg.drop_rate_comm,
                     "accel_cal_done": bool(_sh & 0x02),
                     "compass_cal_done": bool(_sh & 0x04),
                 }
@@ -304,8 +347,9 @@ class MavlinkWorker(QThread):
                 # İlk batarya (battery_id=0) kullanılır
                 if getattr(msg, "id", 0) == 0:
                     voltages = getattr(msg, "voltages", [])
-                    cell_v = [v for v in voltages if v != 65535]
-                    total_v = sum(cell_v) / 1000.0 if cell_v else 0.0
+                    cell_mv = [v for v in voltages if v != 65535]
+                    cell_v  = [v / 1000.0 for v in cell_mv]   # mV → V
+                    total_v = sum(cell_v) if cell_v else 0.0
                     current_a = (msg.current_battery / 100.0
                                  if msg.current_battery != -1 else 0.0)
                     mah_used  = (msg.current_consumed
@@ -313,11 +357,12 @@ class MavlinkWorker(QThread):
                     remaining = (msg.battery_remaining
                                  if msg.battery_remaining != -1 else -1)
                     self._telemetry_accumulator.update({
-                        "battery_voltage":   total_v,
-                        "battery_current":   current_a,
-                        "battery_mah_used":  mah_used,
-                        "battery_remaining": remaining,
-                        "battery_cells":     len(cell_v),
+                        "battery_voltage":        total_v,
+                        "battery_current":         current_a,
+                        "battery_mah_used":        mah_used,
+                        "battery_remaining":       remaining,
+                        "battery_cells":           len(cell_v),
+                        "battery_cell_voltages":   cell_v,
                     })
             elif msg_type == "GLOBAL_POSITION_INT":
                 # relative_alt = ev noktasına göre GPS-EKF fused irtifa (mm → m)
@@ -377,15 +422,28 @@ class MavlinkWorker(QThread):
                     "time_utc": msg.time_utc,
                     "size": msg.size,
                 })
-            elif msg_type == "ESC_TELEMETRY_1_TO_4":
-                # Debug output to verify what's coming in
-                # print(f"DEBUG ESC: RPM={msg.rpm}, V={msg.voltage}, A={msg.current}, T={msg.temperature}")
+            elif msg_type in ("ESC_TELEMETRY_1_TO_4",   "ESC_TELEMETRY_5_TO_8",
+                              "ESC_TELEMETRY_9_TO_12",  "ESC_TELEMETRY_13_TO_16"):
+                _ESC_BASE = {"ESC_TELEMETRY_1_TO_4":    0, "ESC_TELEMETRY_5_TO_8":   4,
+                              "ESC_TELEMETRY_9_TO_12":  8, "ESC_TELEMETRY_13_TO_16": 12}
+                base = _ESC_BASE[msg_type]
+                for i in range(4):
+                    b = base + i
+                    self._esc_all['rpm'][b]  = msg.rpm[i]
+                    self._esc_all['volt'][b] = msg.voltage[i] / 100.0
+                    self._esc_all['curr'][b] = msg.current[i] / 100.0
+                    self._esc_all['temp'][b] = msg.temperature[i]
+                    self._esc_all['mah'][b]  = msg.totalcurrent[i]
+                # Bağlı ESC'leri bul: voltaj > 5 V olan slotlar (boşta bile batarya gerilimini gösterir)
+                slots = [i for i in range(16) if self._esc_all['volt'][i] > 5.0][:4]
+                if not slots:
+                    slots = [9, 10, 11, 12]   # Fallback: kanal 10-13 (0-tabanlı indeks)
                 self._telemetry_accumulator.update({
-                    "esc_rpm": list(msg.rpm),
-                    "esc_voltage": [v / 100.0 for v in msg.voltage],
-                    "esc_current": [c / 100.0 for c in msg.current],
-                    "esc_temp": list(msg.temperature),
-                    "esc_mah": list(msg.totalcurrent),
+                    "esc_rpm":     [self._esc_all['rpm'][i]  for i in slots],
+                    "esc_voltage": [self._esc_all['volt'][i] for i in slots],
+                    "esc_current": [self._esc_all['curr'][i] for i in slots],
+                    "esc_temp":    [self._esc_all['temp'][i] for i in slots],
+                    "esc_mah":     [self._esc_all['mah'][i]  for i in slots],
                 })
             elif msg_type == "VIBRATION":
                 self._telemetry_accumulator["vib_x"] = getattr(msg, "vibration_x", 0.0)
@@ -394,80 +452,68 @@ class MavlinkWorker(QThread):
             elif msg_type == "PID_TUNING":
                 self._telemetry_accumulator["pid_err"] = getattr(msg, "pe", 0.0)
 
-            # ~20 Hz telemetri yayını (her 5 mesajda bir)
-            self._telemetry_tick += 1
-            if self._telemetry_tick >= 5 and self._telemetry_accumulator:
-                self._telemetry_tick = 0
+            # Telemetri yayını — ZAMAN TABANLI throttle (≤15 Hz).
+            # Eskiden "her 5 mesaj"dı; mesaj seli (çift stream/yüksek hız) olunca
+            # emit hızı kontrolsüz artıyordu. Artık mesaj hızından bağımsız sabit tavan.
+            now = time.time()
+            if (self._telemetry_accumulator
+                    and now - self._last_telemetry_emit >= self._telemetry_min_interval):
+                self._last_telemetry_emit = now
                 data = dict(self._telemetry_accumulator)
-                data["last_heartbeat_age"] = time.time() - self._last_heartbeat_time
+                data["last_heartbeat_age"] = now - self._last_heartbeat_time
                 self.telemetry_updated.emit(data)
 
     def _request_streams(self) -> None:
-        """Telemetri akışlarını ister.
+        """Telemetri akışlarını ister (radyo-uyumlu hızlar).
 
-        İki yöntem birlikte gönderilir:
-          1. REQUEST_DATA_STREAM (#66)  — ArduPilot ≤3.x (SITL 3.3 dahil)
-          2. SET_MESSAGE_INTERVAL (#511) — ArduPilot ≥4.x (modern)
-
-        Drone kendi desteklediğini yanıtlar; diğerini yoksayar.
+        ArduPilot ≥4.x için SET_MESSAGE_INTERVAL (#511) asıl yöntem. Eski FC (≤3.x)
+        fallback'i için HEDEFLİ REQUEST_DATA_STREAM gönderilir — ama 'ALL' (stream 0)
+        ARTIK GÖNDERİLMEZ: ALL@4Hz, RAW_IMU/SCALED_PRESSURE/SERVO_OUTPUT gibi gereksiz
+        mesajları akıtıp radyoyu doyuruyordu (mission indirme 500ms/WP nedeni).
         """
         if self._mav is None:
             return
 
-        # ── Yöntem 1: REQUEST_DATA_STREAM (eski ArduPilot / SITL 3.3) ────────
-        # MAV_DATA_STREAM değerleri:
-        #   0=ALL  1=RAW_SENSORS  2=EXTENDED_STATUS  3=RC_CHANNELS
-        #   6=POSITION  10=EXTRA1(ATTITUDE)  11=EXTRA2(VFR_HUD)  12=EXTRA3
-        LEGACY_STREAMS = [
-            (0,  4),   # ALL           4 Hz — güvenli genel istek
-            (6,  5),   # POSITION      5 Hz — GLOBAL_POSITION_INT, GPS_RAW_INT
-            (10, 10),  # EXTRA1       10 Hz — ATTITUDE
-            (11, 10),  # EXTRA2       10 Hz — VFR_HUD
-            (12,  2),  # EXTRA3        2 Hz — EKF_STATUS_REPORT
-            (2,   2),  # EXT_STATUS    2 Hz — SYS_STATUS, BATTERY_STATUS
-            (3,   5),  # RC_CHANNELS   5 Hz
-        ]
+        # ── Eski FC fallback: HEDEFLİ streamler (ALL YOK) ────────────────────
+        #   2=EXT_STATUS 3=RC 6=POSITION 10=EXTRA1(ATTITUDE) 11=EXTRA2(VFR) 12=EXTRA3
+        LEGACY_STREAMS = [(6, 4), (10, 8), (11, 5), (12, 1), (2, 2), (3, 4)]
         for stream_id, rate_hz in LEGACY_STREAMS:
             try:
                 self._mav.mav.request_data_stream_send(
-                    self._mav.target_system,
-                    self._mav.target_component,
-                    stream_id,
-                    rate_hz,
-                    1,   # start
+                    self._mav.target_system, self._mav.target_component,
+                    stream_id, rate_hz, 1,
                 )
             except Exception as exc:
                 logger.warning("REQUEST_DATA_STREAM başarısız (stream=%d): %s", stream_id, exc)
 
-        # ── Yöntem 2: SET_MESSAGE_INTERVAL (modern ArduPilot ≥4.x) ───────────
-        # target_component = 1 (autopilot) — MAVProxy'nin comp=0 broadcast'ini atlıyoruz
-        # (msg_id, interval_us)  — 100_000 µs = 10 Hz, 200_000 = 5 Hz
+        # ── Modern: SET_MESSAGE_INTERVAL (ArduPilot ≥4.x) ────────────────────
+        self._apply_message_intervals(_MSG_INTERVALS_NORMAL)
+
+    def _apply_message_intervals(self, intervals: dict) -> None:
+        """Verilen {msg_id: interval_us} tablosunu SET_MESSAGE_INTERVAL ile uygular."""
+        if self._mav is None:
+            return
         sys_id = self._mav.target_system or 1
-        STREAMS = [
-            (30,  100_000),   # ATTITUDE            10 Hz
-            (74,  100_000),   # VFR_HUD             10 Hz
-            (24,  200_000),   # GPS_RAW_INT          5 Hz
-            (33,  200_000),   # GLOBAL_POSITION_INT  5 Hz
-            (1,   500_000),   # SYS_STATUS           2 Hz
-            (147, 500_000),   # BATTERY_STATUS       2 Hz
-            (193, 500_000),   # EKF_STATUS_REPORT    2 Hz
-            (65,  200_000),   # RC_CHANNELS          5 Hz
-            (242, 500_000),   # HOME_POSITION        2 Hz
-            (11030, 200_000), # ESC_TELEMETRY_1_TO_4 5 Hz
-        ]
-        for msg_id, interval_us in STREAMS:
+        for msg_id, interval_us in intervals.items():
             try:
                 self._mav.mav.command_long_send(
-                    sys_id,
-                    1,      # comp=1: doğrudan autopilot'a gönder
-                    511,    # MAV_CMD_SET_MESSAGE_INTERVAL
+                    sys_id, 1,      # comp=1: doğrudan autopilot
+                    511,            # MAV_CMD_SET_MESSAGE_INTERVAL
                     0,
-                    float(msg_id),
-                    float(interval_us),
+                    float(msg_id), float(interval_us),
                     0, 0, 0, 0, 0,
                 )
             except Exception as exc:
                 logger.warning("SET_MESSAGE_INTERVAL başarısız (msg=%d): %s", msg_id, exc)
+
+    def _set_transfer_mode(self, on: bool) -> None:
+        """Mission upload/download sırasında ağır telemetri akışlarını geçici kıs
+        (radyo MISSION_ITEM'a açılır → indirme 3-4× hızlanır). Bitince normale döner."""
+        try:
+            self._apply_message_intervals(
+                _MSG_INTERVALS_TRANSFER if on else _MSG_INTERVALS_NORMAL)
+        except Exception as exc:
+            logger.warning("Transfer modu akış ayarı başarısız: %s", exc)
 
         logger.info("Telemetri akışları talep edildi (legacy + modern)")
 
@@ -616,9 +662,10 @@ class MavlinkWorker(QThread):
 
     @pyqtSlot(dict, list)
     def upload_mission(self, params: dict, waypoints: list) -> None:
-        """Görevi FC'ye MAVLink ile yükler (TCP:5762 — MAVProxy interferansı yok)."""
+        """Görevi FC'ye yükler — AKTİF bağlantı çubuğu bağlantısını kullanır
+        (COM/serial, TCP veya UDP — neye bağlıysan ona)."""
         if self._mav is None:
-            self.mission_upload_done.emit(False, "Drone bağlı değil")
+            self.mission_upload_done.emit(False, "Drone bağlı değil (bağlantı çubuğundan bağlanın)")
             return
         alt = float(params.get("flight_altitude_m", 15.0))
         if waypoints and str(waypoints[0].get("type", "")).upper() == "TAKEOFF":
@@ -628,9 +675,9 @@ class MavlinkWorker(QThread):
 
     @pyqtSlot()
     def request_mission(self) -> None:
-        """Drone'dan görevi indirmeyi talep eder."""
+        """Drone'dan görevi indirir — AKTİF bağlantı çubuğu bağlantısını kullanır."""
         if self._mav is None:
-            self.mission_download_done.emit(False, [], "Drone bağlı değil")
+            self.mission_download_done.emit(False, [], "Drone bağlı değil (bağlantı çubuğundan bağlanın)")
             return
         self._download_mission_pending = True
 
@@ -653,6 +700,9 @@ class MavlinkWorker(QThread):
 
         def _hb():
             nonlocal last_hb
+            # Uzun işlem (upload/download) run loop'u bloke eder; watchdog'un
+            # worker'ı "takıldı" sanıp interrupt etmemesi için canlılık sayacını artır.
+            self.heartbeat_counter += 1
             if time.time() - last_hb > 1.0:
                 try:
                     self._mav.mav.heartbeat_send(
@@ -664,6 +714,7 @@ class MavlinkWorker(QThread):
                     pass
                 last_hb = time.time()
 
+        self._set_transfer_mode(True)   # ağır telemetriyi kıs → radyo upload'a açılır
         try:
             self._mav.mav.mission_clear_all_send(sys_id, comp_id)
             _hb()
@@ -801,6 +852,8 @@ class MavlinkWorker(QThread):
         except Exception as exc:
             logger.error("Mission upload hatası: %s", exc)
             self.mission_upload_done.emit(False, str(exc))
+        finally:
+            self._set_transfer_mode(False)   # normal telemetri hızlarına dön
 
     def _do_mission_download(self) -> None:
         """FC'den görev listesini indirir."""
@@ -810,6 +863,9 @@ class MavlinkWorker(QThread):
         last_hb = time.time()
         def _hb():
             nonlocal last_hb
+            # Uzun işlem (upload/download) run loop'u bloke eder; watchdog'un
+            # worker'ı "takıldı" sanıp interrupt etmemesi için canlılık sayacını artır.
+            self.heartbeat_counter += 1
             if time.time() - last_hb > 1.0:
                 try:
                     self._mav.mav.heartbeat_send(
@@ -821,9 +877,10 @@ class MavlinkWorker(QThread):
                     pass
                 last_hb = time.time()
 
+        self._set_transfer_mode(True)   # ağır telemetriyi kıs → radyo MISSION_ITEM'a açılır
         try:
             self._mav.mav.mission_request_list_send(sys_id, comp_id)
-            
+
             # MISSION_COUNT bekle
             msg = self._mav.recv_match(type=["MISSION_COUNT"], blocking=True, timeout=5.0)
             if not msg:
@@ -832,11 +889,12 @@ class MavlinkWorker(QThread):
 
             count = msg.count
             logger.info("Drone %d WP bildirdi. İndirme başlıyor...", count)
-            
+
             if count == 0:
                 self.mission_download_done.emit(True, [], "Görev listesi boş.")
                 return
 
+            self.mission_download_progress.emit(0, count)   # ilerleme: başlangıç
             waypoints = []
             for seq in range(count):
                 retries = 0
@@ -862,6 +920,7 @@ class MavlinkWorker(QThread):
                         }
                         waypoints.append(wp)
                         logger.debug("WP[%d] alındı", seq)
+                        self.mission_download_progress.emit(seq + 1, count)
                         break
                     else:
                         retries += 1
@@ -877,6 +936,8 @@ class MavlinkWorker(QThread):
         except Exception as exc:
             logger.error("Mission download hatası: %s", exc)
             self.mission_download_done.emit(False, [], str(exc))
+        finally:
+            self._set_transfer_mode(False)   # normal telemetri hızlarına dön
 
     def _do_flight_sequence(self) -> None:
         """GUIDED → ARM → TAKEOFF → bekle → AUTO sekansı."""
@@ -888,6 +949,9 @@ class MavlinkWorker(QThread):
 
         def _hb():
             nonlocal last_hb
+            # Uzun işlem (upload/download) run loop'u bloke eder; watchdog'un
+            # worker'ı "takıldı" sanıp interrupt etmemesi için canlılık sayacını artır.
+            self.heartbeat_counter += 1
             if time.time() - last_hb > 1.0:
                 try:
                     self._mav.mav.heartbeat_send(

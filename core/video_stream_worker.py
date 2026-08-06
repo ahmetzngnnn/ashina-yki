@@ -1,32 +1,32 @@
 """
-video_stream_worker.py — Video İşleyici
+video_stream_worker.py — Video Alıcı (YKI tarafı sıfır işlem)
+==============================================================
+YKI yalnızca RPi'dan gelen JPEG'leri alır ve Qt'ye verir.
+Hiçbir görüntü işlemi (renk dönüşümü, cv2, numpy) yapılmaz.
+
 Desteklenen kaynaklar:
-  - "none" veya boş  : Pasif mod
-  - "0", "1" ...     : /dev/videoN webcam index
-  - "http://..."     : MJPEG HTTP stream
-  - GStreamer pipeline string
+  - "none" / boş   : Pasif
+  - "http://..."   : MJPEG HTTP stream (Content-Length tabanlı parser)
+  - "0", "1" ...   : Yerel webcam (cv2, yalnızca test için)
 """
-import io
 import logging
 import time
 import urllib.request
 from PyQt6.QtCore import QThread, pyqtSignal
-from PyQt6.QtGui import QImage
+from PyQt6.QtGui  import QImage
 
 try:
     import cv2
-    import numpy as np
     CV2_AVAILABLE = True
 except ImportError:
     CV2_AVAILABLE = False
-    logging.warning("opencv-python kurulu değil — Video devre dışı")
 
 logger = logging.getLogger(__name__)
 
-TARGET_FPS          = 30
-_MAX_RETRY_DELAY    = 30   # saniye
-_MIN_RETRY_DELAY    = 2    # saniye
-_BUF_OVERFLOW_BYTES = 262144  # 256 KB
+_MAX_RETRY_DELAY = 10
+_MIN_RETRY_DELAY = 1
+_READ_CHUNK      = 65536   # 64 KB
+_MAX_BUF         = 524288  # 512 KB — taşma koruması
 
 
 class VideoStreamWorker(QThread):
@@ -40,7 +40,6 @@ class VideoStreamWorker(QThread):
         super().__init__(parent)
         self._source       = source
         self._open_timeout = open_timeout
-        # FIX P1-4: retry_delay parametre (gcs_config'den beslenebilir)
         self._retry_delay  = retry_delay
         self.heartbeat_counter: int = 0
 
@@ -48,134 +47,139 @@ class VideoStreamWorker(QThread):
         self._source = source
 
     def run(self) -> None:
-        # FIX P1-1: Exponential backoff — bağlantı sorunlarında giderek artan bekleme
-        retry_delay = _MIN_RETRY_DELAY
-
+        retry = _MIN_RETRY_DELAY
         while not self.isInterruptionRequested():
             self.heartbeat_counter += 1
             src = self._source.strip()
             if not src or src.lower() == "none":
-                retry_delay = _MIN_RETRY_DELAY   # kaynak temizlenince sıfırla
+                retry = _MIN_RETRY_DELAY
                 time.sleep(1)
                 continue
             try:
                 if src.startswith("http://") or src.startswith("https://"):
-                    self._capture_http(src)
+                    self._recv_mjpeg(src)
                 else:
-                    self._capture_cv(src)
-                # Bağlantı başarılı kapandı (interrupt veya kaynak değişimi) → sıfırla
-                retry_delay = _MIN_RETRY_DELAY
+                    self._recv_webcam(src)
+                retry = _MIN_RETRY_DELAY
             except Exception as exc:
                 logger.warning("Video bağlanamadı (%s): %s — %ds sonra tekrar",
-                               src, exc, retry_delay)
+                               src, exc, retry)
                 self.error_occurred.emit(str(exc))
-                # FIX P1-1: Exponential backoff ile bekle
-                for _ in range(retry_delay):
+                self.frame_ready.emit(QImage())
+                for _ in range(retry):
                     if self.isInterruptionRequested():
                         return
                     time.sleep(1)
-                # Sonraki deneme için süreyi iki katına çıkar (max'a kadar)
-                retry_delay = min(retry_delay * 2, _MAX_RETRY_DELAY)
+                retry = min(retry * 2, _MAX_RETRY_DELAY)
 
-    # ── HTTP MJPEG Parser ──────────────────────────────────────────────────────
-    def _capture_http(self, url: str) -> None:
-        if not CV2_AVAILABLE:
-            time.sleep(1)
-            return
-
+    # ── HTTP MJPEG Alıcı — Content-Length tabanlı, sıfır işlem ──────────────
+    def _recv_mjpeg(self, url: str) -> None:
+        """
+        MJPEG stream'den JPEG baytlarını alır.
+        Content-Length başlığı varsa tam frame boyutunu kullanır (güvenilir).
+        YKI tarafında hiçbir piksel işlemi yapılmaz — Qt kendi JPEG decoder'ını kullanır.
+        """
         try:
             req = urllib.request.urlopen(url, timeout=self._open_timeout)
         except Exception as e:
             raise ConnectionError(f"HTTP bağlanamadı: {e}")
 
-        ct = req.headers.get("Content-Type", "")
-        boundary = b""
-        if "boundary=" in ct:
-            bnd = ct.split("boundary=")[1].strip().split(";")[0].strip()
-            boundary = ("--" + bnd).encode()
-
-        logger.info("HTTP MJPEG akışı başladı: %s (boundary=%r)", url, boundary)
+        logger.info("MJPEG alıcı başladı: %s", url)
         buf = b""
-        interval = 1.0 / TARGET_FPS
-        last_frame_t = time.monotonic()
+        _HEND = b"\r\n\r\n"
 
         while not self.isInterruptionRequested():
             self.heartbeat_counter += 1
             try:
-                chunk = req.read(32768)
+                chunk = req.read(_READ_CHUNK)
             except Exception:
+                self.frame_ready.emit(QImage())
                 break
             if not chunk:
+                self.frame_ready.emit(QImage())
                 break
             buf += chunk
 
-            # Buffer overflow koruması
-            if len(buf) > _BUF_OVERFLOW_BYTES:
-                last_sof = buf.rfind(b"\xff\xd8")
-                if last_sof > 0:
-                    buf = buf[last_sof:]
+            # Taşma koruması — en son SOI'den başa sar
+            if len(buf) > _MAX_BUF:
+                soi = buf.rfind(b"\xff\xd8")
+                buf = buf[soi:] if soi >= 0 else b""
+                continue
 
+            # Tampondaki tüm tam kareleri işle
             while True:
-                start = buf.find(b"\xff\xd8")
-                if start < 0:
+                h_end = buf.find(_HEND)
+                if h_end < 0:
                     break
-                end = buf.find(b"\xff\xd9", start + 2)
-                if end < 0:
-                    break
-                end += 2
-                jpeg = buf[start:end]
-                buf  = buf[end:]
 
-                arr   = np.frombuffer(jpeg, dtype=np.uint8)
-                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                if frame is None:
-                    continue
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                h, w, ch = rgb.shape
-                q_img = QImage(bytes(rgb.data), w, h, ch * w,
-                               QImage.Format.Format_RGB888).copy()
-                self.frame_ready.emit(q_img)
+                # Content-Length'i ayrıştır
+                header_raw = buf[:h_end]
+                cl = 0
+                for line in header_raw.split(b"\r\n"):
+                    if line.lower().startswith(b"content-length:"):
+                        try:
+                            cl = int(line.split(b":", 1)[1].strip())
+                        except ValueError:
+                            pass
+                        break
 
-                now     = time.monotonic()
-                sleep_t = interval - (now - last_frame_t)
-                if sleep_t > 0:
-                    time.sleep(sleep_t)
-                last_frame_t = time.monotonic()
+                frame_start = h_end + 4  # \r\n\r\n'yi atla
 
-    # ── OpenCV Yerel Kaynak ───────────────────────────────────────────────────
-    def _capture_cv(self, source: str) -> None:
+                if cl > 0:
+                    # Tam veri geldi mi?
+                    if len(buf) < frame_start + cl:
+                        break
+                    jpeg = buf[frame_start:frame_start + cl]
+                    buf  = buf[frame_start + cl:]
+                    if buf.startswith(b"\r\n"):
+                        buf = buf[2:]
+                else:
+                    # Fallback: JPEG SOI/EOI işaretçileri
+                    soi = buf.find(b"\xff\xd8", frame_start)
+                    if soi < 0:
+                        break
+                    eoi = buf.find(b"\xff\xd9", soi + 2)
+                    if eoi < 0:
+                        break
+                    jpeg = buf[soi:eoi + 2]
+                    buf  = buf[eoi + 2:]
+
+                # Piksel işlemi yok — Qt JPEG decoder doğrudan
+                q = QImage()
+                if q.loadFromData(jpeg):
+                    self.frame_ready.emit(q)
+
+    # ── Yerel Webcam (yalnızca test, cv2 gerektirir) ─────────────────────────
+    def _recv_webcam(self, source: str) -> None:
         if not CV2_AVAILABLE:
             time.sleep(1)
             return
-
+        import numpy as np
         try:
             cap_src = int(source)
         except ValueError:
             cap_src = source
-
         cap = cv2.VideoCapture(cap_src)
         if not cap.isOpened():
-            raise ConnectionError(f"Video kaynağı açılamadı: {source}")
-
-        logger.info("Video akışı başladı: %s", source)
-        interval     = 1.0 / TARGET_FPS
-        last_frame_t = time.monotonic()
+            raise ConnectionError(f"Webcam açılamadı: {source}")
+        logger.info("Webcam başladı: %s", source)
+        interval = 1.0 / 30
+        last_t   = time.monotonic()
         try:
             while not self.isInterruptionRequested():
                 self.heartbeat_counter += 1
                 ret, frame_bgr = cap.read()
                 if not ret:
-                    logger.warning("Kare alınamadı — yeniden bağlanılıyor")
                     break
                 rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 h, w, ch = rgb.shape
-                q_img = QImage(bytes(rgb.data), w, h, ch * w,
-                               QImage.Format.Format_RGB888).copy()
-                self.frame_ready.emit(q_img)
-                sleep_t = interval - (time.monotonic() - last_frame_t)
-                if sleep_t > 0:
-                    time.sleep(sleep_t)
-                last_frame_t = time.monotonic()
+                q = QImage(bytes(rgb.data), w, h, ch * w,
+                           QImage.Format.Format_RGB888).copy()
+                self.frame_ready.emit(q)
+                s = interval - (time.monotonic() - last_t)
+                if s > 0:
+                    time.sleep(s)
+                last_t = time.monotonic()
         finally:
             cap.release()
 

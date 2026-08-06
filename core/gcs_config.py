@@ -25,12 +25,12 @@ if not os.path.exists(_SETTINGS_FILE) and os.path.exists(_DEV_SETTINGS):
     shutil.copy(_DEV_SETTINGS, _SETTINGS_FILE)
 
 DEFAULTS: dict = {
-    "companion_host":         "192.168.10.138",
+    "companion_host":         "192.168.1.229",   # İHA RPi — yardımcı bilgisayar + video (8080/8081)
     "companion_mission_port": 5601,
     "companion_status_port":  5602,
-    "companion_video_port":   8080,          # İşlenmiş video (görev sırasında, video_streamer)
-    "companion_video_raw_port": 8081,        # Ham kamera (görev yokken, relay)
-    "mavlink_host":           "192.168.10.138",
+    "companion_video_port":   8081,          # İşlenmiş video (görev sırasında, vision annotated)
+    "companion_video_raw_port": 8080,        # Ham kamera (her zaman açık)
+    "mavlink_host":           "192.168.1.229",   # MAVLink de aynı RPi üzerinden (port 5763)
     "mavlink_port":           5763,
     # FIX P1-4: Timeout değerleri artık configurable
     "ai_connect_timeout":     5.0,           # AISocketWorker TCP bağlantı timeout (s)
@@ -108,7 +108,7 @@ class GCSConfig:
 
     @property
     def companion_video_raw_port(self) -> int:
-        return int(self._data.get("companion_video_raw_port", 8081))
+        return int(self._data.get("companion_video_raw_port", 8080))
 
     # ── Anten Takip property'leri ─────────────────────────────────────────
     @property

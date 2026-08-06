@@ -94,16 +94,25 @@ def main() -> None:
 
     # ── 4. Login Penceresi ────────────────────────────────────────────────────
     main_window: MainWindow | None = None
+    kiosk_mode = os.environ.get("ASHINA_YKI_KIOSK") == "1"
 
     def on_login_success(role: int) -> None:
         nonlocal main_window
         logger.info("Giriş başarılı — rol: %s", role)
         main_window = MainWindow(db_conn, auth_manager)
-        main_window.show()
+        if kiosk_mode:
+            main_window.showFullScreen()
+        else:
+            main_window.show()
 
-    login = LoginWindow(auth_manager)
-    login.login_successful.connect(on_login_success)
-    login.show()
+    if kiosk_mode:
+        logger.info("Kiosk modu aktif — giriş ekranı atlanıyor, admin olarak otomatik giriş.")
+        auth_manager.authenticate_local("admin", "admin")
+        on_login_success(auth_manager.get_role())
+    else:
+        login = LoginWindow(auth_manager)
+        login.login_successful.connect(on_login_success)
+        login.show()
 
     # ── 5. Event Loop ─────────────────────────────────────────────────────────
     exit_code = app.exec()
