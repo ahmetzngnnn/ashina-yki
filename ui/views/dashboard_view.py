@@ -638,7 +638,9 @@ class QuickDataWidget(QWidget):
             yaw_d += 360.0
         self._value_labels["yaw_deg"].setText(fmt(yaw_d))
         self._value_labels["climb"].setText(fmt(float(data.get("climb", 0.0))))
-        self._value_labels["heading"].setText(str(data.get("heading", 0)))
+        # heading: ham float yerine tam derece (0-359). ÖNCEDEN str() ile 15 ondalık
+        # gösteriliyordu ("20.1747259...").
+        self._value_labels["heading"].setText(f"{int(round(float(data.get('heading', 0)))) % 360}°")
 
 
 # ── Harita Widget ─────────────────────────────────────────────────────────────
@@ -1061,25 +1063,25 @@ class DashboardView(QWidget):
         lbl_red = QLabel("Kırmızı Yük:")
         lbl_red.setStyleSheet(lbl_style)
         btn_drop_red_open = QPushButton("Aç")
-        btn_drop_red_open.setStyleSheet("background-color:#a82020; color:white; font-weight:bold; font-size:11px; padding: 4px; border-radius:3px; border:none;")
+        btn_drop_red_open.setStyleSheet("background-color:#3a1f22; color:#ff8a85; border:1px solid #7a3b3b; border-radius:6px; padding:6px; font-weight:600; font-size:11px;")
         btn_drop_red_close = QPushButton("Kapat")
-        btn_drop_red_close.setStyleSheet("background-color:#2a2a35; color:#aaa; font-weight:bold; font-size:11px; padding: 4px; border-radius:3px; border:none;")
+        btn_drop_red_close.setStyleSheet("background-color:#1f2a33; color:#8996a3; border:1px solid #35424d; border-radius:6px; padding:6px; font-weight:600; font-size:11px;")
         
         # 2. Mavi Yük
         lbl_blue = QLabel("Mavi Yük:")
         lbl_blue.setStyleSheet(lbl_style)
         btn_drop_blue_open = QPushButton("Aç")
-        btn_drop_blue_open.setStyleSheet("background-color:#1565c0; color:white; font-weight:bold; font-size:11px; padding: 4px; border-radius:3px; border:none;")
+        btn_drop_blue_open.setStyleSheet("background-color:#182a3d; color:#7db8f0; border:1px solid #35597a; border-radius:6px; padding:6px; font-weight:600; font-size:11px;")
         btn_drop_blue_close = QPushButton("Kapat")
-        btn_drop_blue_close.setStyleSheet("background-color:#2a2a35; color:#aaa; font-weight:bold; font-size:11px; padding: 4px; border-radius:3px; border:none;")
+        btn_drop_blue_close.setStyleSheet("background-color:#1f2a33; color:#8996a3; border:1px solid #35424d; border-radius:6px; padding:6px; font-weight:600; font-size:11px;")
         
         # 3. Yük Alma Kapakları
         lbl_grab = QLabel("Yük Kapak:")
         lbl_grab.setStyleSheet(lbl_style)
         btn_grab_open = QPushButton("Aç")
-        btn_grab_open.setStyleSheet("background-color:#2e7d32; color:white; font-weight:bold; font-size:11px; padding: 4px; border-radius:3px; border:none;")
+        btn_grab_open.setStyleSheet("background-color:#1c3a2a; color:#6ee7a0; border:1px solid #2f6b48; border-radius:6px; padding:6px; font-weight:600; font-size:11px;")
         btn_grab_close = QPushButton("Kapat")
-        btn_grab_close.setStyleSheet("background-color:#37474f; color:#ccc; font-weight:bold; font-size:11px; padding: 4px; border-radius:3px; border:none;")
+        btn_grab_close.setStyleSheet("background-color:#1f2a33; color:#8996a3; border:1px solid #35424d; border-radius:6px; padding:6px; font-weight:600; font-size:11px;")
         
         # 4. Gimbal
         lbl_gimbal = QLabel("Gimbal Açısı:")

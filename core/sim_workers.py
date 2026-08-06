@@ -47,13 +47,17 @@ class FakeMavlinkWorker(MavlinkWorker):
             lat = _HOME_LAT + R * math.sin(t * 0.15)
             lon = _HOME_LON + R * math.cos(t * 0.15)
             alt = 30.0 + 5.0 * math.sin(t * 0.3)
-            yaw = math.degrees(t * 0.15) % 360.0
+            yaw_deg = math.degrees(t * 0.15) % 360.0
             batt = max(30.0, 100.0 - t * 0.2)
+            # ATTITUDE sözleşmesi RADYAN (gerçek MavlinkWorker msg.yaw radyan gönderir;
+            # dashboard math.degrees uygular). heading/hdg ise tam derece (VFR_HUD int).
             data = {
                 "lat": lat, "lon": lon, "alt": alt,
                 "relative_alt": alt, "baro_alt": alt,
-                "roll": 3.0 * math.sin(t), "pitch": 2.0 * math.cos(t),
-                "yaw": yaw, "heading": yaw, "hdg": yaw,
+                "roll": math.radians(3.0 * math.sin(t)),
+                "pitch": math.radians(2.0 * math.cos(t)),
+                "yaw": math.radians(yaw_deg),
+                "heading": int(yaw_deg), "hdg": int(yaw_deg),
                 "rollspeed": 0.0, "pitchspeed": 0.0, "yawspeed": 0.0,
                 "groundspeed": 6.0 + math.sin(t), "airspeed": 6.0,
                 "climb": math.cos(t * 0.3), "throttle": 45,
