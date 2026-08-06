@@ -73,7 +73,7 @@ class SettingsView(QWidget):
 
         self._add_field(comp_layout, 0, "IP Adresi",
                         "companion_host", is_spin=False,
-                        placeholder="192.168.10.138")
+                        placeholder="192.168.1.10")
         self._add_field(comp_layout, 1, "Görev Portu (TCP)",
                         "companion_mission_port", is_spin=True, spin_range=(1, 65535))
         self._add_field(comp_layout, 2, "Durum Portu (TCP)",
@@ -91,7 +91,7 @@ class SettingsView(QWidget):
 
         self._add_field(mav_layout, 0, "Host / IP",
                         "mavlink_host", is_spin=False,
-                        placeholder="192.168.10.138")
+                        placeholder="192.168.1.10")
         self._add_field(mav_layout, 1, "Port",
                         "mavlink_port", is_spin=True, spin_range=(1, 65535))
 

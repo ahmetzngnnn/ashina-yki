@@ -92,7 +92,19 @@ class MainWindow(QMainWindow):
 
     # ── Worker Başlatma ──────────────────────────────────────────────────────
     def _init_workers(self) -> None:
-        self.mavlink_worker = MavlinkWorker(self)
+        # mode=sim → sahte worker'lar (gerçek İHA/SITL olmadan arayüzü canlı gör).
+        # Fake sınıflar gerçek worker'ları alt-sınıflar; imzalar aynı, sinyaller aynı.
+        if config.is_sim:
+            from core.sim_workers import (
+                FakeMavlinkWorker as _MavCls,
+                FakeVideoWorker as _VidCls,
+                FakeRpiStatusWorker as _RpiCls,
+            )
+            logger.info("YKİ SİMÜLASYON modu — sahte worker'lar (mavlink/video/rpi) aktif")
+        else:
+            _MavCls, _VidCls, _RpiCls = MavlinkWorker, VideoStreamWorker, RpiStatusWorker
+
+        self.mavlink_worker = _MavCls(self)
         self.mavlink_worker.set_db_conn(self._db_conn)
         # FIX P1-4: Timeout değerlerini config'den al
         self.ai_worker = AISocketWorker(
@@ -113,14 +125,14 @@ class MainWindow(QMainWindow):
         # "Otomatik" seçilince tekrar açılır.
         self._video_manual_override = False
         self._last_mission_running = False   # son RPi status'tan görev aktif mi
-        self.video_worker = VideoStreamWorker(
+        self.video_worker = _VidCls(
             source="none",
             open_timeout=config.video_open_timeout,
             retry_delay=config.video_retry_delay,
             parent=self,
         )
         self.tts_worker = AudioTTSWorker(parent=self)
-        self.rpi_worker = RpiStatusWorker(
+        self.rpi_worker = _RpiCls(
             host=config.companion_host,
             port=config.companion_status_port,
             connect_timeout=config.rpi_connect_timeout,

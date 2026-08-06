@@ -36,7 +36,7 @@ class RpiStatusWorker(QThread):
     # Yeni: Görevden anlık bildiri mesajları
     mission_notification = pyqtSignal(str)
 
-    def __init__(self, host: str = "192.168.10.138", port: int = 5602,
+    def __init__(self, host: str = "192.168.1.10", port: int = 5602,
                  connect_timeout: float = 5.0, read_timeout: float = 3.0,
                  parent=None):
         super().__init__(parent)

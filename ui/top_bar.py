@@ -192,8 +192,8 @@ class TopBar(QWidget):
         self._rpi_addr = QComboBox()
         self._rpi_addr.setEditable(True)
         self._rpi_addr.addItems([
-            "192.168.10.229:5602",   # Companion (RPi)
-            "127.0.0.1:5602",        # Localhost
+            "192.168.1.10:5602",     # Companion (RPi) — kanonik (bkz. gcs_config)
+            "127.0.0.1:5602",        # Localhost (sim)
         ])
         self._rpi_addr.setFixedWidth(150)
         self._rpi_addr.lineEdit().setPlaceholderText("Yardımcı PC IP:Port")  # type: ignore[union-attr]
@@ -502,9 +502,9 @@ class TopBar(QWidget):
         elif typ == "tcp":
             # Otomatik önerilen portlar
             self._conn_addr.addItems([
-                "192.168.10.229:5763",   # RPi MAVLink
+                "192.168.1.10:5763",     # RPi MAVLink — kanonik (bkz. gcs_config)
+                "127.0.0.1:5763",        # SITL / laptop sim (tcpin:5763)
                 "127.0.0.1:5762",
-                "127.0.0.1:5763",
             ])
             self._baud_combo.setVisible(False)
             self._data_type_combo.setVisible(False)

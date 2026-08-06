@@ -63,9 +63,15 @@ def main() -> None:
     # Windows'ta multiprocessing için zorunlu
     multiprocessing.freeze_support()
 
+    # --sim: sahte worker'larla (gerçek İHA/SITL olmadan) başlat. Env üzerinden
+    # gcs_config.mode'a geçer (property env'i her okumada kontrol eder).
+    if "--sim" in sys.argv:
+        os.environ["ASHINA_YKI_MODE"] = "sim"
+
     setup_logging()
     logger = logging.getLogger(__name__)
-    logger.info("ASHİNA YKİ başlatılıyor...")
+    logger.info("ASHİNA YKİ başlatılıyor... (mod: %s)",
+                os.environ.get("ASHINA_YKI_MODE", "real"))
 
     # ── 1. Qt Uygulaması ─────────────────────────────────────────────────────
     app = QApplication(sys.argv)

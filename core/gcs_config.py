@@ -25,12 +25,16 @@ if not os.path.exists(_SETTINGS_FILE) and os.path.exists(_DEV_SETTINGS):
     shutil.copy(_DEV_SETTINGS, _SETTINGS_FILE)
 
 DEFAULTS: dict = {
-    "companion_host":         "192.168.1.229",   # İHA RPi — yardımcı bilgisayar + video (8080/8081)
+    # Çalışma modu: "real" (gerçek İHA/SITL'e bağlan) | "sim" (sahte worker'lar —
+    # backend olmadan sadece arayüzü canlı gör). Env ASHINA_YKI_MODE veya --sim
+    # bayrağı override eder. Uçtan-uca sim (SITL+IHA-sim) için "real" + 127.0.0.1 host.
+    "mode":                   "real",
+    "companion_host":         "192.168.1.10",   # İHA RPi — yardımcı bilgisayar + video (8080/8081)
     "companion_mission_port": 5601,
     "companion_status_port":  5602,
     "companion_video_port":   8081,          # İşlenmiş video (görev sırasında, vision annotated)
     "companion_video_raw_port": 8080,        # Ham kamera (her zaman açık)
-    "mavlink_host":           "192.168.1.229",   # MAVLink de aynı RPi üzerinden (port 5763)
+    "mavlink_host":           "192.168.1.10",   # MAVLink de aynı RPi üzerinden (port 5763)
     "mavlink_port":           5763,
     # FIX P1-4: Timeout değerleri artık configurable
     "ai_connect_timeout":     5.0,           # AISocketWorker TCP bağlantı timeout (s)
@@ -91,8 +95,23 @@ class GCSConfig:
 
     # ── Kolaylık özellikleri ─────────────────────────────────────────
     @property
+    def mode(self) -> str:
+        """'real' | 'sim'. Env ASHINA_YKI_MODE öncelikli (CLI --sim bunu ayarlar)."""
+        env = os.environ.get("ASHINA_YKI_MODE", "").strip().lower()
+        if env in ("real", "sim"):
+            return env
+        return str(self._data.get("mode", "real")).lower()
+
+    @property
+    def is_sim(self) -> bool:
+        return self.mode == "sim"
+
+    @property
     def companion_host(self) -> str:
-        return str(self._data["companion_host"])
+        # ASHINA_YKI_HOST env → tek düğmeyle host override (laptop_e2e.sh sim'de
+        # 127.0.0.1'e çevirir). M3: dağınık IP default'ları tek kaynağa indirildi.
+        env = os.environ.get("ASHINA_YKI_HOST", "").strip()
+        return env or str(self._data["companion_host"])
 
     @property
     def companion_mission_port(self) -> int:
@@ -164,7 +183,8 @@ class GCSConfig:
 
     @property
     def mavlink_host(self) -> str:
-        return str(self._data["mavlink_host"])
+        env = os.environ.get("ASHINA_YKI_HOST", "").strip()
+        return env or str(self._data["mavlink_host"])
 
     @property
     def mavlink_port(self) -> int:
