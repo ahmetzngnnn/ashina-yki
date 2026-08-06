@@ -127,6 +127,8 @@ class SystemLogView(QWidget):
         lbl_yki.setStyleSheet("color:#3daee9; font-weight:bold;")
         self._yki_log = QTextEdit()
         self._yki_log.setReadOnly(True)
+        # Sınırsız büyümeyi engelle — uzun oturumda bellek/UI şişmesi (en fazla 2000 satır).
+        self._yki_log.document().setMaximumBlockCount(2000)
         self._yki_log.setStyleSheet("color:#e0e0e0; font-family:'Courier New'; font-size:11px; border:1px solid #0f3460;")
         left_l.addWidget(lbl_yki)
         left_l.addWidget(self._yki_log)
@@ -139,6 +141,7 @@ class SystemLogView(QWidget):
         lbl_drone.setStyleSheet("color:#4ade80; font-weight:bold;")
         self._drone_log = QTextEdit()
         self._drone_log.setReadOnly(True)
+        self._drone_log.document().setMaximumBlockCount(2000)
         self._drone_log.setStyleSheet("color:#e0e0e0; font-family:'Courier New'; font-size:11px; border:1px solid #0f3460;")
         right_l.addWidget(lbl_drone)
         right_l.addWidget(self._drone_log)

@@ -968,6 +968,7 @@ class DashboardView(QWidget):
         dtl = QVBoxLayout(drone_tab)
         dtl.setContentsMargins(2, 2, 2, 2)
         self._msg_log = QTextEdit()
+        self._msg_log.document().setMaximumBlockCount(500)   # sınırsız büyümeyi engelle
         self._msg_log.setReadOnly(True)
         self._msg_log.setStyleSheet(
             "color:#3daee9;font-family:'Courier New';"
@@ -989,6 +990,7 @@ class DashboardView(QWidget):
         )
         rtl.addWidget(self._iha_status_lbl)
         self._rpi_msg_log = QTextEdit()
+        self._rpi_msg_log.document().setMaximumBlockCount(500)
         self._rpi_msg_log.setReadOnly(True)
         self._rpi_msg_log.setStyleSheet(
             "color:#10b981;font-family:'Courier New';"
@@ -1668,20 +1670,20 @@ class DashboardView(QWidget):
             return
             
         px = QPixmap.fromImage(q_img)
-        
-        # Enforce that the middle panel's width matches the video's aspect ratio dynamically
+
+        # Orta paneli video en-boy oranına göre ayarla — ama YALNIZCA oran DEĞİŞİNCE.
+        # ÖNCEDEN her karede ideal_w = label.height()*aspect hesaplanıyordu; label
+        # yüksekliği layout'tan etkilendiği için bu, video fps'inde sürekli relayout
+        # (ve salınım) tetikliyordu. Video çözünürlüğü akış boyunca sabit → oran sabit →
+        # tek sefer ayarla, sonra dokunma.
         h = self._video_label.height()
         if h > 0 and q_img.height() > 0:
-            aspect = q_img.width() / q_img.height()
-            ideal_w = int(h * aspect)
-            
-            # Avoid endless layout loop by checking if it already matches closely
-            if abs(self._center_panel.width() - ideal_w) > 2:
-                # Clear any old fixed width on the label itself to let it stretch
+            aspect = round(q_img.width() / q_img.height(), 3)
+            if aspect != getattr(self, "_last_video_aspect", None):
+                self._last_video_aspect = aspect
                 self._video_label.setMinimumWidth(0)
                 self._video_label.setMaximumWidth(16777215)
-                # Fix the width on the entire middle column container
-                self._center_panel.setFixedWidth(ideal_w)
+                self._center_panel.setFixedWidth(int(h * aspect))
                 
         # Scale with KeepAspectRatio to be safe, but since parent width is matched, there will be no black bars!
         self._video_label.setPixmap(
