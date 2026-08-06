@@ -149,43 +149,6 @@ _SBW = "QPushButton{border-radius:4px;padding:6px 10px;font-weight:bold;}"
 _SC = "border:1px solid #0f3460;padding:4px;border-radius:3px;"
 _SL = "font-size:12px;"
 
-# ── Sabitler ──────────────────────────────────────────────────────────────────
-_AI_MODELS = [
-  "YOLOv8n — Hızlı (Nano)",
-  "YOLOv8s — Dengeli (Small)",
-  "YOLOv8m — Orta (Medium)",
-  "YOLOv8l — Güçlü (Large)",
-  "YOLOv8x — En Güçlü (X-Large)",
-  "YOLOv8_person — İnsan Tespiti",
-  "YOLOv8_vehicle — Araç Tespiti",
-  "RT-DETR — Gerçek Zamanlı",
-  "Özel Model... (custom.pt)",
-]
-
-_DETECT_TARGETS = [
-  "İnsan / Kişi",
-  "Zırhlı Araç (Tank / APC)",
-  "Hafif Araç (Araba / Kamyon)",
-  "İnsansız Hava Aracı",
-  "Kuş / Yaban Hayvanı",
-  "Silah / Silah Sistemi",
-  "Yangın / Duman",
-  "Su Baskını / Sel",
-  "Gemi / Deniz Aracı",
-  "Bina Hasarı",
-  "Özel Hedef (Tanımla)",
-]
-
-_DETECT_ACTIONS = [
-  "Uyarı Ver (Alert Only)",
-  "Takip Et (Track Target)",
-  "Üzerinde Bekle (Hover)",
-  "Eve Dön (RTL)",
-  "Yere İn (Land)",
-  "Sadece Kaydet (Log Only)",
-]
-
-
 # ── Harita Widget ─────────────────────────────────────────────────────────────
 class MissionMapWidget(QWidget):
   wp_clicked = pyqtSignal(float, float)   # yeni WP tıklaması: lat, lon
