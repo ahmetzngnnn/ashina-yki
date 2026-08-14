@@ -67,6 +67,13 @@ def localize_leaflet(html: str) -> str:
     _load_vendor()
     if not (_cache["js"] and _cache["css"]):
         return html   # CDN yolu (değişmez)
-    out = _CSS_LINK_RE.sub(f"<style>{_cache['css']}</style>", html, count=1)
-    out = _JS_SCRIPT_RE.sub(f"<script>{_cache['js']}</script>", out, count=1)
+    # NEDEN lambda: re.sub'ın DÜZ METİN değiştiricisi bir ŞABLONDUR — içindeki
+    # ters bölü dizileri (\s, \1, \g) kaçış olarak yorumlanır. Leaflet'in
+    # küçültülmüş kaynağı regex literalleri yüzünden \s içerir ve düz metin
+    # verildiğinde re.sub "bad escape \s" ile PATLAR. Yani bu fonksiyon
+    # vendored dosyalar İNDİRİLDİĞİ anda çöküyordu (dosyalar yokken erken
+    # döndüğü için fark edilmemişti). Fonksiyon-değiştirici şablon işlemez,
+    # dönen metni birebir yazar.
+    out = _CSS_LINK_RE.sub(lambda _m: f"<style>{_cache['css']}</style>", html, count=1)
+    out = _JS_SCRIPT_RE.sub(lambda _m: f"<script>{_cache['js']}</script>", out, count=1)
     return out
