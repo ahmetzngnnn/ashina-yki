@@ -96,7 +96,34 @@ def renk_bul(ad: str):
     return VARSAYILAN_RENK, "Diğer"
 
 
-def isle(giris: Path, cikis: Path, tol: float = 3.0) -> None:
+def yonelim_duzelt(js: dict, yaw_deg: float) -> None:
+    """Modelin burnunu YKİ kuralına (-Z ileri) çevirir.
+
+    NEDEN gerekli: CAD'de aracın ileri yönü tasarımcıya göre değişir; bu
+    modelde burun +Z'ye bakıyordu, yani 3B panelde mavi "ileri" oku aracın
+    ARKASINI gösteriyordu. Düzeltme MODELE işlenir, görüntüleyiciye değil —
+    görüntüleyici genel kalmalı ki başka bir model gelince kural bozulmasın.
+    """
+    if abs(yaw_deg) < 1e-6:
+        return
+    import math
+    a = math.radians(yaw_deg) / 2.0
+    # Y ekseni etrafında dönüş kuaterniyonu [x, y, z, w]
+    q = [0.0, math.sin(a), 0.0, math.cos(a)]
+    kok = js["scenes"][js.get("scene", 0)]["nodes"]
+    for i in kok:
+        n = js["nodes"][i]
+        if "matrix" in n:
+            # Matris varsa kuaterniyonla birleştirmek karmaşık; araya yeni bir
+            # düğüm koymak daha güvenli.
+            yeni = {"name": "yonelim_duzeltme", "rotation": q, "children": [i]}
+            js["nodes"].append(yeni)
+            js["scenes"][js.get("scene", 0)]["nodes"] = [len(js["nodes"]) - 1]
+            return
+        n["rotation"] = q
+
+
+def isle(giris: Path, cikis: Path, tol: float = 3.0, yaw_duzelt: float = 180.0) -> None:
     ara = cikis.with_suffix(".ham.glb")
     if giris.suffix.lower() in (".step", ".stp"):
         import cascadio
@@ -152,6 +179,10 @@ def isle(giris: Path, cikis: Path, tol: float = 3.0) -> None:
             p["material"] = mat_index[etiket]
         sayim[etiket] = sayim.get(etiket, 0) + ucgen(m)
 
+    if yaw_duzelt:
+        yonelim_duzelt(js, yaw_duzelt)
+        print(f"      yönelim düzeltmesi: {yaw_duzelt:.0f}° (burun -Z'ye)")
+
     glb_yaz(cikis, js, bin_)
     print(f"\n✓ {cikis}  ({cikis.stat().st_size/1048576:.1f} MB)")
     print("  renk grupları (üçgen):")
@@ -168,4 +199,7 @@ if __name__ == "__main__":
     kaynak = Path(sys.argv[1]).expanduser()
     hedef = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(__file__).parent / "drone.glb"
     tol = float(sys.argv[3]) if len(sys.argv) > 3 else 3.0
-    isle(kaynak, hedef, tol)
+    # 4. arguman: yonelim duzeltmesi (derece, Y ekseni). Bu modelde burun
+    # +Z'ye baktigi icin varsayilan 180.
+    yaw = float(sys.argv[4]) if len(sys.argv) > 4 else 180.0
+    isle(kaynak, hedef, tol, yaw)
