@@ -5,6 +5,7 @@ Orta : MP-Stil HUD (compass tape, pitch merdiveni, taraf bantlari, alt bilgi)
 Sag  : 3D Drone Modeli (sag üst) + Esri harita (sag alt)
 Alt  : Video akisi (HUD ile esit yükseklik)
 """
+import time
 import math
 import logging
 from PyQt6.QtCore import pyqtSignal, pyqtSlot, Qt, QPoint, QUrl, QTimer, QPointF, QRectF
@@ -968,6 +969,7 @@ class DashboardView(QWidget):
     send_command      = pyqtSignal(int, list)
     ned_velocity_cmd  = pyqtSignal(float, float, float)   # vx, vy, vz m/s
     video_source_changed = pyqtSignal(str)   # → video_worker.set_source
+    speak_requested   = pyqtSignal(str)      # sesli otopilot → TTS worker
     send_servo_action = pyqtSignal(str, str, int) # target, state, angle
 
     # NEDEN: Tespit kartları sınırsız birikip bellek/layout yükü yaratıyordu.
@@ -1492,7 +1494,10 @@ class DashboardView(QWidget):
         hw_lay.addStretch()
         right_tabs.addTab(hw_tab, "Sağlık")
 
-        # 5. Görev Yol Haritası Sekmesi
+        # (Görev İzleme paneli _build_mission_monitor'da kurulur)
+
+        # 5. Görev Yol Haritası (artık sekme olarak eklenmiyor; adım
+        #    durumlarını güncelleyen mevcut mantık korunuyor)
         road_tab = QWidget()
         road_lay = QVBoxLayout(road_tab)
         road_lay.setContentsMargins(12, 12, 12, 12)
@@ -1550,7 +1555,12 @@ class DashboardView(QWidget):
         self._apply_roadmap_styles(["pending"] * len(steps_data))
 
         road_lay.addStretch()
-        right_tabs.addTab(road_tab, "Adımlar")
+
+        # ── 6. Görev İzleme + Sesli Otopilot ─────────────────────────────
+        # NEDEN "Adımlar" yerine: sabit 7 maddelik yol haritası görevin ne
+        # yaptığını değil, ne YAPACAĞINI gösteriyordu; uçuş sırasında bilgi
+        # taşımıyordu. Burası anlık akışı METİN olarak yazar ve sesli anlatır.
+        right_tabs.addTab(self._build_mission_monitor(), "Görev İzleme")
 
         # Harita/yan sekmeler: okunur kalsın ama görev izleme alanını yutmasın.
         # Üst sınır olmadan QWebEngineView'in boyut ipucu tüm artan alanı çekiyordu.
@@ -1768,6 +1778,84 @@ class DashboardView(QWidget):
                 old.deleteLater()
             except Exception:
                 pass
+
+    # ── Görev İzleme + Sesli Otopilot ──────────────────────────────────────
+    def _build_mission_monitor(self):
+        """Görevi metin olarak akıtan ve sesli anlatan panel.
+
+        Anlatım mantığı core/flight_narrator.py'de (Qt'siz, test edilebilir);
+        burası yalnızca gösterim ve kullanıcı kontrolü."""
+        from PyQt6.QtWidgets import QCheckBox, QTextEdit
+
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+
+        # Üst şerit: sesli asistan aç/kapa + anlık faz
+        ust = QHBoxLayout(); ust.setSpacing(8)
+        self._chk_voice = QCheckBox("Sesli otopilot")
+        self._chk_voice.setChecked(True)
+        self._chk_voice.setToolTip(
+            "Görev akışını, aracın yönelimini ve rüzgâr durumunu sesli anlatır.\n"
+            "Kritik uyarılar (batarya, EKF) bu kapalıyken de yazılır."
+        )
+        ust.addWidget(self._chk_voice)
+        ust.addStretch()
+        self._lbl_faz = QLabel("—")
+        self._lbl_faz.setObjectName("sectionTitle")
+        ust.addWidget(self._lbl_faz)
+        lay.addLayout(ust)
+
+        # Rüzgâr göstergesi
+        self._lbl_ruzgar = QLabel("Rüzgâr: ölçüm için askıda bekleme gerekiyor")
+        self._lbl_ruzgar.setObjectName("hintLabel")
+        self._lbl_ruzgar.setWordWrap(True)
+        lay.addWidget(self._lbl_ruzgar)
+
+        # Anlatı akışı
+        self._txt_narrative = QTextEdit()
+        self._txt_narrative.setReadOnly(True)
+        self._txt_narrative.setFont(QFont("Consolas", 9))
+        # Bellek sınırı: uzun uçuşta sınırsız büyümesin
+        self._txt_narrative.document().setMaximumBlockCount(500)
+        lay.addWidget(self._txt_narrative, 1)
+
+        alt = QHBoxLayout(); alt.addStretch()
+        btn_temizle = QPushButton("Temizle")
+        btn_temizle.setMinimumHeight(26)
+        btn_temizle.clicked.connect(self._txt_narrative.clear)
+        alt.addWidget(btn_temizle)
+        lay.addLayout(alt)
+        return w
+
+    @pyqtSlot(dict)
+    def add_narration(self, olay: dict) -> None:
+        """Anlatıcıdan gelen olayı akışa yazar (ve gerekirse seslendirir).
+
+        Seslendirme kararı BURADA verilir: kullanıcı sesi kapattıysa yalnızca
+        kritik olaylar okunur — batarya/EKF gibi uyarılar sessizce geçilmemeli.
+        """
+        renk = {"bilgi": theme.c("text"), "uyari": theme.c("warning"),
+                "kritik": theme.c("danger")}.get(olay.get("onem", "bilgi"), theme.c("text"))
+        ts = time.strftime("%H:%M:%S", time.localtime(olay.get("zaman", time.time())))
+        metin = olay.get("metin", "")
+        self._txt_narrative.append(
+            f'<span style="color:{theme.c("text_muted")}">{ts}</span> '
+            f'<span style="color:{renk}">{metin}</span>')
+        sb = self._txt_narrative.verticalScrollBar()
+        if sb:
+            sb.setValue(sb.maximum())
+
+        if olay.get("etiket") == "ruzgar":
+            self._lbl_ruzgar.setText(metin)
+        faz = olay.get("faz")
+        if faz:
+            self._lbl_faz.setText(faz)
+
+        sesli = self._chk_voice.isChecked() or olay.get("onem") == "kritik"
+        if sesli and olay.get("seslendir", True):
+            self.speak_requested.emit(metin)
 
     def update_mission_roadmap(self, data: dict) -> None:
         """Telemetri durumuna göre görev adımlarını canlı olarak günceller."""

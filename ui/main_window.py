@@ -218,6 +218,11 @@ class MainWindow(QMainWindow):
                 logger.exception("Step motor direği kurulamadı — Pixhawk moduna dönülüyor")
                 self._antenna_mount = None
 
+        # Sesli otopilot: telemetriyi insan diline çeviren anlatıcı
+        # (Qt'siz saf mantık — core/flight_narrator.py)
+        from core.flight_narrator import FlightNarrator
+        self._narrator = FlightNarrator()
+
         self.antenna_tracker = AntennaTrackerWorker(
             conn_string=config.antenna_pixhawk_conn,
             mode=config.antenna_tracker_mode,
@@ -324,6 +329,8 @@ class MainWindow(QMainWindow):
         self._antenna_view.disable_requested.connect(self._on_antenna_disable)
         self._antenna_view.set_home_from_drone.connect(self._on_antenna_home_drone)
         self._antenna_view.set_home_manual.connect(self.antenna_tracker.set_antenna_home)
+        # Sesli otopilot → TTS (kuyruklu, üst üste binmez)
+        self._dashboard.speak_requested.connect(self.tts_worker.speak)
         # Step motor direği: limit referansı, elle döndürme, redüksiyon, kalibrasyon
         self._antenna_view.reference_limit.connect(self.antenna_tracker.on_reference_limit)
         self._antenna_view.jog_axis.connect(self.antenna_tracker.on_jog)
@@ -467,6 +474,16 @@ class MainWindow(QMainWindow):
         self.telemetry_recorder.on_telemetry(data)
         self.antenna_tracker.update_drone_position(data)
         self._syslog_view.update_telemetry_for_analysis(data)  # kendi içinde gate'li
+
+        # Sesli otopilot / görev anlatıcısı — gizli sekmede de çalışmalı:
+        # operatör başka sekmedeyken de batarya/EKF uyarısını duymalı.
+        try:
+            for olay in self._narrator.update(data):
+                d = olay.__dict__.copy()
+                d["faz"] = getattr(self._narrator, "_faz", "")
+                self._dashboard.add_narration(d)
+        except Exception:
+            logger.exception("Görev anlatıcısı hatası")
 
         # Yalnızca AKTİF sekme (pahalı: harita JS / HUD repaint)
         cur = self._tabs.currentWidget()
