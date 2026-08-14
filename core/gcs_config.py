@@ -55,6 +55,31 @@ DEFAULTS: dict = {
     "antenna_home_alt":         0.0,
     "antenna_min_distance_m":   3.0,         # Bu mesafeden yakında anteni oynatma (gürültü önleme)
     "antenna_update_hz":        5.0,         # Takip güncelleme hızı
+
+    # ── Step motor direği (NEMA 17 + TB6600, YKİ'nin koştuğu RPi4 GPIO'sundan) ──
+    # Sürüş katmanı: core/stepper_driver.py. Arka uç "auto" → pigpio varsa onu,
+    # yoksa RPi.GPIO'yu, o da yoksa sim'i (donanımsız dizüstü) kullanır.
+    "antenna_drive":            "pixhawk",   # "pixhawk" (eski) | "stepper" (NEMA17+TB6600)
+    "antenna_stepper_backend":  "auto",      # "auto" | "pigpio" | "rpigpio" | "sim"
+    # Pin numaraları BCM. Mekanik henüz yok — gear_ratio takılan dişliye göre
+    # güncellenir, kod değişmez. min/max: kablo sarmasını önleyen yumuşak limit.
+    "antenna_axis_az": {
+        "step_pin": 17, "dir_pin": 27, "ena_pin": 22, "ena_active_low": True,
+        "invert_dir": False, "motor_steps_per_rev": 200, "microstep": 8,
+        "gear_ratio": 1.0, "min_deg": -180.0, "max_deg": 180.0,
+        "max_speed_dps": 20.0, "accel_dps2": 40.0,
+    },
+    "antenna_axis_el": {
+        "step_pin": 23, "dir_pin": 24, "ena_pin": 25, "ena_active_low": True,
+        "invert_dir": False, "motor_steps_per_rev": 200, "microstep": 8,
+        "gear_ratio": 1.0, "min_deg": -5.0, "max_deg": 90.0,
+        "max_speed_dps": 15.0, "accel_dps2": 30.0,
+    },
+    # Kapalı çevrim: anten üzerindeki uçuş kontrol kartının manyetometresinden
+    # gelen GERÇEK yön ile adım sayacı arasındaki farkı yavaşça kapatır
+    # (kaçan adımları telafi eder). 0 → kapalı çevrim kapalı, saf açık çevrim.
+    "antenna_heading_correction_gain": 0.25,  # 0..1, tik başına düzeltme oranı
+    "antenna_heading_deadband_deg":    2.0,   # bu farkın altını düzeltme (salınım önler)
 }
 
 
@@ -159,6 +184,30 @@ class GCSConfig:
     @property
     def antenna_min_distance_m(self) -> float:
         return float(self._data.get("antenna_min_distance_m", 3.0))
+
+    # ── Step motor direği ────────────────────────────────────────────────
+    @property
+    def antenna_drive(self) -> str:
+        """'pixhawk' (MAVLink mount komutu) | 'stepper' (NEMA17 + TB6600)."""
+        v = str(self._data.get("antenna_drive", "pixhawk")).strip().lower()
+        return v if v in ("pixhawk", "stepper") else "pixhawk"
+
+    @property
+    def antenna_stepper_backend(self) -> str:
+        v = str(self._data.get("antenna_stepper_backend", "auto")).strip().lower()
+        return v if v in ("auto", "pigpio", "rpigpio", "sim") else "auto"
+
+    @property
+    def antenna_axes(self) -> dict:
+        """build_mount() için {'az': {...}, 'el': {...}} sözlüğü."""
+        return {"az": dict(self._data.get("antenna_axis_az") or {}),
+                "el": dict(self._data.get("antenna_axis_el") or {})}
+
+    @property
+    def antenna_heading_correction(self) -> tuple:
+        """(kazanç, ölü bant derece) — kapalı çevrim yön düzeltmesi."""
+        return (float(self._data.get("antenna_heading_correction_gain", 0.25)),
+                float(self._data.get("antenna_heading_deadband_deg", 2.0)))
 
     @property
     def antenna_update_hz(self) -> float:

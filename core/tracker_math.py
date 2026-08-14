@@ -83,3 +83,39 @@ def shortest_yaw_delta(current_deg: float, target_deg: float) -> float:
     """İki azimut arası en kısa dönüş farkı (-180..+180°)."""
     d = (target_deg - current_deg + 540.0) % 360.0 - 180.0
     return d
+
+
+def wrap_safe_target(current_deg: float, bearing_deg_: float,
+                     min_deg: float = -180.0, max_deg: float = 180.0) -> float | None:
+    """Kablo sarmasına karşı güvenli hedef açı — mekanik limitler içinde.
+
+    NEDEN GEREKLİ: Anten koaksiyel kabloyla bağlıdır ve sonsuz dönemez.
+    `shortest_yaw_delta` her zaman EN KISA yolu seçer; kuzeyi tekrar tekrar
+    geçen bir İHA'yı izlerken bu, anteni hep aynı yöne çevirip **kabloyu
+    sarar** (birkaç turda kablo kopar ya da konnektör zorlanır).
+
+    Bu fonksiyon, hedef pusula açısının (0..360) mekanik olarak eşdeğer
+    tüm karşılıklarını (bearing + 360·k) üretir, limitler içinde kalanları
+    seçer ve bunlardan mevcut konuma EN YAKIN olanı döndürür. Böylece
+    eksen fiziksel sınırın dışına hiç çıkmaz.
+
+    Eksen konumu 0..360 ile SINIRLI DEĞİLDİR: -180..+180 aralığında çalışan
+    bir eksende "350° pusula" hedefi -10° olarak döner.
+
+    Dönüş: hedef eksen açısı (derece) veya limitler içinde karşılığı yoksa
+    None — bu durumda anten oraya bakamaz, çağıran tarafın operatörü
+    uyarması gerekir (kör açı).
+    """
+    if max_deg < min_deg:
+        min_deg, max_deg = max_deg, min_deg
+    best: float | None = None
+    # bearing + 360k'nın limitlere düşebileceği tüm k değerleri
+    k_lo = math.floor((min_deg - bearing_deg_) / 360.0)
+    k_hi = math.ceil((max_deg - bearing_deg_) / 360.0)
+    eps = 1e-9
+    for k in range(k_lo, k_hi + 1):
+        cand = bearing_deg_ + 360.0 * k
+        if (min_deg - eps) <= cand <= (max_deg + eps):
+            if best is None or abs(cand - current_deg) < abs(best - current_deg):
+                best = cand
+    return best
