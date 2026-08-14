@@ -95,6 +95,10 @@ class AntennaTrackerWorker(QThread):
         # yok" uyarısı çıktığı için hemen ardından gelen "kör açı" uyarısı
         # SUSTURULUR ve operatör antenin neden durduğunu öğrenemez.
         self._warn_at: dict[str, float] = {}
+        # Kalibrasyon ölçümü: {"az": {"min": adım, "max": adım}} — limit
+        # damgalanmadan ÖNCEKİ ham sayaç. İki limit arası motorla sürüldüyse
+        # fark, gerçek açıklığın kaç adım ettiğini verir.
+        self._limit_marks: dict[str, dict[str, int]] = {}
 
     # ── Kontrol (ana thread'den) ───────────────────────────────────────────
     def enable(self) -> None:
@@ -179,6 +183,113 @@ class AntennaTrackerWorker(QThread):
         logger.info(msg)
         return {"ok": True, "eksen_acisi": limit_deg, "pusula": hdg,
                 "ofset": round(self._az_offset, 2), "mesaj": msg}
+
+    # ── Arayüzden gelen direk komutları ────────────────────────────────────
+    mount_feedback = pyqtSignal(dict)   # {"tur": "referans"|"kalibrasyon"|"geometri", ...}
+
+    @pyqtSlot(str, str)
+    def on_reference_limit(self, axis: str, edge: str) -> None:
+        """'Sol/Sağ/Alt/Üst limit' düğmeleri.
+
+        Azimutta İKİ limit de alınırsa aradaki adım farkı saklanır; operatör
+        'Redüksiyonu Hesapla' derse bu ölçüm kullanılır (bkz. on_calibrate_span).
+        """
+        if self._mount is None:
+            self.mount_feedback.emit({"tur": "referans", "ok": False,
+                                      "mesaj": "Step motor direği yok."})
+            return
+        ax = self._mount.az if axis == "az" else self._mount.el
+        steps_before = ax.raw_steps
+        res = self.reference_at_limit(edge=edge, axis=axis)
+        # Kalibrasyon ölçümü — DİKKAT: referanslama sayacı limit açısına
+        # DAMGALAR, yani sayaç sıçrar. Bu yüzden hem damgadan ÖNCEKİ hem
+        # SONRAKİ değer saklanır. Gidilen gerçek yol:
+        #     ikinci_limit.oncesi − birinci_limit.sonrasi
+        # (Sadece "öncesi" saklanırsa ilk damganın sıçraması yolun yarısını
+        # yutar ve redüksiyon iki kat küçük çıkar — testte yakalandı.)
+        self._limit_marks.setdefault(axis, {})[edge] = {
+            "oncesi": steps_before, "sonrasi": ax.raw_steps, "t": time.time(),
+        }
+        res["tur"] = "referans"
+        self.mount_feedback.emit(res)
+        self._emit_geometry()
+
+    @pyqtSlot(str, float)
+    def on_jog(self, axis: str, delta_deg: float) -> None:
+        """Elle döndürme. Motorlar enerjisizse önce enerjilendirilir —
+        aksi halde düğme 'ölü' görünürdü."""
+        if self._mount is None:
+            return
+        ax = self._mount.az if axis == "az" else self._mount.el
+        ax.set_enabled(True)
+        ax.jog(delta_deg)
+
+    @pyqtSlot(float, float)
+    def on_set_gear_ratio(self, az_ratio: float, el_ratio: float) -> None:
+        """Operatörün girdiği redüksiyon oranlarını uygular ve kaydeder."""
+        if self._mount is None:
+            return
+        try:
+            self._mount.az.set_gear_ratio(az_ratio)
+            self._mount.el.set_gear_ratio(el_ratio)
+        except ValueError as exc:
+            self.mount_feedback.emit({"tur": "geometri", "ok": False,
+                                      "mesaj": f"Geçersiz oran: {exc}"})
+            return
+        self._persist_gear_ratios()
+        self._emit_geometry()
+
+    @pyqtSlot()
+    def on_calibrate_span(self) -> None:
+        """Azimutta iki limit arası MOTORLA sürüldüyse redüksiyonu türetir."""
+        if self._mount is None:
+            return
+        marks = self._limit_marks.get("az", {})
+        if "min" not in marks or "max" not in marks:
+            self.mount_feedback.emit({
+                "tur": "kalibrasyon", "ok": False,
+                "mesaj": ("Önce SOL ve SAĞ limitlerin ikisi de referanslanmalı "
+                          "(arada motorla sürerek).")})
+            return
+        span_deg = abs(self._mount.az.cfg.max_deg - self._mount.az.cfg.min_deg)
+        # Hangi limit ÖNCE damgalandıysa onun "sonrası", sonra damgalananın
+        # "öncesi" ile karşılaştırılır — aradaki fark motorla gidilen yoldur.
+        ilk, son = ("min", "max") if marks["min"]["t"] <= marks["max"]["t"] else ("max", "min")
+        measured = marks[son]["oncesi"] - marks[ilk]["sonrasi"]
+        res = self._mount.az.calibrate_from_span(measured, span_deg)
+        res["tur"] = "kalibrasyon"
+        if res.get("ok"):
+            self._persist_gear_ratios()
+            # Ölçüm tüketildi; yeni kalibrasyon için limitler tekrar alınmalı.
+            self._limit_marks.pop("az", None)
+        self.mount_feedback.emit(res)
+        self._emit_geometry()
+
+    def _persist_gear_ratios(self) -> None:
+        """Girilen oranları settings.json'a yazar (yeniden açılışta korunur)."""
+        try:
+            from core.gcs_config import config as _cfg
+            for name, ax in (("antenna_axis_az", self._mount.az),
+                             ("antenna_axis_el", self._mount.el)):
+                d = dict(_cfg.get(name) or {})
+                d["gear_ratio"] = round(float(ax.cfg.gear_ratio), 6)
+                _cfg.set(name, d)
+            _cfg.save()
+        except Exception:
+            logger.exception("Redüksiyon oranı kaydedilemedi")
+
+    def _emit_geometry(self) -> None:
+        if self._mount is None:
+            return
+        az, el = self._mount.az, self._mount.el
+        self.mount_feedback.emit({
+            "tur": "geometri", "ok": True,
+            "az_reduksiyon": az.cfg.gear_ratio, "el_reduksiyon": el.cfg.gear_ratio,
+            "mesaj": (f"Azimut {az.steps_per_degree():.1f} adım/derece "
+                      f"({az.cfg.min_deg:.0f}..{az.cfg.max_deg:.0f}°)  ·  "
+                      f"Elevasyon {el.steps_per_degree():.1f} adım/derece "
+                      f"({el.cfg.min_deg:.0f}..{el.cfg.max_deg:.0f}°)"),
+        })
 
     def _should_warn(self, sebep: str, period_s: float = 10.0) -> bool:
         """Aynı sebepli uyarıyı en fazla period_s'de bir yayınla (sebep başına)."""
@@ -414,6 +525,12 @@ class AntennaTrackerWorker(QThread):
             self.tracker_status.emit(status)
             return
 
+        # NEDEN burada enerjilendirme: reference_at_limit motorları BİLEREK
+        # enerjisiz bırakır (operatör anteni elle dayanağa iterken motor
+        # tutmasın). Takip başladığında kimse geri açmazsa direk hedefi alır
+        # ama HİÇ KIPIRDAMAZ ve sebebini de söylemez — sahada teşhisi zor bir
+        # arıza. Takip komutu verilmeden önce enerji garanti altına alınır.
+        self._mount.enable(True)
         az_cmd, el_cmd = self._mount.aim(target_axis, aim["elevation"])
         st = self._mount.status()
         status.update({

@@ -16,7 +16,7 @@ import math
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QGroupBox, QLineEdit, QFormLayout, QSizePolicy, QMessageBox,
-    QAbstractSpinBox, QComboBox,
+    QAbstractSpinBox, QComboBox, QDoubleSpinBox,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QPointF, QRectF, QObject, QEvent
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QPolygonF
@@ -144,6 +144,11 @@ class AntennaTrackerView(QWidget):
     disable_requested     = pyqtSignal()
     set_home_from_drone   = pyqtSignal()
     set_home_manual       = pyqtSignal(float, float, float)
+    # ── Step motor direği ──
+    reference_limit       = pyqtSignal(str, str)      # eksen ("az"/"el"), kenar ("min"/"max")
+    jog_axis              = pyqtSignal(str, float)    # eksen, delta derece
+    set_gear_ratio        = pyqtSignal(float, float)  # azimut oranı, elevasyon oranı
+    calibrate_span        = pyqtSignal()              # iki limit arası ölçümden redüksiyon
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -290,8 +295,140 @@ class AntennaTrackerView(QWidget):
         cg.addWidget(man_grp)
         right.addWidget(ctl_grp)
 
+        right.addWidget(self._build_mount_group())
+
         right.addStretch()
         root.addWidget(right_panel)
+
+    # ── Step motor direği: kurulum, referans, elle döndürme ────────────────
+    def _build_mount_group(self):
+        """Saha kurulum paneli.
+
+        Sıra ÖNEMLİ ve panel bunu görsel olarak dayatır:
+          1) Redüksiyon oranını gir (adım/derece bundan hesaplanır)
+          2) Anteni limitlere götürüp referansla
+          3) Takibi başlat
+        """
+        grp = QGroupBox("Anten Direği (step motor)")
+        lay = QVBoxLayout(grp); lay.setSpacing(8)
+
+        # 1) Redüksiyon — iki eksen ayrı
+        red_lbl = QLabel("1 · Redüksiyon oranı (motor turu : eksen turu)")
+        red_lbl.setObjectName("sectionTitle")
+        lay.addWidget(red_lbl)
+        red_form = QFormLayout(); red_form.setSpacing(6)
+        self._sp_gear_az = QDoubleSpinBox()
+        self._sp_gear_el = QDoubleSpinBox()
+        for sp in (self._sp_gear_az, self._sp_gear_el):
+            sp.setRange(0.1, 1000.0); sp.setDecimals(3); sp.setSingleStep(1.0)
+            sp.setValue(1.0); sp.setMaximumWidth(130)
+            sp.setToolTip("Dişli/kayış oranı. Örn. 1:50 sonsuz dişli için 50 girin.\n"
+                          "Adım/derece = 200 × mikroadım × oran / 360")
+        red_form.addRow("Yatay (azimut):", self._sp_gear_az)
+        red_form.addRow("Dikey (elevasyon):", self._sp_gear_el)
+        lay.addLayout(red_form)
+
+        btn_gear = QPushButton("Redüksiyonu Uygula ve Kaydet")
+        btn_gear.setObjectName("primaryButton")
+        btn_gear.setMinimumHeight(28)
+        btn_gear.clicked.connect(self._on_apply_gear)
+        _r = QHBoxLayout(); _r.addStretch(); _r.addWidget(btn_gear)
+        lay.addLayout(_r)
+
+        self._lbl_spd = QLabel("—")
+        self._lbl_spd.setObjectName("mutedLabel")
+        self._lbl_spd.setWordWrap(True)
+        lay.addWidget(self._lbl_spd)
+
+        # 2) Limit referansları — 4 nokta
+        ref_lbl = QLabel("2 · Mekanik limitlerden referans")
+        ref_lbl.setObjectName("sectionTitle")
+        lay.addWidget(ref_lbl)
+        ref_note = QLabel("Anteni ilgili dayanağa götürüp düğmeye basın. "
+                          "Azimutta iki dayanak arası 270°.")
+        ref_note.setObjectName("mutedLabel"); ref_note.setWordWrap(True)
+        lay.addWidget(ref_note)
+
+        grid = QGridLayout(); grid.setSpacing(6)
+        self._btn_ref_az_min = QPushButton("◀ Sol limit")
+        self._btn_ref_az_max = QPushButton("Sağ limit ▶")
+        self._btn_ref_el_min = QPushButton("▼ Alt limit (−10°)")
+        self._btn_ref_el_max = QPushButton("▲ Üst limit (+60°)")
+        for b, (ax, edge) in ((self._btn_ref_az_min, ("az", "min")),
+                              (self._btn_ref_az_max, ("az", "max")),
+                              (self._btn_ref_el_min, ("el", "min")),
+                              (self._btn_ref_el_max, ("el", "max"))):
+            b.setMinimumHeight(28)
+            b.clicked.connect(lambda _c=False, a=ax, e=edge: self.reference_limit.emit(a, e))
+        grid.addWidget(self._btn_ref_az_min, 0, 0); grid.addWidget(self._btn_ref_az_max, 0, 1)
+        grid.addWidget(self._btn_ref_el_min, 1, 0); grid.addWidget(self._btn_ref_el_max, 1, 1)
+        lay.addLayout(grid)
+
+        self._lbl_ref = QLabel("Referans alınmadı — takip başlatılamaz.")
+        self._lbl_ref.setObjectName("mutedLabel"); self._lbl_ref.setWordWrap(True)
+        lay.addWidget(self._lbl_ref)
+
+        # 3) Elle döndürme (jog) — kalibrasyon için de gerekli
+        jog_lbl = QLabel("3 · Elle döndürme")
+        jog_lbl.setObjectName("sectionTitle")
+        lay.addWidget(jog_lbl)
+        jog = QGridLayout(); jog.setSpacing(6)
+        for col, d in enumerate((-10.0, -1.0, 1.0, 10.0)):
+            b = QPushButton(f"{d:+.0f}°"); b.setMinimumHeight(26)
+            b.setToolTip("Azimut ekseni")
+            b.clicked.connect(lambda _c=False, dd=d: self.jog_axis.emit("az", dd))
+            jog.addWidget(b, 0, col)
+        for col, d in enumerate((-5.0, -1.0, 1.0, 5.0)):
+            b = QPushButton(f"{d:+.0f}°"); b.setMinimumHeight(26)
+            b.setToolTip("Elevasyon ekseni")
+            b.clicked.connect(lambda _c=False, dd=d: self.jog_axis.emit("el", dd))
+            jog.addWidget(b, 1, col)
+        jog.addWidget(QLabel("Azimut"), 0, 4); jog.addWidget(QLabel("Elevasyon"), 1, 4)
+        lay.addLayout(jog)
+
+        btn_cal = QPushButton("İki limit arası sürüldü → Redüksiyonu Hesapla")
+        btn_cal.setMinimumHeight(28)
+        btn_cal.setToolTip(
+            "Sol limitten sağ limite MOTORLA (yukarıdaki düğmelerle) gidildiyse,\n"
+            "sayılan adım 270°'ye bölünerek gerçek redüksiyon bulunur.\n"
+            "Anten elle çevrildiyse bu ölçüm geçersizdir."
+        )
+        btn_cal.clicked.connect(self.calibrate_span.emit)
+        lay.addWidget(btn_cal)
+
+        self._lbl_mount = QLabel("—")
+        self._lbl_mount.setObjectName("monoLabel"); self._lbl_mount.setWordWrap(True)
+        lay.addWidget(self._lbl_mount)
+        return grp
+
+    def _on_apply_gear(self):
+        self.set_gear_ratio.emit(float(self._sp_gear_az.value()),
+                                 float(self._sp_gear_el.value()))
+
+    @pyqtSlot(dict)
+    def mount_feedback(self, info: dict) -> None:
+        """Worker'dan gelen direk geri bildirimi (referans/kalibrasyon/durum)."""
+        kind = info.get("tur")
+        msg = info.get("mesaj", "")
+        if kind == "referans":
+            self._lbl_ref.setText(msg)
+            self._lbl_ref.setStyleSheet(
+                f"color:{theme.c('success' if info.get('ok') else 'danger')};")
+        elif kind == "kalibrasyon":
+            self._lbl_mount.setText(msg)
+            self._lbl_mount.setStyleSheet(
+                f"color:{theme.c('success' if info.get('ok') else 'warning')};")
+        elif kind == "geometri":
+            self._lbl_spd.setText(msg)
+            self._lbl_spd.setStyleSheet(f"color:{theme.c('text_muted')};")
+            if info.get("az_reduksiyon"):
+                self._sp_gear_az.blockSignals(True)
+                self._sp_gear_az.setValue(float(info["az_reduksiyon"]))
+                self._sp_gear_az.blockSignals(False)
+            if info.get("el_reduksiyon"):
+                self._sp_gear_el.blockSignals(True)
+                self._sp_gear_el.setValue(float(info["el_reduksiyon"]))
+                self._sp_gear_el.blockSignals(False)
 
     # ── Kullanıcı eylemleri ────────────────────────────────────────────────
     def _set_state(self, text: str, token: str):

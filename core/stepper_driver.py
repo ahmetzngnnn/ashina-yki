@@ -330,6 +330,37 @@ class StepperAxis:
             self._target_steps = int(round(clamped * self._spd))
         return clamped
 
+    @property
+    def raw_steps(self) -> int:
+        """Ham adım sayacı — kalibrasyon ölçümü için (iki limit arası)."""
+        with self._lock:
+            return self._pos_steps
+
+    def set_gear_ratio(self, ratio: float) -> float:
+        """Redüksiyon oranını çalışma anında değiştirir; AÇIYI korur.
+
+        Saha kurulumunda dişli takıldığında operatör oranı arayüzden girer.
+        Adım sayacı doğrudan bırakılırsa açı değişmiş görünürdü (aynı adım,
+        farklı adım/derece); bu yüzden konum, YENİ ölçeğe göre yeniden
+        hesaplanır — anten fiziksel olarak nerede duruyorsa açısı odur.
+
+        Dönüş: yeni adım/derece.
+        """
+        if ratio <= 0:
+            raise ValueError("Redüksiyon oranı pozitif olmalı")
+        with self._lock:
+            angle_now = self._pos_steps / self._spd
+            target_now = self._target_steps / self._spd
+            self.cfg.gear_ratio = float(ratio)
+            self._spd = self.cfg.steps_per_degree()
+            self._pos_steps = int(round(angle_now * self._spd))
+            self._target_steps = int(round(target_now * self._spd))
+            return self._spd
+
+    def steps_per_degree(self) -> float:
+        with self._lock:
+            return self._spd
+
     def set_current_angle(self, deg: float) -> None:
         """Referanslama: 'şu an bu açıdasın' der (uçuş kontrol kartının
         manyetometresinden gelen gerçek yönle senkronlamak için).
@@ -339,6 +370,57 @@ class StepperAxis:
             self._pos_steps = int(round(deg * self._spd))
             self._target_steps = self._pos_steps
             self._speed_dps = 0.0
+
+    def jog(self, delta_deg: float) -> float:
+        """Elle döndürme: hedefi mevcut AÇIDAN itibaren delta kadar öteler.
+
+        Hedefe göre değil ANLIK AÇIYA göre ötelenir; art arda basılan jog
+        düğmeleri, motor henüz varmadan hedefi biriktirip anteni limite
+        fırlatmasın diye."""
+        with self._lock:
+            base = self._pos_steps / self._spd
+        return self.set_target(base + delta_deg)
+
+    def calibrate_from_span(self, steps_measured: int, span_deg: float) -> dict:
+        """İki mekanik dayanak arasında sayılan adımdan redüksiyonu türetir.
+
+        Azimutta iki katı dayanak arası açıklık BİLİNİYOR (270°). Operatör bir
+        limitten diğerine MOTORLA giderse (jog ile), sürülen adım sayısı
+        gerçek adım/derece oranını verir:
+
+            adım/derece = |ölçülen adım| / açıklık
+            redüksiyon  = adım/derece × 360 / (adım/tur × mikroadım)
+
+        Böylece dişli oranı elle hesaplanmak zorunda kalmaz; sistem kendi
+        parametresini günceller. Dişli kayması/kaçan adım varsa da burada
+        ortaya çıkar (beklenenden sapma raporlanır).
+
+        UYARI: Ölçüm yalnızca hareket MOTORLA yapıldıysa geçerlidir. Anten
+        elle çevrildiyse adım sayacı ilerlemez — bu durumda ölçüm anlamsızdır
+        ve fonksiyon uyarı döndürür.
+        """
+        span = abs(float(span_deg))
+        n = abs(int(steps_measured))
+        if span < 1e-6:
+            return {"ok": False, "mesaj": "Açıklık sıfır olamaz."}
+        if n == 0:
+            return {"ok": False, "mesaj": ("Adım sayacı ilerlememiş — anten elle mi "
+                                           "çevrildi? Kalibrasyon için iki limit arası "
+                                           "MOTORLA (jog ile) sürülmelidir.")}
+        spd_new = n / span
+        denom = self.cfg.motor_steps_per_rev * self.cfg.microstep
+        ratio_new = spd_new * 360.0 / denom
+        ratio_old = self.cfg.gear_ratio
+        self.set_gear_ratio(ratio_new)
+        sapma = (ratio_new / ratio_old - 1.0) * 100.0 if ratio_old else float("nan")
+        return {"ok": True, "adim": n, "aciklik": span,
+                "adim_derece": round(spd_new, 3),
+                "reduksiyon": round(ratio_new, 4),
+                "onceki_reduksiyon": round(ratio_old, 4),
+                "sapma_yuzde": round(sapma, 1),
+                "mesaj": (f"{n} adım / {span:.1f}° → {spd_new:.2f} adım/derece, "
+                          f"redüksiyon {ratio_new:.3f} (önceki {ratio_old:.3f}, "
+                          f"sapma %{sapma:+.1f})")}
 
     def nudge_steps(self, steps: int) -> None:
         """Konum sayacını kaydırmadan hedefi adım cinsinden ötele — kapalı

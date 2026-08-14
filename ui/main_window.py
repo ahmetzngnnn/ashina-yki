@@ -324,6 +324,12 @@ class MainWindow(QMainWindow):
         self._antenna_view.disable_requested.connect(self._on_antenna_disable)
         self._antenna_view.set_home_from_drone.connect(self._on_antenna_home_drone)
         self._antenna_view.set_home_manual.connect(self.antenna_tracker.set_antenna_home)
+        # Step motor direği: limit referansı, elle döndürme, redüksiyon, kalibrasyon
+        self._antenna_view.reference_limit.connect(self.antenna_tracker.on_reference_limit)
+        self._antenna_view.jog_axis.connect(self.antenna_tracker.on_jog)
+        self._antenna_view.set_gear_ratio.connect(self.antenna_tracker.on_set_gear_ratio)
+        self._antenna_view.calibrate_span.connect(self.antenna_tracker.on_calibrate_span)
+        self.antenna_tracker.mount_feedback.connect(self._antenna_view.mount_feedback)
 
         # Dashboard → AI worker (servo) — mavlink değil
         self._dashboard.send_servo_action.connect(self.ai_worker.send_servo_command)

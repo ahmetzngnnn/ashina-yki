@@ -63,16 +63,20 @@ DEFAULTS: dict = {
     "antenna_stepper_backend":  "auto",      # "auto" | "pigpio" | "rpigpio" | "sim"
     # Pin numaraları BCM. Mekanik henüz yok — gear_ratio takılan dişliye göre
     # güncellenir, kod değişmez. min/max: kablo sarmasını önleyen yumuşak limit.
+    # Azimut: iki katı dayanak arası 270° (sol limit -135°, sağ limit +135°).
+    # Elevasyon: yatayın 10° altı ile 60° üstü arası (toplam 70°).
+    # gear_ratio saha kurulumunda arayüzden girilir; adım/derece otomatik
+    # yeniden hesaplanır (bkz. StepperAxis.set_gear_ratio).
     "antenna_axis_az": {
         "step_pin": 17, "dir_pin": 27, "ena_pin": 22, "ena_active_low": True,
         "invert_dir": False, "motor_steps_per_rev": 200, "microstep": 8,
-        "gear_ratio": 1.0, "min_deg": -180.0, "max_deg": 180.0,
+        "gear_ratio": 1.0, "min_deg": -135.0, "max_deg": 135.0,
         "max_speed_dps": 20.0, "accel_dps2": 40.0,
     },
     "antenna_axis_el": {
         "step_pin": 23, "dir_pin": 24, "ena_pin": 25, "ena_active_low": True,
         "invert_dir": False, "motor_steps_per_rev": 200, "microstep": 8,
-        "gear_ratio": 1.0, "min_deg": -5.0, "max_deg": 90.0,
+        "gear_ratio": 1.0, "min_deg": -10.0, "max_deg": 60.0,
         "max_speed_dps": 15.0, "accel_dps2": 30.0,
     },
     # Kapalı çevrim: anten üzerindeki uçuş kontrol kartının manyetometresinden
