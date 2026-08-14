@@ -16,7 +16,7 @@ import math
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QGroupBox, QLineEdit, QFormLayout, QSizePolicy, QMessageBox,
-    QAbstractSpinBox, QComboBox, QDoubleSpinBox,
+    QAbstractSpinBox, QComboBox, QDoubleSpinBox, QScrollArea, QFrame,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QPointF, QRectF, QObject, QEvent
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QPolygonF
@@ -208,12 +208,21 @@ class AntennaTrackerView(QWidget):
         self._compass = CompassWidget()
         root.addWidget(self._compass, stretch=1)
 
-        # ── Sağ: kontrol + değerler — sabit 380px panel ──
+        # ── Sağ: kontrol + değerler — sabit genişlik, DİKEYDE KAYDIRILABİLİR ──
+        # NEDEN kaydırma: panel içeriği (durum + açılar + kontrol + direk
+        # kurulumu) pencere yüksekliğini aşıyor. Kaydırma yokken Qt widget'ları
+        # asgari boylarının altına sıkıştırıp ÜST ÜSTE BİNDİRİYORDU — başlıklar
+        # girdilerin, limit düğmeleri jog düğmelerinin üstüne geliyordu.
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFixedWidth(396)          # 380 içerik + dikey kaydırma çubuğu
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
         right_panel = QWidget()
-        right_panel.setFixedWidth(380)
         right = QVBoxLayout(right_panel)
-        right.setContentsMargins(0, 0, 0, 0)
+        right.setContentsMargins(0, 0, 6, 0)
         right.setSpacing(8)
+        right_scroll.setWidget(right_panel)
 
         # Durum başlığı
         st_grp = QGroupBox("Anten Takip Durumu")
@@ -298,7 +307,7 @@ class AntennaTrackerView(QWidget):
         right.addWidget(self._build_mount_group())
 
         right.addStretch()
-        root.addWidget(right_panel)
+        root.addWidget(right_scroll)
 
     # ── Step motor direği: kurulum, referans, elle döndürme ────────────────
     def _build_mount_group(self):
@@ -312,23 +321,28 @@ class AntennaTrackerView(QWidget):
         grp = QGroupBox("Anten Direği (step motor)")
         lay = QVBoxLayout(grp); lay.setSpacing(8)
 
-        # 1) Redüksiyon — iki eksen ayrı
-        red_lbl = QLabel("1 · Redüksiyon oranı (motor turu : eksen turu)")
+        # 1) Redüksiyon — iki eksen ayrı, tek ızgarada (dikey yer kazancı)
+        red_lbl = QLabel("1 · Redüksiyon oranı")
         red_lbl.setObjectName("sectionTitle")
         lay.addWidget(red_lbl)
-        red_form = QFormLayout(); red_form.setSpacing(6)
+
+        red = QGridLayout(); red.setSpacing(6)
         self._sp_gear_az = QDoubleSpinBox()
         self._sp_gear_el = QDoubleSpinBox()
         for sp in (self._sp_gear_az, self._sp_gear_el):
-            sp.setRange(0.1, 1000.0); sp.setDecimals(3); sp.setSingleStep(1.0)
-            sp.setValue(1.0); sp.setMaximumWidth(130)
-            sp.setToolTip("Dişli/kayış oranı. Örn. 1:50 sonsuz dişli için 50 girin.\n"
+            sp.setRange(0.1, 1000.0); sp.setDecimals(2); sp.setSingleStep(1.0)
+            sp.setValue(1.0); sp.setMinimumWidth(96); sp.setMaximumWidth(120)
+            sp.setToolTip("Dişli/kayış oranı — motor turu : eksen turu.\n"
+                          "Örn. 1:50 sonsuz dişli için 50 girin.\n"
                           "Adım/derece = 200 × mikroadım × oran / 360")
-        red_form.addRow("Yatay (azimut):", self._sp_gear_az)
-        red_form.addRow("Dikey (elevasyon):", self._sp_gear_el)
-        lay.addLayout(red_form)
+        red.addWidget(QLabel("Yatay"), 0, 0)
+        red.addWidget(self._sp_gear_az, 0, 1)
+        red.addWidget(QLabel("Dikey"), 0, 2)
+        red.addWidget(self._sp_gear_el, 0, 3)
+        red.setColumnStretch(4, 1)
+        lay.addLayout(red)
 
-        btn_gear = QPushButton("Redüksiyonu Uygula ve Kaydet")
+        btn_gear = QPushButton("Uygula ve Kaydet")
         btn_gear.setObjectName("primaryButton")
         btn_gear.setMinimumHeight(28)
         btn_gear.clicked.connect(self._on_apply_gear)
@@ -372,18 +386,20 @@ class AntennaTrackerView(QWidget):
         jog_lbl = QLabel("3 · Elle döndürme")
         jog_lbl.setObjectName("sectionTitle")
         lay.addWidget(jog_lbl)
-        jog = QGridLayout(); jog.setSpacing(6)
-        for col, d in enumerate((-10.0, -1.0, 1.0, 10.0)):
-            b = QPushButton(f"{d:+.0f}°"); b.setMinimumHeight(26)
-            b.setToolTip("Azimut ekseni")
-            b.clicked.connect(lambda _c=False, dd=d: self.jog_axis.emit("az", dd))
-            jog.addWidget(b, 0, col)
-        for col, d in enumerate((-5.0, -1.0, 1.0, 5.0)):
-            b = QPushButton(f"{d:+.0f}°"); b.setMinimumHeight(26)
-            b.setToolTip("Elevasyon ekseni")
-            b.clicked.connect(lambda _c=False, dd=d: self.jog_axis.emit("el", dd))
-            jog.addWidget(b, 1, col)
-        jog.addWidget(QLabel("Azimut"), 0, 4); jog.addWidget(QLabel("Elevasyon"), 1, 4)
+        # Eksen adı SOLDA sabit sütunda: sağa konunca düğmeleri sıkıştırıp
+        # üzerlerine biniyordu.
+        jog = QGridLayout(); jog.setSpacing(4)
+        for satir, (ad, eksen, adimlar) in enumerate(
+                (("Yatay", "az", (-10.0, -1.0, 1.0, 10.0)),
+                 ("Dikey", "el", (-5.0, -1.0, 1.0, 5.0)))):
+            e = QLabel(ad); e.setObjectName("mutedLabel"); e.setFixedWidth(42)
+            jog.addWidget(e, satir, 0)
+            for col, d in enumerate(adimlar, start=1):
+                b = QPushButton(f"{d:+.0f}°")
+                b.setMinimumHeight(26); b.setMinimumWidth(52)
+                b.setToolTip(f"{ad} ekseni {d:+.0f}° döndür (motorla)")
+                b.clicked.connect(lambda _c=False, ax=eksen, dd=d: self.jog_axis.emit(ax, dd))
+                jog.addWidget(b, satir, col)
         lay.addLayout(jog)
 
         btn_cal = QPushButton("İki limit arası sürüldü → Redüksiyonu Hesapla")
