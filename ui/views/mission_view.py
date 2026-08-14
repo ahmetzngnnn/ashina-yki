@@ -46,10 +46,7 @@ html,body,#map{width:100%;height:100%;margin:0;padding:0;}
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 var map = L.map('map',{zoomControl:true,attributionControl:false,maxZoom:28}).setView([39.925,32.866],16);
-L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-  {maxZoom:28, maxNativeZoom:19, attribution:'Esri'}).addTo(map);
-L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
-  {maxZoom:28, maxNativeZoom:19, opacity:0.7}).addTo(map);
+ASHINA_addBaseLayers(map);   // altlık + katman seçici + ölçek + çözünürlük göstergesi (ui/map_assets.py)
 
 var waypoints = [];
 var wpMarkers = [];
