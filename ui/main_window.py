@@ -201,12 +201,31 @@ class MainWindow(QMainWindow):
         # İHA telemetrisinden anten azimut/elevasyon hesaplayıp anten Pixhawk'ına iletir.
         from core.antenna_tracker_worker import AntennaTrackerWorker
         _ah_lat, _ah_lon, _ah_alt = config.antenna_home
+
+        # Step motor direği (NEMA17 + TB6600, RPi4 GPIO). Yalnızca
+        # antenna_drive="stepper" iken kurulur; kurulum başarısız olursa
+        # (kütüphane/pin sorunu) takip Pixhawk moduna düşer — YKİ açılmalıdır.
+        self._antenna_mount = None
+        if config.antenna_drive == "stepper":
+            try:
+                from core.stepper_driver import build_mount
+                self._antenna_mount = build_mount(config.antenna_axes,
+                                                  config.antenna_stepper_backend)
+                self._antenna_mount.start()
+                logger.info("Anten direği (step motor) hazır: %s",
+                            self._antenna_mount.status())
+            except Exception as exc:
+                logger.exception("Step motor direği kurulamadı — Pixhawk moduna dönülüyor")
+                self._antenna_mount = None
+
         self.antenna_tracker = AntennaTrackerWorker(
             conn_string=config.antenna_pixhawk_conn,
             mode=config.antenna_tracker_mode,
             home_lat=_ah_lat, home_lon=_ah_lon, home_alt=_ah_alt,
             min_distance_m=config.antenna_min_distance_m,
             update_hz=config.antenna_update_hz,
+            drive="stepper" if self._antenna_mount is not None else "pixhawk",
+            mount=self._antenna_mount,
             parent=self,
         )
 
