@@ -28,7 +28,6 @@ Kullanım:
 """
 from __future__ import annotations
 
-import base64
 import json
 import logging
 from pathlib import Path
@@ -371,7 +370,25 @@ class Model3DView(QWidget):
         self._web = QWebEngineView()
         self._web.loadFinished.connect(self._on_load)
         lay.addWidget(self._web)
-        self._web.setHtml(self._html(), QUrl("qrc:///"))
+
+        # NEDEN setHtml DEĞİL de geçici dosya:
+        # QWebEngineView.setHtml içeriği ~2 MB ile SINIRLIDIR. three.js (740 KB)
+        # zaten büyük; modeli de base64 olarak gömünce HTML 11 MB'a çıktı ve
+        # sayfa HİÇ YÜKLENMEDİ (loadFinished=False, boş panel). Bu yüzden HTML
+        # geçici bir dosyaya yazılıp file:// olarak yükleniyor; model de
+        # gömülmeden diskten okunuyor.
+        from PyQt6.QtWebEngineCore import QWebEngineSettings
+        st = self._web.settings()
+        # file:// sayfasının başka bir file:// kaynağını (model) okumasına izin
+        # ver — varsayılan olarak Chromium bunu CORS gereği engeller.
+        st.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+
+        import tempfile
+        self._tmp = tempfile.NamedTemporaryFile(
+            prefix="ashina3d_", suffix=".html", delete=False, mode="w", encoding="utf-8")
+        self._tmp.write(self._html())
+        self._tmp.close()
+        self._web.load(QUrl.fromLocalFile(self._tmp.name))
 
     # ── HTML kurulumu ────────────────────────────────────────────────
     def _html(self) -> str:
@@ -398,11 +415,9 @@ class Model3DView(QWidget):
         model = model_var_mi()
         url_js = ""
         if model is not None:
-            try:
-                b64 = base64.b64encode(model.read_bytes()).decode("ascii")
-                url_js = f'<script>window.MODEL_URL="data:model/gltf-binary;base64,{b64}";</script>'
-            except OSError as exc:
-                logger.warning("3B model okunamadı: %s", exc)
+            # Model GÖMÜLMEZ, diskten okunur (bkz. setHtml 2 MB sınırı notu).
+            url = QUrl.fromLocalFile(str(model)).toString()
+            url_js = f'<script>window.MODEL_URL={json.dumps(url)};</script>'
         html = html.replace("@@BG@@", theme.c("bg"))
         html = html.replace("@@TXT@@", theme.c("text"))
         html = html.replace("@@WARN@@", theme.c("warning"))
@@ -410,6 +425,30 @@ class Model3DView(QWidget):
 
     def _on_load(self, ok: bool) -> None:
         self._hazir = bool(ok)
+        if not ok:
+            logger.error("3B sayfa yüklenemedi — panel boş kalacak")
+
+    def closeEvent(self, event):   # noqa: N802 (Qt API)
+        self._temizle()
+        super().closeEvent(event)
+
+    def __del__(self):
+        try:
+            self._temizle()
+        except Exception:
+            pass
+
+    def _temizle(self) -> None:
+        """Geçici HTML dosyasını siler (widget kapanınca artık gerekmez)."""
+        yol = getattr(self, "_tmp", None)
+        if yol is None:
+            return
+        try:
+            import os
+            os.unlink(yol.name)
+        except OSError:
+            pass
+        self._tmp = None
 
     # ── Python API ───────────────────────────────────────────────────
     def _js(self, kod: str) -> None:
