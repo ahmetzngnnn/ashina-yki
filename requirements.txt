@@ -6,6 +6,9 @@ paho-mqtt>=2.0.0
 opencv-python>=4.8.0
 pyqtgraph>=0.13.3
 pyttsx3>=2.90
+# Türkçe nöral ses (sesli otopilot). Model assets/tts/ altında DEPODA;
+# bu paket yoksa sistem sessizce pyttsx3/espeak'e düşer.
+piper-tts>=1.6.0
 folium>=0.14.0
 requests>=2.31.0
 cryptography>=41.0.0
