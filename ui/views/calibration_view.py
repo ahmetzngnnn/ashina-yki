@@ -882,8 +882,22 @@ class CalibrationView(QWidget):
         left = QWidget()
         ll = QVBoxLayout(left)
         ll.setContentsMargins(6, 6, 6, 6)
+        # 3B: pusula kalibrasyonu aracin HER EKSENDE cevrilmesini ister;
+        # donen model bunu metinden cok daha iyi anlatir. WebEngine yoksa
+        # mevcut 2B cizime dusulur.
+        self._compass_model3d = None
+        try:
+            from ui.widgets.model3d_view import Model3DView
+            self._compass_model3d = Model3DView()
+            self._compass_model3d.setMinimumSize(280, 260)
+            ll.addWidget(self._compass_model3d, 1)
+        except Exception:
+            logger.exception("Pusula 3B gorunumu kurulamadi")
         self._compass_drone = Drone3DWidget()
-        ll.addWidget(self._compass_drone)
+        if self._compass_model3d is None:
+            ll.addWidget(self._compass_drone)
+        else:
+            self._compass_drone.setVisible(False)
         split.addWidget(left)
 
         right = QWidget()
@@ -957,6 +971,9 @@ class CalibrationView(QWidget):
         )
         self._compass_active = True
         self._compass_drone.start_spin()
+        if self._compass_model3d is not None:
+            self._compass_model3d.rotation_demo(True)
+            self._compass_model3d.set_info("Araci her eksende yavasca cevirin")
         self._compass_progress.setValue(0)
         self._compass_progress.setFormat("Pusula 1: %p%")
         self._compass_progress2.setValue(0)
@@ -992,6 +1009,8 @@ class CalibrationView(QWidget):
         self.send_command.emit(cmd, [0, 0, 0, 0, 0, 0, 0])
         self._compass_active = False
         self._compass_drone.stop_spin()
+        if self._compass_model3d is not None:
+            self._compass_model3d.rotation_demo(False)
         self._compass_status_set(
             "⛔ İptal komutu gönderildi (DO_CANCEL_MAG_CAL)", "danger"
         )
@@ -1030,6 +1049,8 @@ class CalibrationView(QWidget):
         # Tüm pusulalar tamamlandıysa animasyonu durdur
         if self._compass_progress.value() == 100 and self._compass_progress2.value() == 100:
             self._compass_drone.stop_spin()
+        if self._compass_model3d is not None:
+            self._compass_model3d.rotation_demo(False)
         if cal_status >= 2:
             self._compass_status_set(
                 f"✓ Pusula {compass_id + 1} kalibrasyonu başarılı ({label})",

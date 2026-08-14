@@ -1397,7 +1397,10 @@ class DashboardView(QWidget):
         
         self._ai_scroll.setWidget(self._ai_container)
         ai_lay.addWidget(self._ai_scroll)
-        right_tabs.addTab(ai_tab, "Hedefler")
+        # NOT: "Hedefler" sekmesi 3B izleme ile değiştirildi; tespit kaydı
+        # widget'ları korunuyor (update_detection_history hâlâ besliyor),
+        # ileride başka bir yere taşınabilir.
+        right_tabs.addTab(self._build_track3d_tab(), "3B İzleme")
 
         # 4. Sinyal & Donanım Sekmesi
         hw_tab = QWidget()
@@ -1660,6 +1663,7 @@ class DashboardView(QWidget):
     def update_telemetry(self, data: dict) -> None:
         self._quick_data.update_telemetry(data)
         self._hud.update_telemetry(data)
+        self.update_track3d(data)
         
         # ESC verilerini HUD'a gönder
         rpms = data.get("esc_rpm")
@@ -1778,6 +1782,72 @@ class DashboardView(QWidget):
                 old.deleteLater()
             except Exception:
                 pass
+
+    # ── 3B Canlı İzleme ────────────────────────────────────────────────────
+    def _build_track3d_tab(self):
+        """Aracın gerçek hareketini 3B gösteren sekme.
+
+        Konum home'a göre metre cinsinden hesaplanır (kuzey/doğu/yukarı);
+        model gerçek yönelimiyle döner ve arkasında zamanla solan bir iz
+        bırakır. Harita 2B kuş bakışı verir, bu sekme İRTİFA ve YÖNELİMİ
+        aynı anda görünür kılar — özellikle alçalma/hizalama fazında.
+        """
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(6)
+
+        self._track3d = None
+        try:
+            from ui.widgets.model3d_view import Model3DView
+            self._track3d = Model3DView()
+            lay.addWidget(self._track3d, 1)
+        except Exception:
+            logger.exception("3B izleme kurulamadı")
+            uyari = QLabel("3B izleme kurulamadı (WebEngine gerekli).")
+            uyari.setObjectName("mutedLabel")
+            lay.addWidget(uyari)
+            return w
+
+        alt = QHBoxLayout(); alt.setSpacing(6)
+        self._lbl_track3d = QLabel("Home bekleniyor…")
+        self._lbl_track3d.setObjectName("mutedLabel")
+        alt.addWidget(self._lbl_track3d)
+        alt.addStretch()
+        btn_iz = QPushButton("İzi Temizle")
+        btn_iz.setMinimumHeight(26)
+        btn_iz.clicked.connect(self._on_clear_trail)
+        alt.addWidget(btn_iz)
+        lay.addLayout(alt)
+        return w
+
+    def _on_clear_trail(self) -> None:
+        if getattr(self, "_track3d", None) is not None:
+            self._track3d.clear_trail()
+
+    def update_track3d(self, data: dict) -> None:
+        """Telemetriden 3B izleme konumunu günceller.
+
+        Home noktası İLK geçerli fix'te kilitlenir ve konum ona göre metre
+        cinsinden hesaplanır. Home yoksa hesaplanamaz — koordinat farkını
+        ölçmek için bir başlangıç şart."""
+        if getattr(self, "_track3d", None) is None:
+            return
+        lat = data.get("lat"); lon = data.get("lon")
+        if lat is None or lon is None or (abs(lat) < 1e-7 and abs(lon) < 1e-7):
+            return
+        if getattr(self, "_t3d_home", None) is None:
+            self._t3d_home = (float(lat), float(lon))
+            self._lbl_track3d.setText("Home kilitlendi — iz kaydediliyor")
+        hlat, hlon = self._t3d_home
+        # Küçük mesafede düz-dünya yaklaşımı yeterli (birkaç km'de hata < %0,1)
+        kuzey = (float(lat) - hlat) * 111320.0
+        dogu = (float(lon) - hlon) * 111320.0 * math.cos(math.radians(hlat))
+        yukari = float(data.get("relative_alt", data.get("alt", 0.0)) or 0.0)
+        roll = math.degrees(float(data.get("roll", 0.0) or 0.0))
+        pitch = math.degrees(float(data.get("pitch", 0.0) or 0.0))
+        yaw = math.degrees(float(data.get("yaw", 0.0) or 0.0))
+        self._track3d.set_pose(kuzey, dogu, yukari, roll, pitch, yaw)
 
     # ── Görev İzleme + Sesli Otopilot ──────────────────────────────────────
     def _build_mission_monitor(self):

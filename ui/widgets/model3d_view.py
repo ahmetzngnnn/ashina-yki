@@ -100,9 +100,23 @@ _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 <script>/*@@GLTF@@*/</script>
 <script>/*@@ORBIT@@*/</script>
 <script>
-let sahne, kamera, cizer, model, kontrol;
+let sahne, kamera, cizer, model, tasiyici, kontrol;
 let hedefQ = new THREE.Quaternion();      // animasyonun gittiği yönelim
-const ADIM = 0.08;                        // yumuşak geçiş oranı (slerp)
+let hedefPoz = new THREE.Vector3();       // animasyonun gittiği konum (sahne birimi)
+const ADIM = 0.08;                        // yumuşak geçiş oranı (slerp/lerp)
+
+// ── İz (uçuş izi) ────────────────────────────────────────────────────────
+// Araç hareket ettikçe arkasında bırakılan, ZAMANLA SOLAN çizgi.
+let izNoktalar = [];                      // {v: Vector3, t: ms}
+let izCizgi = null;
+const IZ_MAX_NOKTA = 900;                 // bellek tavanı (uzun uçuşta şişmesin)
+const IZ_OMUR_MS   = 90000;               // 90 sn sonra nokta tamamen silinir
+const IZ_MIN_MESAFE = 0.004;              // bu kadar kımıldamadan yeni nokta ekleme
+
+// Ölçek: sahne birimi ile metre arasındaki bağ. Araç menzilin dışına
+// çıkarsa otomatik uzaklaşılır (aksi halde model görüş alanından çıkardı).
+let menzirMetre = 50.0;                   // ızgaranın temsil ettiği yarıçap (m)
+const SAHNE_YARICAP = 1.15;
 
 function eksenOku(uzunluk, renk, yon, etiket){
   // Gövde eksenlerini gösteren ok — operatör "burun" nerede anlasın diye
@@ -188,7 +202,24 @@ function kur(){
   kontrol.enableDamping = true; kontrol.enablePan = false;
   kontrol.minDistance = 0.7; kontrol.maxDistance = 4.0;
 
-  model = new THREE.Group(); sahne.add(model);
+  // Taşıyıcı KONUMU, model YÖNELİMİ taşır. Ayrılmalarının sebebi: iz
+  // aracın konumundan çizilir, yönelimden etkilenmemelidir.
+  tasiyici = new THREE.Group(); sahne.add(tasiyici);
+  model = new THREE.Group(); tasiyici.add(model);
+
+  // Başlangıç (home) işareti — iz buradan başlar
+  const home = new THREE.Mesh(
+    new THREE.RingGeometry(0.05, 0.075, 24),
+    new THREE.MeshBasicMaterial({color: 0x6ee7a0, side: THREE.DoubleSide}));
+  home.rotation.x = -Math.PI/2; home.position.y = -0.249; sahne.add(home);
+
+  // İz çizgisi: renk tepe noktası başına verilir (solma bunun üzerinden)
+  const izGeo = new THREE.BufferGeometry();
+  izGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(IZ_MAX_NOKTA*3), 3));
+  izGeo.setAttribute('color',    new THREE.BufferAttribute(new Float32Array(IZ_MAX_NOKTA*3), 3));
+  izCizgi = new THREE.Line(izGeo, new THREE.LineBasicMaterial({vertexColors:true}));
+  izCizgi.frustumCulled = false; sahne.add(izCizgi);
+
   // Gövde eksenleri: kırmızı=sağ(X), yeşil=yukarı(Y), mavi=ileri(-Z)
   model.add(eksenOku(0.34, 0xff5a55, new THREE.Vector3(1,0,0)));
   model.add(eksenOku(0.30, 0x6ee7a0, new THREE.Vector3(0,1,0)));
@@ -226,9 +257,31 @@ function boyutla(){
   kamera.aspect = w/Math.max(1,h); kamera.updateProjectionMatrix();
 }
 
+function iziGuncelle(){
+  if (!izCizgi) return;
+  const simdi = performance.now();
+  // Ömrü dolan noktaları at (baştan; dizi zaman sıralı)
+  while (izNoktalar.length && simdi - izNoktalar[0].t > IZ_OMUR_MS) izNoktalar.shift();
+  const poz = izCizgi.geometry.attributes.position.array;
+  const ren = izCizgi.geometry.attributes.color.array;
+  for (let i=0; i<izNoktalar.length; i++){
+    const n = izNoktalar[i];
+    poz[i*3] = n.v.x; poz[i*3+1] = n.v.y; poz[i*3+2] = n.v.z;
+    // Yaşlandıkça sön: taze = parlak turkuaz, eski = zemine karışır
+    const yas = Math.min(1, (simdi - n.t) / IZ_OMUR_MS);
+    const k = 1 - yas;
+    ren[i*3] = 0.18*k; ren[i*3+1] = 0.83*k; ren[i*3+2] = 0.75*k;
+  }
+  izCizgi.geometry.setDrawRange(0, izNoktalar.length);
+  izCizgi.geometry.attributes.position.needsUpdate = true;
+  izCizgi.geometry.attributes.color.needsUpdate = true;
+}
+
 function dongu(){
   requestAnimationFrame(dongu);
-  model.quaternion.slerp(hedefQ, ADIM);   // yumuşak geçiş
+  model.quaternion.slerp(hedefQ, ADIM);      // yönelim
+  tasiyici.position.lerp(hedefPoz, ADIM);    // konum
+  iziGuncelle();
   kontrol.update();
   cizer.render(sahne, kamera);
 }
@@ -245,6 +298,55 @@ window.setYonelim = function(roll, pitch, yaw){
 window.setBilgi = function(metin){
   document.getElementById('bilgi').textContent = metin;
 };
+
+// Canlı takip: aracın home'a göre konumu (METRE, kuzey/doğu/yukarı) ve yönelimi.
+window.setPoz = function(kuzey, dogu, yukari, roll, pitch, yaw){
+  if (window.WEBGL_YOK) return;
+  // Menzil dışına çıkınca otomatik uzaklaş — araç görüş alanından çıkmasın.
+  // %10 pay bırakılır ki sınırda sürekli ölçek değiştirip titremesin.
+  const uzaklik = Math.sqrt(kuzey*kuzey + dogu*dogu + yukari*yukari);
+  if (uzaklik > menzirMetre * 0.9){
+    const eski = menzirMetre;
+    while (uzaklik > menzirMetre * 0.9) menzirMetre *= 1.5;
+    // Ölçek değişti: mevcut iz noktaları da yeni ölçeğe taşınmalı, yoksa
+    // geçmiş iz kayar ve yanlış bir uçuş yolu gösterir.
+    const k = eski / menzirMetre;
+    izNoktalar.forEach(n => n.v.multiplyScalar(k));
+  }
+  const s = SAHNE_YARICAP / menzirMetre;
+  // Sahne ekseni: X=doğu, Y=yukarı, Z=GÜNEY (kuzey -Z yönüdür)
+  hedefPoz.set(dogu*s, yukari*s - 0.25, -kuzey*s);
+  window.setYonelim(roll, pitch, yaw);
+
+  const son = izNoktalar.length ? izNoktalar[izNoktalar.length-1].v : null;
+  if (!son || son.distanceTo(hedefPoz) > IZ_MIN_MESAFE){
+    izNoktalar.push({v: hedefPoz.clone(), t: performance.now()});
+    if (izNoktalar.length > IZ_MAX_NOKTA) izNoktalar.shift();
+  }
+  document.getElementById('bilgi').textContent =
+    'K' + kuzey.toFixed(0) + ' D' + dogu.toFixed(0) + ' Y' + yukari.toFixed(0) +
+    ' m  ·  menzil ' + menzirMetre.toFixed(0) + ' m';
+};
+
+window.izTemizle = function(){ izNoktalar = []; };
+
+// Pusula kalibrasyonu: aracın nasıl çevrilmesi gerektiğini sürekli döndürerek
+// gösterir. ArduPilot her eksende tam tur ister.
+let demoAcik = false, demoT = 0;
+window.donusDemo = function(acik){
+  demoAcik = !!acik;
+  if (!demoAcik) window.setYonelim(0,0,0);
+};
+setInterval(function(){
+  if (!demoAcik || window.WEBGL_YOK) return;
+  demoT += 0.05;
+  // Üç evre: yaw turu → roll turu → pitch turu
+  const evre = Math.floor(demoT / (2*Math.PI)) % 3;
+  const a = THREE.MathUtils.radToDeg(demoT % (2*Math.PI));
+  if (evre === 0) window.setYonelim(0, 0, a);
+  else if (evre === 1) window.setYonelim(a, 0, 0);
+  else window.setYonelim(0, a, 0);
+}, 50);
 kur();
 </script></body></html>"""
 
@@ -335,3 +437,20 @@ class Model3DView(QWidget):
 
     def set_info(self, metin: str) -> None:
         self._js(f"window.setBilgi && setBilgi({json.dumps(metin)});")
+
+    # ── Canlı takip ──────────────────────────────────────────────────
+    def set_pose(self, kuzey_m: float, dogu_m: float, yukari_m: float,
+                 roll: float, pitch: float, yaw: float) -> None:
+        """Aracın home'a göre konumunu (metre) ve yönelimini uygular.
+
+        Ölçek otomatiktir: araç uzaklaştıkça sahne uzaklaşır, iz de aynı
+        oranda taşınır (geçmiş iz kaymasın diye)."""
+        self._js(f"window.setPoz && setPoz({kuzey_m:.2f},{dogu_m:.2f},"
+                 f"{yukari_m:.2f},{roll:.2f},{pitch:.2f},{yaw:.2f});")
+
+    def clear_trail(self) -> None:
+        self._js("window.izTemizle && izTemizle();")
+
+    def rotation_demo(self, acik: bool) -> None:
+        """Pusula kalibrasyonu için sürekli dönüş gösterimi."""
+        self._js(f"window.donusDemo && donusDemo({'true' if acik else 'false'});")
