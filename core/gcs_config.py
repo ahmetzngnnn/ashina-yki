@@ -30,6 +30,7 @@ DEFAULTS: dict = {
     # backend olmadan sadece arayüzü canlı gör). Env ASHINA_YKI_MODE veya --sim
     # bayrağı override eder. Uçtan-uca sim (SITL+IHA-sim) için "real" + 127.0.0.1 host.
     "mode":                   "real",
+    "ui_theme":               "dark",        # Arayüz teması: "dark" | "light"
     "companion_host":         "192.168.1.10",   # İHA RPi — yardımcı bilgisayar + video (8080/8081)
     "companion_mission_port": 5601,
     "companion_status_port":  5602,
@@ -106,6 +107,12 @@ class GCSConfig:
     @property
     def is_sim(self) -> bool:
         return self.mode == "sim"
+
+    @property
+    def ui_theme(self) -> str:
+        """'dark' | 'light'. Tanınmayan değer koyu temaya düşer."""
+        value = str(self._data.get("ui_theme", "dark")).strip().lower()
+        return value if value in ("dark", "light") else "dark"
 
     @property
     def companion_host(self) -> str:

@@ -4,6 +4,7 @@ import logging
 import socket
 import threading
 import time
+from collections import deque
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -54,10 +55,20 @@ class RpiStatusWorker(QThread):
         # Aynı failsafe mesajının tekrar tekrar gösterilmesini engelle
         self._alert_last_emit: dict = {}   # key=(subsystem,level,message) → timestamp
         self._ALERT_COOLDOWN = 30.0        # saniye
-        # GERÇEK LAN gecikmesi (ping) — companion'a TCP RTT ölçümü, throttle'lı
+        # LAN gecikme göstergesi (ping_ms).
+        # KRİTİK DÜZELTME: ÖNCEDEN her 8 saniyede aynı 5602 DURUM portuna İKİNCİ
+        # bir TCP bağlantısı açılıp kapatılarak RTT ölçülüyordu. Companion
+        # status_server her YENİ istemciye anında durum üretiyor ve o üretimde
+        # görev bildirimleri TAHRİBATLI okunuyordu (get_notifications → clear)
+        # → bildirim bu kısa ömürlü ölçüm bağlantısına yazılıp ÇÖPE gidiyor,
+        # operatör kritik bildirimi KAYBEDİYORDU.
+        # ÇÖZÜM: ölçüm için ARTIK YENİ BAĞLANTI AÇILMIYOR. Zaten açık olan durum
+        # soketinde ardışık mesajlar arası gecikme ölçülüyor; yayın periyodunun
+        # üzerine binen EK gecikme "ping_ms" olarak raporlanıyor (sinyal adı ve
+        # alan şeması KORUNDU — UI bağlı: dashboard_view.update_rpi_status).
         self._last_ping_ms: float | None = None
-        self._last_ping_at: float = 0.0
-        self._PING_INTERVAL = 8.0          # saniye (companion log gürültüsünü sınırlar)
+        self._last_msg_ts:  float | None = None      # son geçerli mesaj zamanı
+        self._delta_hist:   deque = deque(maxlen=30) # son mesaj aralıkları (ms)
 
     # ── Kontrol metodları (main thread'den çağrılır) ───────────────────────────
 
@@ -138,6 +149,10 @@ class RpiStatusWorker(QThread):
             sock.settimeout(self._read_timeout)
 
             buf = b""
+            # Yeni bağlantı → gecikme ölçümü geçmişini sıfırla (kopukluk süresi
+            # yanlışlıkla "gecikme" olarak raporlanmasın).
+            self._last_msg_ts = None
+            self._delta_hist.clear()
             # FIX P1-5: Ardışık JSON hata sayacı
             json_error_count = 0
             # Sessiz-donma tespiti: son GEÇERLİ veri ne zaman geldi (bkz. _STALE_TIMEOUT_S)
@@ -168,6 +183,19 @@ class RpiStatusWorker(QThread):
 
                 buf += chunk
 
+                # Tampon taşma koruması. NEDEN: yanlış porta bağlanılırsa
+                # (ör. video akışı 8080) gelen veride hiç "\n" olmayabilir →
+                # buf sınırsız büyür (bellek şişer) ve satır işlenmediği için
+                # "sessiz-donma" koruması da devreye GİRMEZ (recv veri aldığı
+                # sürece timeout oluşmaz). 1 MB'ı aşarsa tamponu at ve yeniden bağlan.
+                if len(buf) > 1_000_000:
+                    msg = ("RPi durum akışında 1 MB'tan fazla satırsız veri — "
+                           "yanlış port olabilir, tampon atılıp yeniden bağlanılıyor")
+                    logger.warning(msg)
+                    self.error_occurred.emit(msg)
+                    buf = b""
+                    break   # dış döngü reconnect yapar
+
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     line = line.strip()
@@ -177,13 +205,9 @@ class RpiStatusWorker(QThread):
                         data = json.loads(line)
                         json_error_count = 0          # Başarılı parse → sayacı sıfırla
                         last_data_ts = time.monotonic()  # sessiz-donma tespiti için
-                        # GERÇEK LAN gecikmesi: throttle'lı TCP RTT ölçümü ekle
-                        now_p = time.monotonic()
-                        if now_p - self._last_ping_at >= self._PING_INTERVAL:
-                            self._last_ping_at = now_p
-                            p = self._measure_ping(host, port)
-                            if p is not None:
-                                self._last_ping_ms = p
+                        # LAN gecikmesi: MEVCUT soketteki veri geliş aralığından
+                        # türetilir — ayrı bağlantı AÇILMAZ (bkz. __init__ notu).
+                        self._update_link_latency(time.monotonic())
                         if self._last_ping_ms is not None:
                             data["ping_ms"] = self._last_ping_ms
                         self.rpi_status_updated.emit(data)
@@ -240,20 +264,26 @@ class RpiStatusWorker(QThread):
         self._active = False
         self.rpi_connected.emit(False)
 
-    def _measure_ping(self, host: str, port: int) -> float | None:
-        """Companion'a GERÇEK TCP RTT (LAN gecikmesi, ms). TCP el sıkışma süresini
-        ölçer — yeni kısa bağlantı açıp kapatır. Throttle'lı çağrılır."""
-        try:
-            t0 = time.perf_counter()
-            s = socket.create_connection((host, port), timeout=2.0)
-            dt = (time.perf_counter() - t0) * 1000.0
-            try:
-                s.close()
-            except Exception:
-                pass
-            return round(dt, 1)
-        except Exception:
-            return None
+    def _update_link_latency(self, now: float) -> None:
+        """Bağlantı gecikmesini MEVCUT durum soketinden türet (ms).
+
+        Companion sabit periyotla yayın yapar (status_server, ~1 s). Gözlenen
+        en küçük mesaj aralığı pratikte bu nominal periyottur; anlık aralığın
+        nominalin ÜZERİNE binen kısmı = hattın eklediği gecikme/jitter.
+        Bu ölçüm için EK TCP BAĞLANTISI AÇILMAZ — eski ping ölçümü 5602'ye
+        ikinci bir bağlantı açtığı için görev bildirimlerini çalıyordu.
+        Alan adı ("ping_ms") ve sinyal şeması korunur (UI bağlı).
+        """
+        prev = self._last_msg_ts
+        self._last_msg_ts = now
+        if prev is None:
+            return
+        delta_ms = (now - prev) * 1000.0
+        if delta_ms <= 0:
+            return
+        self._delta_hist.append(delta_ms)
+        baseline = min(self._delta_hist)          # ≈ companion yayın periyodu
+        self._last_ping_ms = round(max(0.0, delta_ms - baseline), 1)
 
     def stop(self) -> None:
         self.requestInterruption()

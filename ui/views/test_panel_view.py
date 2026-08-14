@@ -20,19 +20,13 @@ from PyQt6.QtWidgets import (
     QFileDialog, QSizePolicy,
 )
 
-from core import local_storage
+from core import local_storage, theme
 
 logger = logging.getLogger(__name__)
 
 # ── Stil ──────────────────────────────────────────────────────────────────────
-_SS = ("QGroupBox{border:1px solid #0f3460;color:#aaa;font-weight:bold;"
-       "padding-top:18px;margin-top:6px;border-radius:4px;}")
-_SB = "QPushButton{color:#00e5ff;border-radius:4px;padding:6px 10px;font-weight:bold;}"
-_SBG = ("QPushButton{color:#4ade80;border-radius:4px;padding:7px 12px;font-weight:bold;}"
-        "QPushButton:hover{}"
-        "QPushButton:disabled{color:#555;}")
-_SBR = "QPushButton{color:#ff6666;border-radius:4px;padding:7px 12px;font-weight:bold;}"
-_SBW = "QPushButton{color:#f0a500;border-radius:4px;padding:7px 12px;font-weight:bold;}"
+# NOT: QGroupBox / buton stilleri artık global style.qss'ten gelir (v2 şartname);
+# yerel override yok.
 
 # Test durumları
 _ST_WAITING = "BEKLIYOR"
@@ -40,6 +34,40 @@ _ST_RUNNING = "ÇALIŞIYOR"
 _ST_PASS    = "BAŞARILI"
 _ST_FAIL    = "BAŞARISIZ"
 _ST_SKIP    = "ATLANDI"
+# NEDEN (H5): YKİ'nin hiçbir komut göndermediği, tamamen operatör gözlemine
+# dayanan testler için ayrı durum. "ÇALIŞIYOR" göstermek testin otomatik
+# yürütüldüğü yanılgısı yaratıp sahte BAŞARILI sonucuna yol açıyordu.
+_ST_MANUAL  = "MANUEL"
+
+# Test durumu → tema token'ı. Renkler çalışma anında değiştiği için inline
+# kalır, ama ham hex yerine token üzerinden okunur (tema değişimini izler).
+# NOT: ÇALIŞIYOR "warning" (devam eden işlem), MANUEL "info" tonundadır —
+# H5 ayrımı (otomatik yürüyen test / operatör gözlemi) renkte de korunmalı.
+_STATE_TOKENS = {
+    _ST_WAITING: "text_muted",
+    _ST_RUNNING: "warning",
+    _ST_PASS:    "success",
+    _ST_FAIL:    "danger",
+    _ST_SKIP:    "text_muted",
+    _ST_MANUAL:  "info",
+}
+
+# Otomatik komutu olmayan testler (idx) ve operatörün uygulaması gereken adımlar.
+_MANUAL_TESTS = (3, 4)
+_MANUAL_STEPS = {
+    3: (
+        "1) Drone'u güvenli irtifada AUTO/GUIDED modda uçurun.",
+        "2) YKİ telemetri antenini/USB'sini fiziksel olarak ayırın.",
+        "3) FS_GCS_ENABLE süresi dolunca aracın RTL'e geçtiğini GÖZLEYİN.",
+        "4) Telemetriyi geri takın, aracın eve döndüğünü doğrulayın.",
+    ),
+    4: (
+        "1) Drone'u sabit irtifada tutarak YKİ'den uzaklaştırın.",
+        "2) RSSI / paket kaybı / video donma mesafelerini not edin.",
+        "3) Bağlantı bozulmaya başladığı mesafeyi kaydedin.",
+        "4) Aracı menzil içine geri getirip bağlantıyı doğrulayın.",
+    ),
+}
 
 # Önceden uçuş kontrol listesi öğeleri
 _CHECKLIST = [
@@ -60,71 +88,93 @@ class _HealthIndicator(QFrame):
 
     def __init__(self, title: str, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(140, 85)
+        self.setMinimumSize(120, 84)
+        self.setMaximumHeight(92)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.setStyleSheet("QFrame{border:1px solid #0f3460;border-radius:6px;}")
+        self.setObjectName("cardFrame")
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(4)
+
+        # Son bilinen durum — tema değişince renkler bundan yeniden üretilir.
+        self._ok: bool | None = None
 
         self._led = QLabel("●")
         self._led.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._led.setFont(QFont("Segoe UI", 18))
-        self._led.setStyleSheet("color:#555;")
 
         self._title = QLabel(title)
         self._title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._title.setStyleSheet("color:#888;font-size:10px;font-weight:bold;")
 
         self._value = QLabel("—")
         self._value.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._value.setStyleSheet("color:#666;font-size:10px;")
 
         lay.addWidget(self._led)
         lay.addWidget(self._title)
         lay.addWidget(self._value)
 
+        self._apply_theme_colors()
+        theme.notifier().changed.connect(lambda _n: self._apply_theme_colors())
+
     def set_status(self, ok: bool | None, value_text: str = ""):
-        if ok is True:
-            color, led_color = "#1a3a1a", "#4ade80"
-        elif ok is False:
-            color, led_color = "#3a1a1a", "#ff4444"
-        else:
-            color, led_color = "#111122", "#555"
-        self.setStyleSheet(
-            f"QFrame{{border:1px solid #0f3460;border-radius:6px;background:{color};}}"
-        )
-        self._led.setStyleSheet(f"color:{led_color};")
+        self._ok = ok
         if value_text:
             self._value.setText(value_text)
-            self._value.setStyleSheet(f"color:{led_color};font-size:10px;")
+        self._apply_theme_colors()
+
+    def _apply_theme_colors(self):
+        """Durum + tema renklerini (yeniden) yazar.
+
+        Durum yalnız kenarlık + LED rengiyle gösterilir; arka plan boyanmaz
+        (kart zemini QSS'teki cardFrame'den gelir)."""
+        if self._ok is True:
+            border_color = led_color = theme.c("success")
+        elif self._ok is False:
+            border_color = led_color = theme.c("danger")
+        else:
+            border_color, led_color = theme.c("border"), theme.c("text_muted")
+        # Kapsayıcıya ID seçicili stil — alt widget'lara yayılmaz.
+        card_sheet = f"QFrame#cardFrame{{border-color:{border_color};}}"
+        self.setStyleSheet(card_sheet)
+        self._led.setStyleSheet(f"color:{led_color};")
+        # 10px + bold kombinasyonu hazır class'la karşılanmıyor; renk token'dan.
+        self._title.setStyleSheet(
+            f"color:{theme.c('text_muted')};font-size:10px;font-weight:bold;"
+        )
+        self._value.setStyleSheet(f"color:{led_color};font-size:10px;")
 
 
 # ── Kontrol Listesi Satırı ────────────────────────────────────────────────────
 class _CheckRow(QFrame):
     def __init__(self, name: str, desc: str, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(
-            "QFrame{border:none;background:transparent;}"
-            "QFrame:hover{}"
-        )
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(4, 2, 4, 2)
+        lay.setContentsMargins(6, 3, 6, 3)
+        lay.setSpacing(8)
 
         self._icon = QLabel("⬜")
         self._icon.setFixedWidth(24)
-        self._icon.setStyleSheet("font-size:14px;")
+        self._icon.setStyleSheet("font-size:14px;")   # renk yok — emoji
 
-        lbl = QLabel(name)
-        lbl.setStyleSheet("color:#ccc;font-size:12px;font-weight:bold;")
-        lbl.setFixedWidth(180)
+        self._name_lbl = QLabel(name)
+        self._name_lbl.setFixedWidth(190)
 
         self._desc_lbl = QLabel(desc)
-        self._desc_lbl.setStyleSheet("color:#777;font-size:11px;")
+        self._desc_lbl.setObjectName("mutedLabel")     # 11px soluk metin (QSS)
+        self._desc_lbl.setWordWrap(True)   # dar panelde kırpma yerine satır sar
 
         lay.addWidget(self._icon)
-        lay.addWidget(lbl)
+        lay.addWidget(self._name_lbl)
         lay.addWidget(self._desc_lbl, 1)
+
+        self._apply_theme_colors()
+        theme.notifier().changed.connect(lambda _n: self._apply_theme_colors())
+
+    def _apply_theme_colors(self):
+        """12px + bold metin class'ı yok; renk token'dan verilir."""
+        self._name_lbl.setStyleSheet(
+            f"color:{theme.c('text')};font-size:12px;font-weight:bold;"
+        )
 
     def set_state(self, ok: bool | None):
         if ok is True:
@@ -143,37 +193,35 @@ class _TestRow(QFrame):
         super().__init__(parent)
         self._idx = idx
         self._state = _ST_WAITING
-        self.setStyleSheet(
-            "QFrame{border:1px solid #1a1a3e;border-radius:4px;}"
-        )
+        self.setObjectName("cardFrame")
+        self.setMaximumHeight(44)
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(8, 6, 8, 6)
+        lay.setContentsMargins(8, 4, 8, 4)
+        lay.setSpacing(8)
 
         self._num = QLabel(f"TEST {idx + 1}")
         self._num.setFixedWidth(55)
-        self._num.setStyleSheet("color:#00e5ff;font-weight:bold;font-size:12px;")
 
         self._title = QLabel(title)
-        self._title.setStyleSheet("color:#ddd;font-size:12px;font-weight:bold;")
         self._title.setFixedWidth(220)
 
         self._desc = QLabel(description)
-        self._desc.setStyleSheet("color:#777;font-size:11px;")
+        self._desc.setObjectName("mutedLabel")        # 11px soluk metin (QSS)
 
         self._timer_lbl = QLabel("—")
+        self._timer_lbl.setObjectName("mutedLabel")
         self._timer_lbl.setFixedWidth(60)
         self._timer_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._timer_lbl.setStyleSheet("color:#aaa;font-size:11px;")
 
         self._status_lbl = QLabel(_ST_WAITING)
+        self._status_lbl.setObjectName("mutedLabel")
         self._status_lbl.setFixedWidth(90)
         self._status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._status_lbl.setStyleSheet(
-            "color:#777;border-radius:3px;padding:2px 4px;font-size:11px;"
-        )
 
         self._start_btn = QPushButton("Başlat")
-        self._start_btn.setStyleSheet(_SBG)
+        self._start_btn.setObjectName("successButton")
+        self._start_btn.setFixedHeight(28)
+        self._start_btn.setFixedWidth(90)
         self._start_btn.clicked.connect(lambda: self.start_requested.emit(self._idx))
 
         lay.addWidget(self._num)
@@ -183,29 +231,35 @@ class _TestRow(QFrame):
         lay.addWidget(self._status_lbl)
         lay.addWidget(self._start_btn)
 
+        self._apply_theme_colors()
+        theme.notifier().changed.connect(lambda _n: self._apply_theme_colors())
+
+    def _apply_theme_colors(self):
+        """Kurulumda yazılan inline renkleri tema değişiminde tazeler.
+
+        Buton etkinliği burada DEĞİŞTİRİLMEZ — set_state'i çağırmak, başka bir
+        test çalışırken kilitlenmiş Başlat butonlarını yeniden açardı."""
+        self._num.setStyleSheet(
+            f"color:{theme.c('accent')};font-weight:bold;font-size:12px;"
+        )
+        self._title.setStyleSheet(
+            f"color:{theme.c('text')};font-size:12px;font-weight:bold;"
+        )
+        # Yalnız metin rengi (arka plan/kenarlık inline YOK).
+        self._status_lbl.setStyleSheet(
+            f"color:{theme.c(_STATE_TOKENS.get(self._state, 'text_muted'))};"
+        )
+
     def set_state(self, state: str):
         self._state = state
-        color_map = {
-            _ST_WAITING: "#777",
-            _ST_RUNNING: "#f0a500",
-            _ST_PASS:    "#4ade80",
-            _ST_FAIL:    "#ff4444",
-            _ST_SKIP:    "#888",
-        }
-        bg_map = {
-            _ST_WAITING: "#1a1a2e",
-            _ST_RUNNING: "#2a2a0a",
-            _ST_PASS:    "#0a2a0a",
-            _ST_FAIL:    "#2a0a0a",
-            _ST_SKIP:    "#1a1a1a",
-        }
-        c = color_map.get(state, "#777")
-        bg = bg_map.get(state, "#1a1a2e")
         self._status_lbl.setText(state)
+        # Yalnız metin rengi çalışma anında değişir (arka plan/kenarlık inline YOK).
         self._status_lbl.setStyleSheet(
-            f"background:{bg};color:{c};border-radius:3px;padding:2px 4px;font-size:11px;"
+            f"color:{theme.c(_STATE_TOKENS.get(state, 'text_muted'))};"
         )
-        self._start_btn.setEnabled(state not in (_ST_RUNNING, _ST_PASS))
+        # NEDEN (H5): MANUEL durumu da "devam eden test" sayılır — bu satırın
+        # Başlat butonu, operatör sonucu kaydedene kadar kapalı kalmalıdır.
+        self._start_btn.setEnabled(state not in (_ST_RUNNING, _ST_PASS, _ST_MANUAL))
 
     def set_timer(self, text: str):
         self._timer_lbl.setText(text)
@@ -248,6 +302,7 @@ class TestPanelView(QWidget):
         self._telemetry_snap: dict = {}
         self._test_results: dict[int, dict] = {}
         self._session_ts_start: int = 0
+        self._conn_ok: bool = False   # bağlantı etiketinin son bilinen durumu
 
         self._elapsed = QElapsedTimer()
         self._tick_timer = QTimer(self)
@@ -255,6 +310,7 @@ class TestPanelView(QWidget):
         self._tick_timer.timeout.connect(self._on_tick)
 
         self._build_ui()
+        theme.notifier().changed.connect(lambda _n: self._apply_theme_colors())
 
     # ── UI İnşa ───────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -264,9 +320,8 @@ class TestPanelView(QWidget):
 
         # --- Üst Satır: Sağlık Göstergeleri ---
         health_grp = QGroupBox("📡  Aviyonik Sağlık Durumu")
-        health_grp.setStyleSheet(_SS)
         h_lay = QHBoxLayout(health_grp)
-        h_lay.setSpacing(10)
+        h_lay.setSpacing(8)
 
         self._h_gps  = _HealthIndicator("GPS")
         self._h_ekf  = _HealthIndicator("EKF")
@@ -274,13 +329,15 @@ class TestPanelView(QWidget):
         self._h_rc   = _HealthIndicator("RC")
         self._h_arm  = _HealthIndicator("Arming")
 
+        # Kartlar satırı eşit stretch ile paylaşır; dev orta boşluk yok.
         for w in (self._h_gps, self._h_ekf, self._h_bat, self._h_rc, self._h_arm):
-            h_lay.addWidget(w)
-        h_lay.addStretch(1)
+            h_lay.addWidget(w, 1)
 
-        # Bağlantı durumu
+        # Bağlantı durumu — satırın sağında sabit genişlikte
         self._conn_lbl = QLabel("● Bağlantı: Yok")
-        self._conn_lbl.setStyleSheet("color:#ff4444;font-weight:bold;font-size:12px;")
+        self._conn_lbl.setFixedWidth(150)
+        self._conn_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._apply_conn_style()
         h_lay.addWidget(self._conn_lbl)
 
         root.addWidget(health_grp)
@@ -290,9 +347,8 @@ class TestPanelView(QWidget):
 
         # Sol: Kontrol Listesi
         cl_grp = QGroupBox("✅  Uçuş Öncesi Kontrol Listesi")
-        cl_grp.setStyleSheet(_SS)
         cl_lay = QVBoxLayout(cl_grp)
-        cl_lay.setSpacing(2)
+        cl_lay.setSpacing(6)
 
         self._check_rows: dict[str, _CheckRow] = {}
         for name, desc, key in _CHECKLIST:
@@ -303,8 +359,9 @@ class TestPanelView(QWidget):
         cl_lay.addStretch(1)
 
         self._chk_summary = QLabel("Kontrol bekleniyor…")
-        self._chk_summary.setStyleSheet("color:#aaa;font-size:11px;padding:4px;")
-        cl_lay.addWidget(self._chk_summary)
+        self._chk_summary.setObjectName("hintLabel")
+        # Sola yaslı — tam satır genişliğinde bar oluşturmaz.
+        cl_lay.addWidget(self._chk_summary, 0, Qt.AlignmentFlag.AlignLeft)
 
         cl_scroll = QScrollArea()
         cl_scroll.setWidgetResizable(True)
@@ -319,9 +376,8 @@ class TestPanelView(QWidget):
         right_lay.setSpacing(8)
 
         test_grp = QGroupBox("🧪  Test Senaryoları")
-        test_grp.setStyleSheet(_SS)
         t_lay = QVBoxLayout(test_grp)
-        t_lay.setSpacing(4)
+        t_lay.setSpacing(6)
 
         self._test_rows: list[_TestRow] = []
         for i, (title, desc, _) in enumerate(self._TEST_CONFIGS):
@@ -334,27 +390,23 @@ class TestPanelView(QWidget):
 
         # Test log
         log_grp = QGroupBox("📋  Test Logu")
-        log_grp.setStyleSheet(_SS)
         log_lay = QVBoxLayout(log_grp)
 
         self._log = QTextEdit()
         self._log.setReadOnly(True)
         self._log.setMaximumHeight(140)
-        self._log.setStyleSheet(
-            "QTextEdit{color:#00e5ff;font-family:'Consolas','Courier New';"
-            "font-size:11px;border:1px solid #0f3460;}"
-        )
+        self._apply_log_style()
         log_lay.addWidget(self._log)
 
         # Operatör sonuç butonları (test çalışırken görünür)
         self._result_row = QHBoxLayout()
         self._result_lbl = QLabel("Sonuç kaydet:")
-        self._result_lbl.setStyleSheet("color:#aaa;font-size:11px;")
+        self._result_lbl.setObjectName("mutedLabel")   # 11px soluk metin (QSS)
         self._pass_btn = QPushButton("✅  Geçti")
-        self._pass_btn.setStyleSheet(_SBG)
+        self._pass_btn.setObjectName("successButton")
         self._pass_btn.clicked.connect(lambda: self._on_manual_result(True))
         self._fail_btn = QPushButton("❌  Başarısız")
-        self._fail_btn.setStyleSheet(_SBR)
+        self._fail_btn.setObjectName("dangerButton")
         self._fail_btn.clicked.connect(lambda: self._on_manual_result(False))
         self._result_row.addWidget(self._result_lbl)
         self._result_row.addWidget(self._pass_btn)
@@ -366,12 +418,15 @@ class TestPanelView(QWidget):
         log_lay.addWidget(self._result_widget)
 
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
         self._save_btn = QPushButton("💾  Raporu Kaydet (DB + Dosya)")
-        self._save_btn.setStyleSheet(_SB)
+        self._save_btn.setObjectName("primaryButton")
+        self._save_btn.setFixedHeight(30)
         self._save_btn.clicked.connect(self._save_report)
-        self._clear_log_btn = QPushButton("🗑  Logu Temizle")
-        self._clear_log_btn.setStyleSheet(_SBR)
+        self._clear_log_btn = QPushButton("🗑  Logu Temizle")  # nötr stil
+        self._clear_log_btn.setFixedHeight(30)
         self._clear_log_btn.clicked.connect(self._log.clear)
+        btn_row.addStretch(1)  # eylemler sağa yaslı, tam satır genişliğinde değil
         btn_row.addWidget(self._save_btn)
         btn_row.addWidget(self._clear_log_btn)
         log_lay.addLayout(btn_row)
@@ -420,16 +475,28 @@ class TestPanelView(QWidget):
         self._h_rc.set_status(rc_ok, f"RSSI:{rc_rssi}" if rc_rssi >= 0 else "—")
 
         # Arming
+        # NEDEN (M8): mavlink_worker telemetriyi "flight_mode" anahtarıyla
+        # gönderiyor; eski kod "mode" arıyordu → gösterge her zaman "—" kalıyor,
+        # operatör aracın hangi modda olduğunu göremiyordu. Her iki anahtar da
+        # desteklenir (sim/eski worker'lar "mode" gönderebilir).
         armed = d.get("armed", False)
-        mode  = d.get("mode", "—")
+        mode  = d.get("flight_mode", d.get("mode", "—"))
         self._h_arm.set_status(None, f"{'ARMED' if armed else 'DISARMED'}\n{mode}")
 
         # Bağlantı
+        self._conn_ok = True
         self._conn_lbl.setText("● Bağlantı: AKTİF")
-        self._conn_lbl.setStyleSheet("color:#4ade80;font-weight:bold;font-size:12px;")
+        self._apply_conn_style()
 
     def _update_checklist(self, d: dict):
-        states: dict[str, bool] = {
+        # NEDEN (M7): "arming_ok" eskiden `not d.get("pre_arm_fail", False)` idi.
+        # "pre_arm_fail" alanı telemetride HİÇ üretilmiyor → varsayılan False →
+        # kontrol HER ZAMAN ✅ görünüyordu. Bu, hiç doğrulanmamış bir emniyet
+        # maddesini "geçti" gibi gösteren SAHTE bir yeşildi. Artık alan yoksa
+        # durum "bilinmiyor" (None) → _CheckRow.set_state(None) ⬜ gösterir ve
+        # geçti sayısına dahil edilmez.
+        _pre_arm = d.get("pre_arm_fail", None)
+        states: dict[str, bool | None] = {
             "gps_fix":    d.get("gps_fix_type", 0) >= 3,
             "ekf_ok":     (d.get("ekf_flags", 0) & 0x1F) == 0x1F,
             "battery_ok": d.get("battery_remaining", -1) >= 50,
@@ -437,22 +504,56 @@ class TestPanelView(QWidget):
             "compass_ok": d.get("compass_cal_done", False),
             "accel_ok":   d.get("accel_cal_done", False),
             "telem_ok":   True,  # telemetri veri geldiyse bağlı
-            "arming_ok":  not d.get("pre_arm_fail", False),
+            "arming_ok":  None if _pre_arm is None else (not _pre_arm),
         }
         pass_count = 0
+        unknown_count = 0
         for key, row in self._check_rows.items():
             ok = states.get(key)
             row.set_state(ok)
-            if ok:
+            if ok is True:
                 pass_count += 1
+            elif ok is None:
+                unknown_count += 1
 
         total = len(_CHECKLIST)
         if pass_count == total:
             self._chk_summary.setText(f"✅  Tüm kontroller geçti ({total}/{total}) — Uçuşa hazır!")
-            self._chk_summary.setStyleSheet("color:#4ade80;font-size:11px;padding:4px;")
+            # hintLabel zemini QSS'ten; yalnız metin rengi duruma göre değişir.
+            self._chk_summary.setStyleSheet(f"color:{theme.c('success')};")
         else:
-            self._chk_summary.setText(f"⚠️  {pass_count}/{total} kontrol geçti — Uçuş riski var!")
-            self._chk_summary.setStyleSheet("color:#f0a500;font-size:11px;padding:4px;")
+            # NEDEN (M7): Bilinmeyen maddeler ayrıca gösterilir — operatör
+            # "geçmedi" ile "veri yok" durumunu ayırt edebilmelidir.
+            unk = f"  ({unknown_count} madde BİLİNMİYOR)" if unknown_count else ""
+            self._chk_summary.setText(
+                f"⚠️  {pass_count}/{total} kontrol geçti{unk} — Uçuş riski var!"
+            )
+            self._chk_summary.setStyleSheet(f"color:{theme.c('warning')};")
+
+    # ── Tema ─────────────────────────────────────────────────────────────────
+    def _apply_conn_style(self):
+        """Bağlantı etiketi rengi — son bilinen duruma göre yeniden yazılır."""
+        color = theme.c("success") if self._conn_ok else theme.c("danger")
+        self._conn_lbl.setStyleSheet(f"color:{color};font-weight:bold;font-size:12px;")
+
+    def _apply_log_style(self):
+        """Test logu: mono yazı tipi + info tonu (QSS'te QTextEdit class'ı yok)."""
+        self._log.setStyleSheet(
+            f"QTextEdit{{color:{theme.c('info')};font-family:'Consolas','Courier New';"
+            f"font-size:11px;border:1px solid {theme.c('border')};}}"
+        )
+
+    def _apply_theme_colors(self):
+        """Tema değişince kurulumda yazılmış inline renkleri yeniden yazar.
+
+        Sağlık kartları ve test satırları kendi aboneliklerini kurar; burada
+        yalnız bu view'ın doğrudan boyadığı öğeler tazelenir. Kontrol listesi
+        özeti son telemetri anlık görüntüsüyle yeniden üretilir — hiç telemetri
+        gelmediyse "Kontrol bekleniyor…" metni bozulmasın diye dokunulmaz."""
+        self._apply_conn_style()
+        self._apply_log_style()
+        if self._telemetry_snap:
+            self._update_checklist(self._telemetry_snap)
 
     # ── Test Yönetimi ─────────────────────────────────────────────────────────
     @pyqtSlot(int)
@@ -481,7 +582,9 @@ class TestPanelView(QWidget):
         self._log_line(f"▶  TEST {idx + 1}: {title} — BAŞLADI")
         self._log_line(f"   Telemetri: GPS={self._telemetry_snap.get('gps_fix_type', '?')}, "
                        f"Bat=%{self._telemetry_snap.get('battery_remaining', '?')}, "
-                       f"Mode={self._telemetry_snap.get('mode', '?')}")
+                       # NEDEN (M8): worker "flight_mode" gönderiyor; "mode" eski
+                       # anahtar. İkisi de desteklenir, aksi halde log'da hep "?" çıkıyordu.
+                       f"Mode={self._telemetry_snap.get('flight_mode', self._telemetry_snap.get('mode', '?'))}")
 
         # MAVLink komutları
         self._execute_test_command(idx)
@@ -578,9 +681,15 @@ class TestPanelView(QWidget):
             )
 
         elif idx == 2:  # RC Failsafe Test
+            # NEDEN (C2 — KRİTİK): Eskiden custom_mode=11 gönderiliyordu.
+            # ArduCopter'da 11 = DRIFT modudur, RTL DEĞİL. Log "RTL modu aktif
+            # edildi" derken araç DRIFT'e geçiyordu (yarı-manuel, pilot girdisi
+            # bekleyen mod) → RC failsafe testinde araç eve dönmüyordu.
+            # Doğru RTL custom_mode = 6 (bkz. dashboard_view._set_mode(6) ve
+            # main_window._on_abort_mission).
             self.send_command.emit(
                 mavlink.MAV_CMD_DO_SET_MODE,
-                [1, 11, 0, 0, 0, 0, 0]  # RTL Mode
+                [1, 6, 0, 0, 0, 0, 0]  # RTL Mode (ArduCopter custom_mode = 6)
             )
             self._log_line("   → RTL modu aktif edildi")
             self._log_line(
@@ -588,10 +697,23 @@ class TestPanelView(QWidget):
             )
 
         else:
-            # Testler 3, 4 — manuel tetikleme
+            # ── Testler 3, 4 — TAM MANUEL (H5 — YÜKSEK) ────────────────────
+            # NEDEN: Bu iki test hiçbir MAVLink komutu göndermiyor. Eski kod
+            # yalnızca "manuel tetikleme gerektirir" yazıp testi ÇALIŞIYOR
+            # durumunda bırakıyordu; sayaç işliyor ve operatör hiçbir şey
+            # yapmadan "Geçti"ye basınca test BAŞARILI sayılıyordu. Artık durum
+            # açıkça MANUEL olarak işaretlenir, otomatik PASS verilmez ve
+            # operatöre yapılacak adımlar tek tek log'a yazılır.
+            self._test_rows[idx].set_state(_ST_MANUAL)
             self._log_line(
-                f"   ℹ  Bu test manuel tetikleme gerektirir.\n"
-                f"   Talimatları uygulayın ve aşağıda sonucu kaydedin."
+                "   ⚠  MANUEL TEST — YKİ hiçbir komut GÖNDERMEZ. "
+                "Sonuç yalnızca operatörün fiili gözlemiyle kaydedilir."
+            )
+            for step in _MANUAL_STEPS.get(idx, ()):
+                self._log_line(f"      {step}")
+            self._log_line(
+                "   ℹ  Adımları uyguladıktan sonra gerçek gözleminize göre "
+                "\"Geçti\" / \"Başarısız\" butonuna basın."
             )
 
         # Kalkış (idx=0) dışındaki tüm testler için
@@ -646,6 +768,10 @@ class TestPanelView(QWidget):
             "duration_s": elapsed_s,
             "result": result,
             "test_title": title,
+            # NEDEN (H5): Bu testte YKİ hiçbir komut göndermedi — sonuç yalnızca
+            # operatör beyanıdır. Rapor bunu otomatik doğrulanmış testten
+            # ayırt edebilsin diye işaretlenir.
+            "manual_only": idx in _MANUAL_TESTS,
         })
         self._test_results[idx] = snap
 
@@ -656,8 +782,25 @@ class TestPanelView(QWidget):
             return
 
         ts_now = int(time.time())
-        all_pass = all(r.get("result") == _ST_PASS for r in self._test_results.values())
-        overall = _ST_PASS if all_pass else _ST_FAIL
+        # ── Genel sonuç hesabı (H6 — YÜKSEK) ────────────────────────────────
+        # NEDEN: Eski kod `all(... == PASS)` kullanıyordu. Boş/eksik sonuç
+        # kümesinde "hiç başarısız yok" mantığı devreye girip 6 testin 1'i bile
+        # yapılmamışken rapora yeşil "BAŞARILI" yazıyordu. Artık toplam sayım
+        # yapılır: hiç sonuç yoksa veya testler eksikse ASLA BAŞARILI denmez.
+        passed  = sum(1 for r in self._test_results.values() if r.get("result") == _ST_PASS)
+        failed  = sum(1 for r in self._test_results.values() if r.get("result") == _ST_FAIL)
+        skipped = sum(1 for r in self._test_results.values() if r.get("result") == _ST_SKIP)
+        total_tests = len(self._TEST_CONFIGS)
+        executed = passed + failed + skipped
+
+        if executed == 0:
+            overall = "SONUÇ YOK / HATA"
+        elif failed > 0:
+            overall = _ST_FAIL
+        elif executed < total_tests:
+            overall = f"EKSİK ({executed}/{total_tests} test yürütüldü)"
+        else:
+            overall = _ST_PASS
 
         # Rapor metni oluştur
         lines = [
@@ -665,13 +808,18 @@ class TestPanelView(QWidget):
             "ASHİNA YKİ — UÇUŞ ÖNCESİ TEST RAPORU",
             f"Tarih: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts_now))}",
             f"Genel Sonuç: {overall}",
+            f"Geçti: {passed}  Başarısız: {failed}  Atlandı: {skipped}  "
+            f"Yürütülmedi: {total_tests - executed}",
             "=" * 60,
         ]
         for i, cfg in enumerate(self._TEST_CONFIGS):
             r = self._test_results.get(i)
             if r:
+                # NEDEN (H5): Manuel testlerde YKİ komut göndermedi — sonucun
+                # operatör beyanı olduğu raporda açıkça görünmelidir.
+                manual_note = "  [MANUEL — operatör beyanı]" if r.get("manual_only") else ""
                 lines.append(
-                    f"TEST {i + 1}: {cfg[0]}\n"
+                    f"TEST {i + 1}: {cfg[0]}{manual_note}\n"
                     f"  Sonuç: {r.get('result','?')}  Süre: {r.get('duration_s','?')}s\n"
                     f"  GPS: {r.get('gps_fix_type','?')}  Bat: %{r.get('battery_remaining','?')}"
                 )

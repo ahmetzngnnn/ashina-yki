@@ -3,7 +3,7 @@ import json
 import math
 from datetime import datetime
 from PyQt6.QtCore import pyqtSlot, Qt
-from PyQt6.QtGui import QFont, QColor
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QListWidget, QListWidgetItem, QPushButton, QLabel,
@@ -12,9 +12,23 @@ from PyQt6.QtWidgets import (
 
 import pyqtgraph as pg
 
-from core import local_storage
+from core import local_storage, theme
 
 logger = logging.getLogger(__name__)
+
+# ── Uçuş grafiği seri renkleri ───────────────────────────────────────────────
+# aviyonik semantik — temadan bağımsız. Seri renkleri (hız=yeşil, gerilim=
+# kırmızı, roll=mavi, pitch=turuncu, tepe noktası işareti=amber) uçuş verisi
+# okuma geleneğidir; tema değişse de aynı kalır.
+# Tek koşul: hem koyu (#0f161c) hem beyaz grafik zemininde okunabilmeleri.
+# Eski parlak tonlar (hız #00e676 → beyazda 1.7:1, işaret #ffff00 → 1.1:1)
+# açık temada görünmez oluyordu; hue korunarak koyulaştırıldı — yeni değerler
+# iki zeminde de ≥3:1 (WCAG grafik nesnesi eşiği) kontrast verir.
+SERIES_SPEED   = "#009e5c"   # yer hızı  — beyaz 3.5:1 / koyu 5.3:1
+SERIES_VOLTAGE = "#f44336"   # gerilim   — beyaz 3.7:1 / koyu 5.0:1
+SERIES_ROLL    = "#2196f3"   # roll      — beyaz 3.1:1 / koyu 5.8:1
+SERIES_PITCH   = "#d97a00"   # pitch     — beyaz 3.1:1 / koyu 5.9:1
+SERIES_MARKER  = "#a88500"   # tepe/dip işareti — beyaz 3.5:1 / koyu 5.2:1
 
 # ── Havacılık Standartları Uyumluluk Kuralları ────────────────────────────────
 _COMPLIANCE_RULES = [
@@ -77,8 +91,17 @@ class FlightAnalysisView(QWidget):
     def __init__(self, db_conn, parent=None):
         super().__init__(parent)
         self._db_conn = db_conn
+        # Tema değişince HTML panelleri (renkleri gövdeye gömülü) yeniden
+        # üretilebilsin diye son gösterilen kayıt bellekte tutulur.
+        self._last_record: dict | None = None
+        self._last_points: list = []
+        self._last_compliance: dict | None = None
+        # Okuma hatası mesajı da tema rengiyle (danger) yazılıyor — tema
+        # değişince bayat kalmasın diye metni saklıyoruz.
+        self._last_error: str | None = None
         self._build_ui()
         self.refresh_list()
+        theme.notifier().changed.connect(lambda _n: self._apply_theme_colors())
 
     def _build_ui(self):
         main_lay = QHBoxLayout(self)
@@ -93,22 +116,17 @@ class FlightAnalysisView(QWidget):
         l_lay.setContentsMargins(0,0,0,0)
         
         lbl_title = QLabel("📂 Kayıtlar & Analiz")
-        lbl_title.setStyleSheet("color:#00e5ff;font-size:14px;font-weight:bold;")
+        lbl_title.setObjectName("sectionTitle")
         l_lay.addWidget(lbl_title)
-        
+
         self._list_widget = QListWidget()
-        self._list_widget.setStyleSheet(
-            "QListWidget{color:#ccc;border:1px solid #0f3460;font-size:12px;}"
-            "QListWidget::item{padding:8px 4px;border-bottom:1px solid #1a1a3e;}"
-            "QListWidget::item:selected{color:#fff;background-color:#0f3460;}"
-        )
         self._list_widget.itemSelectionChanged.connect(self._on_selection_changed)
         l_lay.addWidget(self._list_widget)
-        
+
         btn_refresh = QPushButton("🔄 Listeyi Yenile")
         btn_refresh.clicked.connect(self.refresh_list)
-        btn_refresh.setMinimumHeight(40)
-        btn_refresh.setStyleSheet("QPushButton{color:#00e5ff;border:1px solid #00e5ff; border-radius: 4px; font-weight: bold;} QPushButton:hover{background-color:#00e5ff; color:black;}")
+        btn_refresh.setMinimumHeight(30)   # şartname §3: buton 28-30px
+        btn_refresh.setObjectName("ghostButton")
         l_lay.addWidget(btn_refresh)
         
         # ── Sağ Panel (Dashboard) ─────────────────────────────────────────────
@@ -117,24 +135,23 @@ class FlightAnalysisView(QWidget):
         r_lay.setContentsMargins(10,0,0,0)
         
         self._lbl_dash = QLabel("← Soldan bir uçuş kaydı seçin")
-        self._lbl_dash.setStyleSheet("color:#00e5ff;font-size:15px;font-weight:bold;")
+        self._lbl_dash.setObjectName("pageTitle")
         r_lay.addWidget(self._lbl_dash)
-        
+
         # KPI Kartları
         kpi_frame = QFrame()
-        kpi_frame.setStyleSheet("QFrame{border:1px solid #0f3460;border-radius:6px; background-color:#161616;}")
+        kpi_frame.setObjectName("cardFrame")
         kpi_lay = QGridLayout(kpi_frame)
         kpi_lay.setContentsMargins(5,5,5,5)
-        
+
         def make_kpi(title):
             l_t = QLabel(title)
-            l_t.setStyleSheet("color: #888; font-size: 11px; border:none; background:transparent;")
+            l_t.setObjectName("mutedLabel")
             l_t.setAlignment(Qt.AlignmentFlag.AlignCenter)
             l_v = QLabel("--")
-            l_v.setStyleSheet("color: #00e5ff; font-size: 18px; font-weight: bold; border:none; background:transparent;")
+            l_v.setObjectName("valueLabel")
             l_v.setAlignment(Qt.AlignmentFlag.AlignCenter)
             w = QWidget()
-            w.setStyleSheet("border:none; background:transparent;")
             wl = QVBoxLayout(w)
             wl.setContentsMargins(5,5,5,5)
             wl.addWidget(l_t)
@@ -155,31 +172,37 @@ class FlightAnalysisView(QWidget):
         # Sekmeler
         self._tabs = QTabWidget()
         self._tabs.setFont(QFont("Segoe UI", 10))
-        self._tabs.setStyleSheet(
-            "QTabWidget::pane{border:1px solid #0f3460;}"
-            "QTabBar::tab{color:#aaa;padding:8px 16px;font-size:12px;}"
-            "QTabBar::tab:selected{color:#00e5ff;font-weight:bold;}"
-        )
         r_lay.addWidget(self._tabs, 1)
         
         # -- Tab 1: 📊 Uçuş Grafikleri --
         tab_charts = QWidget()
         tab_charts_lay = QVBoxLayout(tab_charts)
         
-        pg.setConfigOption('background', '#121212')
-        pg.setConfigOption('foreground', '#d4d4d4')
-        
+        # pg.setConfigOption GLOBAL'dir ve yalnızca BUNDAN SONRA kurulan
+        # grafikleri etkiler; bu yüzden widget'lar oluşturulmadan önce yazılır,
+        # tema değişiminde ise _apply_theme_colors hem global ayarı hem mevcut
+        # grafiklerin zemin/eksen renklerini tazeler.
+        self._apply_pg_config()
+
         # Grafikler
         self._plot_speed = pg.PlotWidget(title="Yer Hızı (m/s) vs Zaman (s)")
         self._plot_speed.showGrid(x=True, y=True, alpha=0.3)
-        
+
         self._plot_volt = pg.PlotWidget(title="Batarya Gerilimi (V) vs Zaman (s)")
         self._plot_volt.showGrid(x=True, y=True, alpha=0.3)
-        
+
         self._plot_att = pg.PlotWidget(title="Yatma Açıları (Roll/Pitch) vs Zaman (s)")
         self._plot_att.showGrid(x=True, y=True, alpha=0.3)
         self._plot_att.addLegend()
-        
+
+        # Başlıklarını da tazeleyebilmek için grafik → başlık eşlemesi.
+        self._plots = (
+            (self._plot_speed, "Yer Hızı (m/s) vs Zaman (s)"),
+            (self._plot_volt,  "Batarya Gerilimi (V) vs Zaman (s)"),
+            (self._plot_att,   "Yatma Açıları (Roll/Pitch) vs Zaman (s)"),
+        )
+        self._style_plots()
+
         tab_charts_lay.addWidget(self._plot_speed)
         tab_charts_lay.addWidget(self._plot_volt)
         tab_charts_lay.addWidget(self._plot_att)
@@ -193,10 +216,6 @@ class FlightAnalysisView(QWidget):
         # Metinsel Analiz ve Gösterge Kutusu
         self._ai_analysis_text = QTextEdit()
         self._ai_analysis_text.setReadOnly(True)
-        self._ai_analysis_text.setStyleSheet(
-            "QTextEdit{background-color:#0d1117; color:#c9d1d9; font-size:13px; "
-            "border:1px solid #30363d; border-radius:6px; padding:12px; line-height:1.5;}"
-        )
         tab_ai_lay.addWidget(self._ai_analysis_text)
         
         self._tabs.addTab(tab_ai, "🤖 Akıllı Gösterge & Motor Analizi")
@@ -204,22 +223,69 @@ class FlightAnalysisView(QWidget):
         # -- Tab 3: Uyumluluk Analizi --
         self._compliance_w = QTextEdit()
         self._compliance_w.setReadOnly(True)
-        self._compliance_w.setStyleSheet(
-            "QTextEdit{color:#ddd;font-family:'Consolas','Courier New'; font-size:12px; border:none;}"
-        )
+        self._compliance_w.setFont(QFont("Consolas", 9))   # mono ~12px (şartname §3)
         self._tabs.addTab(self._compliance_w, "⚖ Uyumluluk Analizi")
-        
+
         # -- Tab 4: Ham Veri --
         self._raw_text = QTextEdit()
         self._raw_text.setReadOnly(True)
-        self._raw_text.setStyleSheet(
-            "QTextEdit{color:#aaa;font-family:'Consolas','Courier New'; font-size:11px; border:none;}"
-        )
+        self._raw_text.setFont(QFont("Consolas", 9))   # mono ~12px (şartname §3)
         self._tabs.addTab(self._raw_text, "📄 Ham Veri")
         
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
         splitter.setSizes([300, 700])
+
+    # ── Tema ──────────────────────────────────────────────────────────────────
+    def _apply_pg_config(self):
+        """pyqtgraph'ın GLOBAL zemin/ön plan ayarını aktif temadan yazar."""
+        pg.setConfigOption('background', theme.c("chart_bg"))
+        pg.setConfigOption('foreground', theme.c("chart_fg"))
+
+    def _style_plots(self):
+        """Var olan grafiklerin zemin/eksen/başlık renklerini tazeler.
+
+        NEDEN: setConfigOption yalnızca SONRADAN kurulan grafikleri etkiler;
+        çalışan uygulamada tema değişince mevcut PlotWidget'lar eski renkte
+        kalır (açık temada beyaz zemine açık gri eksen = okunmaz)."""
+        fg = theme.c("chart_fg")
+        bg = theme.c("chart_bg")
+        for plot, title in getattr(self, "_plots", ()):
+            plot.setBackground(bg)
+            plot_item = plot.getPlotItem()
+            for axis_name in ("left", "bottom", "top", "right"):
+                axis = plot_item.getAxis(axis_name)
+                if axis is None:
+                    continue
+                axis.setPen(fg)
+                axis.setTextPen(fg)
+            plot_item.setTitle(title, color=fg)
+            if plot_item.legend is not None:
+                plot_item.legend.setLabelTextColor(fg)
+
+    def _apply_theme_colors(self):
+        """Tema değişince inline yazılmış tüm renkleri yeniden üretir.
+
+        Grafikler (global pg ayarı + mevcut widget'lar) ve renkleri HTML
+        gövdesine gömülü olan Akıllı Gösterge / Uyumluluk sekmeleri son
+        gösterilen kayıttan yeniden çizilir. Seri renkleri aviyonik semantik
+        olduğu için sabit kalır, yeniden çizim gerekmez."""
+        self._apply_pg_config()
+        self._style_plots()
+        if self._last_error is not None:
+            # Okuma hatası ekranda duruyor — mesaj yeni temanın danger rengiyle
+            # yeniden yazılır (koyu tema kırmızısı beyaz zeminde solgun kalıyordu).
+            self._show_read_error(self._last_error)
+        elif self._last_record is not None:
+            self._generate_ai_analysis(self._last_record, self._last_points)
+        if self._last_compliance is not None:
+            self._show_compliance(self._last_compliance)
+
+    def _show_read_error(self, message: str) -> None:
+        """Veri okuma hatasını aktif temanın danger rengiyle gösterir."""
+        self._ai_analysis_text.setHtml(
+            f"<b style='color:{theme.c('danger')};'>{message}</b>"
+        )
 
     def refresh_list(self):
         self._list_widget.clear()
@@ -267,45 +333,54 @@ class FlightAnalysisView(QWidget):
             
             # -- Grafikleri Çiz --
             self._plot_speed.clear()
-            self._plot_speed.plot(times, speeds, pen=pg.mkPen('#00e676', width=2))
+            self._plot_speed.plot(times, speeds, pen=pg.mkPen(SERIES_SPEED, width=2))
             if speeds:
                 max_spd = max(speeds)
                 max_spd_idx = speeds.index(max_spd)
-                self._plot_speed.plot([times[max_spd_idx]], [max_spd], symbol='star', symbolSize=15, symbolBrush='#ffff00', pen=None, name="Maks Hız")
-            
+                self._plot_speed.plot([times[max_spd_idx]], [max_spd], symbol='star', symbolSize=15, symbolBrush=SERIES_MARKER, pen=None, name="Maks Hız")
+
             self._plot_volt.clear()
-            self._plot_volt.plot(times, volts, pen=pg.mkPen('#f44336', width=2))
+            self._plot_volt.plot(times, volts, pen=pg.mkPen(SERIES_VOLTAGE, width=2))
             valid_volts = [v for v in volts if v > 0]
             if valid_volts:
                 min_v = min(valid_volts)
                 min_v_idx = volts.index(min_v)
-                self._plot_volt.plot([times[min_v_idx]], [min_v], symbol='t1', symbolSize=15, symbolBrush='#ffff00', pen=None, name="Min Voltaj")
-            
+                self._plot_volt.plot([times[min_v_idx]], [min_v], symbol='t1', symbolSize=15, symbolBrush=SERIES_MARKER, pen=None, name="Min Voltaj")
+
             self._plot_att.clear()
-            self._plot_att.plot(times, rolls, pen=pg.mkPen('#2196f3', width=2), name="Roll")
-            self._plot_att.plot(times, pitches, pen=pg.mkPen('#ff9800', width=2), name="Pitch")
-            
+            self._plot_att.plot(times, rolls, pen=pg.mkPen(SERIES_ROLL, width=2), name="Roll")
+            self._plot_att.plot(times, pitches, pen=pg.mkPen(SERIES_PITCH, width=2), name="Pitch")
+
             if rolls and pitches:
                 max_r = max(rolls, key=abs)
                 max_r_idx = rolls.index(max_r)
-                self._plot_att.plot([times[max_r_idx]], [max_r], symbol='x', symbolSize=12, symbolPen=pg.mkPen('#ffeb3b', width=3), pen=None, name="Maks Roll")
-                
+                self._plot_att.plot([times[max_r_idx]], [max_r], symbol='x', symbolSize=12, symbolPen=pg.mkPen(SERIES_MARKER, width=3), pen=None, name="Maks Roll")
+
                 max_p = max(pitches, key=abs)
                 max_p_idx = pitches.index(max_p)
-                self._plot_att.plot([times[max_p_idx]], [max_p], symbol='+', symbolSize=12, symbolPen=pg.mkPen('#ffeb3b', width=3), pen=None, name="Maks Pitch")
-            
+                self._plot_att.plot([times[max_p_idx]], [max_p], symbol='+', symbolSize=12, symbolPen=pg.mkPen(SERIES_MARKER, width=3), pen=None, name="Maks Pitch")
+
             # -- Algoritmik Metinsel Yorum Üretimi --
             self._generate_ai_analysis(data, points)
-            
+            # Tema değişince aynı HTML yeniden üretilebilsin diye sakla.
+            self._last_record = data
+            self._last_points = points
+            self._last_error = None
+
             # -- Ham Veri --
             pretty = json.dumps(points, indent=2, ensure_ascii=False)
             self._raw_text.setPlainText(pretty)
             
         except Exception as e:
             logger.error(f"Grafik verisi okunamadı: {e}")
-            self._ai_analysis_text.setHtml(f"<b style='color:red;'>Hata: Veri dosyası okunamadı: {e}</b>")
+            self._last_error = f"Hata: Veri dosyası okunamadı: {e}"
+            self._show_read_error(self._last_error)
             self._raw_text.setPlainText("Veri Yok")
-            
+            # Okuma başarısız — tema değişiminde hata metninin üzerine
+            # "Yeterli veri yok" yazılmasın diye önbellek temizlenir.
+            self._last_record = None
+            self._last_points = []
+
         # -- Uyumluluk --
         # İrtifa bilgisini bul
         max_alt = 0
@@ -319,6 +394,7 @@ class FlightAnalysisView(QWidget):
             "max_pitch": data["max_pitch"],
             "max_alt": max_alt
         }
+        self._last_compliance = comp_data
         self._show_compliance(comp_data)
 
     def _generate_ai_analysis(self, db_record, points):
@@ -357,37 +433,43 @@ class FlightAnalysisView(QWidget):
         sag = start_v - min_v if start_v > 0 else 0
         
         # -- Yüzdelik Hesaplamalar --
+        # Gösterge renkleri temadan gelir; tema değişince _apply_theme_colors
+        # bu HTML'i baştan üretir.
+        c_ok, c_warn, c_bad = theme.c("success"), theme.c("warning"), theme.c("danger")
+        c_text, c_muted = theme.c("text"), theme.c("text_muted")
+        c_track, c_border, c_accent = theme.c("panel_alt"), theme.c("border"), theme.c("accent")
+
         spd_pct = min(100, (max_spd / 25.0) * 100)
-        spd_col = "#2ea043" if spd_pct < 40 else ("#d29922" if spd_pct < 75 else "#f85149")
-        
+        spd_col = c_ok if spd_pct < 40 else (c_warn if spd_pct < 75 else c_bad)
+
         sag_pct = min(100, (sag / 2.0) * 100)
-        sag_col = "#2ea043" if sag_pct < 30 else ("#d29922" if sag_pct < 70 else "#f85149")
-        
+        sag_col = c_ok if sag_pct < 30 else (c_warn if sag_pct < 70 else c_bad)
+
         max_angle = max(max_r, max_p)
         ang_pct = min(100, (max_angle / 45.0) * 100)
-        ang_col = "#2ea043" if ang_pct < 40 else ("#d29922" if ang_pct < 80 else "#f85149")
-        
+        ang_col = c_ok if ang_pct < 40 else (c_warn if ang_pct < 80 else c_bad)
+
         vib_pct = min(100, (max_vib / 60.0) * 100)
-        vib_col = "#2ea043" if vib_pct < 30 else ("#d29922" if vib_pct < 70 else "#f85149")
-        
+        vib_col = c_ok if vib_pct < 30 else (c_warn if vib_pct < 70 else c_bad)
+
         pid_pct = min(100, (max_pid_err / 10.0) * 100)
-        pid_col = "#2ea043" if pid_pct < 25 else ("#d29922" if pid_pct < 60 else "#f85149")
-        
+        pid_col = c_ok if pid_pct < 25 else (c_warn if pid_pct < 60 else c_bad)
+
         # HTML Tablo Şablonu
         def make_bar(label, pct, col, val_text):
             return f"""
             <tr>
-              <td width='25%' style='padding: 4px; color:#c9d1d9;'><b>{label}</b></td>
+              <td width='25%' style='padding: 4px; color:{c_text};'><b>{label}</b></td>
               <td width='55%' style='padding: 4px;'>
-                <div style='background-color: #21262d; width: 100%; height: 14px; border-radius: 3px; border: 1px solid #30363d;'>
+                <div style='background-color: {c_track}; width: 100%; height: 14px; border-radius: 3px; border: 1px solid {c_border};'>
                    <div style='background-color: {col}; width: {pct}%; height: 14px; border-radius: 2px;'></div>
                 </div>
               </td>
               <td width='20%' align='right' style='padding: 4px; color:{col}; font-weight:bold;'>{val_text}</td>
             </tr>
             """
-            
-        html = ["<h3 style='color:#00e5ff; margin-top:0px; margin-bottom: 8px;'>📊 Akıllı Performans Göstergeleri</h3>"]
+
+        html = [f"<h3 style='color:{c_accent}; margin-top:0px; margin-bottom: 8px;'>📊 Akıllı Performans Göstergeleri</h3>"]
         html.append("<table width='100%' cellpadding='0' cellspacing='0' style='font-size: 13px;'>")
         
         html.append(make_bar("Hız Stresi", spd_pct, spd_col, f"{max_spd:.1f} m/s"))
@@ -398,20 +480,20 @@ class FlightAnalysisView(QWidget):
         html.append("</table>")
         
         # -- Motor Analizi --
-        html.append("<h3 style='color:#00e5ff; margin-top:16px; margin-bottom: 8px;'>⚙ Motor & ESC Yük Analizi</h3>")
+        html.append(f"<h3 style='color:{c_accent}; margin-top:16px; margin-bottom: 8px;'>⚙ Motor &amp; ESC Yük Analizi</h3>")
         if max(max_esc_rpm) == 0:
-            html.append("<p style='color:#888; font-size:12px;'><i>Telemetri bağlantısı yok veya motorlar çalışmadı (RPM=0).</i></p>")
+            html.append(f"<p style='color:{c_muted}; font-size:12px;'><i>Telemetri bağlantısı yok veya motorlar çalışmadı (RPM=0).</i></p>")
         else:
             html.append("<table width='100%' cellpadding='0' cellspacing='0' style='font-size: 12px;'>")
             for i in range(4):
                 rpm = max_esc_rpm[i]
                 temp = max_esc_temp[i]
                 rpm_pct = min(100, (rpm / 10000.0) * 100) # Max 10.000 RPM varsayımı
-                col = "#2ea043" if rpm_pct < 60 else ("#d29922" if rpm_pct < 85 else "#f85149")
+                col = c_ok if rpm_pct < 60 else (c_warn if rpm_pct < 85 else c_bad)
                 html.append(make_bar(f"Motor {i+1} RPM", rpm_pct, col, f"{rpm} RPM ({temp}°C)"))
             html.append("</table>")
-            
-        html.append("<hr style='border: 1px solid #30363d; margin-top: 16px; margin-bottom: 12px;'>")
+
+        html.append(f"<hr style='border: 1px solid {c_border}; margin-top: 16px; margin-bottom: 12px;'>")
         
         # Genel Yorum Metni
         summary = []
@@ -423,26 +505,26 @@ class FlightAnalysisView(QWidget):
             summary.append("Sakin ve yavaş bir uçuş profili izlenmiş.")
             
         if sag_pct > 70:
-            summary.append("<span style='color:#f85149;'>Batarya çöküşü çok yüksek, güç sistemi yetersiz kalıyor olabilir!</span>")
+            summary.append(f"<span style='color:{c_bad};'>Batarya çöküşü çok yüksek, güç sistemi yetersiz kalıyor olabilir!</span>")
         elif sag_pct > 30:
             summary.append("Voltajda normal seviyede dalgalanmalar (sag) mevcut.")
-            
+
         if ang_pct > 80:
-            summary.append("<span style='color:#f85149;'>Tehlikeli yatma açılarına ulaşılmış, devrilme veya irtifa kaybı riski yüksek.</span>")
-            
+            summary.append(f"<span style='color:{c_bad};'>Tehlikeli yatma açılarına ulaşılmış, devrilme veya irtifa kaybı riski yüksek.</span>")
+
         if vib_pct > 70:
-            summary.append("<span style='color:#d29922;'>Mekanik titreşim fazla; pervanelerde balans veya şaside gevşeklik olabilir.</span>")
-            
+            summary.append(f"<span style='color:{c_warn};'>Mekanik titreşim fazla; pervanelerde balans veya şaside gevşeklik olabilir.</span>")
+
         if max(max_esc_rpm) > 0:
             heaviest_motor_idx = max_esc_rpm.index(max(max_esc_rpm))
             highest_rpm = max_esc_rpm[heaviest_motor_idx]
             avg_rpm = sum(max_esc_rpm) / 4.0
             if highest_rpm > avg_rpm * 1.2:  # Eğer ortalamanın %20 üstündeyse
-                summary.append(f"<span style='color:#d29922;'><br><br><b>Motor Dengesizliği:</b> Motor {heaviest_motor_idx + 1} diğerlerine göre daha çok zorlanmış ({highest_rpm} RPM). Ağırlık merkeziniz bu motora doğru kaymış veya sürekli rüzgar direncine maruz kalmış olabilir.</span>")
+                summary.append(f"<span style='color:{c_warn};'><br><br><b>Motor Dengesizliği:</b> Motor {heaviest_motor_idx + 1} diğerlerine göre daha çok zorlanmış ({highest_rpm} RPM). Ağırlık merkeziniz bu motora doğru kaymış veya sürekli rüzgar direncine maruz kalmış olabilir.</span>")
             else:
                 summary.append("<br><br><b>Motor Dağılımı:</b> Motor yükleri (RPM) genel olarak dengeli dağılmış, şasi ağırlık merkezi sağlıklı.")
-            
-        html.append(f"<p style='color:#c9d1d9; font-size: 13px; line-height: 1.6;'><b>🤖 Genel Durum Özeti:</b> {' '.join(summary)}</p>")
+
+        html.append(f"<p style='color:{c_text}; font-size: 13px; line-height: 1.6;'><b>🤖 Genel Durum Özeti:</b> {' '.join(summary)}</p>")
         
         self._ai_analysis_text.setHtml("".join(html))
 
@@ -450,36 +532,39 @@ class FlightAnalysisView(QWidget):
         results = _analyze_compliance(params)
         risk = _overall_risk(results)
 
+        # Risk rozeti renkleri temadan; tema değişince _apply_theme_colors
+        # bu HTML'i baştan üretir.
+        c_ok, c_warn, c_bad = theme.c("success"), theme.c("warning"), theme.c("danger")
         risk_color = {
-            "DÜŞÜK":  "#4ade80",
-            "ORTA":   "#f0a500",
-            "YÜKSEK": "#ff4444",
-        }.get(risk, "#aaa")
+            "DÜŞÜK":  c_ok,
+            "ORTA":   c_warn,
+            "YÜKSEK": c_bad,
+        }.get(risk, theme.c("text_muted"))
         risk_bg = {
-            "DÜŞÜK":  "#0a2a0a",
-            "ORTA":   "#2a2a0a",
-            "YÜKSEK": "#2a0a0a",
-        }.get(risk, "#111122")
+            "DÜŞÜK":  theme.c("success_bg"),
+            "ORTA":   theme.c("warning_bg"),
+            "YÜKSEK": theme.c("danger_bg"),
+        }.get(risk, theme.c("panel_alt"))
 
         lines = [
             f"<div style='background:{risk_bg}; color:{risk_color}; padding: 10px; border: 1px solid {risk_color}; border-radius: 4px; font-size:14px; font-weight:bold; margin-bottom: 15px;'>",
             f"Risk Seviyesi: {risk}",
             f"</div>",
-            f"<h4 style='color:#ccc;'>HAVACILIK STANDARTLARI VE LİMİT KONTROLLERİ</h4>",
+            f"<h4 style='color:{theme.c('text')};'>HAVACILIK STANDARTLARI VE LİMİT KONTROLLERİ</h4>",
             "<ul>"
         ]
-        
+
         for r in results:
             icon = "✅" if r["ok"] else ("❌" if r["ok"] is False else "❔")
             sev  = r.get("severity", "")
-            sev_tag = f"<b style='color:#ff4444;'>[{sev}]</b>" if sev == "HIGH" else (f"<b style='color:#f0a500;'>[{sev}]</b>" if sev == "MEDIUM" else "")
-            color = "#4ade80" if r["ok"] else "#ff4444"
+            sev_tag = f"<b style='color:{c_bad};'>[{sev}]</b>" if sev == "HIGH" else (f"<b style='color:{c_warn};'>[{sev}]</b>" if sev == "MEDIUM" else "")
+            color = c_ok if r["ok"] else c_bad
             lines.append(f"<li style='margin-bottom: 4px;'><span style='color:{color}'>{icon} {r['message']}</span> {sev_tag}</li>")
 
         lines += [
             "</ul>",
             "<hr>",
-            "<p style='color:#888; font-size: 11px;'>",
+            f"<p style='color:{theme.c('text_muted')}; font-size: 11px;'>",
             "<b>UYARI EŞİK DEĞERLERİ:</b><br>",
             "• Batarya alt limit: 10.5V (3S için kritik)<br>",
             "• Maks irtifa < 400m (SHGM limitleri)<br>",

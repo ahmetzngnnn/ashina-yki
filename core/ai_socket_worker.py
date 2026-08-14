@@ -133,11 +133,24 @@ class AISocketWorker(QThread):
                         if resp.get("mission_type"):
                             self.mission_accepted.emit()
                     else:
-                        # FIX P0-2: Rejection → kullanıcıya bildir
-                        msg = resp.get("message", "Companion görevi reddetti")
-                        logger.warning("Görev reddedildi: %s", msg)
-                        self.mission_rejected.emit(msg)
-                        self.error_occurred.emit(f"Companion: {msg}")
+                        # FIX P0-2: Rejection → kullanıcıya bildir.
+                        # DÜZELTME: mission_rejected SADECE görev yüklemesi
+                        # (mission_type içeren mesaj) reddedildiğinde emit edilir.
+                        # NEDEN: eskiden komut tipinden BAĞIMSIZ emit ediliyordu →
+                        # operatör kalkıştan önce "Yük Bırak"/servo komutu deneyip
+                        # NACK alınca "Görev Reddedildi" dialogu görüyor ve
+                        # "GÖREVİ BAŞLAT" butonu kilitleniyordu. Görev dışı
+                        # komutların NACK'i artık yalnızca error_occurred ile
+                        # bildirilir (mevcut sinyal — main_window değiştirilmedi).
+                        msg = resp.get("message", "Companion komutu reddetti")
+                        if mission.get("mission_type"):
+                            logger.warning("Görev reddedildi: %s", msg)
+                            self.mission_rejected.emit(msg)
+                            self.error_occurred.emit(f"Companion: {msg}")
+                        else:
+                            action = mission.get("action", "?")
+                            logger.warning("Komut reddedildi (action=%s): %s", action, msg)
+                            self.error_occurred.emit(f"Companion [{action}]: {msg}")
                 else:
                     # FIX P0-2: Boş yanıt → açık hata sinyali
                     logger.warning("Companion'dan boş yanıt geldi")
@@ -262,6 +275,19 @@ class AISocketWorker(QThread):
     def send_run_test(self, spec: str, sim_mode: bool) -> None:
         """İHA test koşucusunu başlat: {"action":"run_test", "test":"all", "sim":true}"""
         self._enqueue({"action": "run_test", "test": spec, "sim": sim_mode})
+
+    @pyqtSlot()
+    def send_abort_test(self) -> None:
+        """Çalışan İHA test paketini durdur: {"action":"abort_test"}.
+
+        NEDEN: YKİ test panelinde "⏹ Durdur" butonu vardı ama İHA tarafında
+        karşılığı YOKTU — başlayan test hiçbir şekilde durdurulamıyordu.
+        Yüksek öncelik: durdurma komutu kuyrukta bekleyen normal komutları
+        beklememeli (abort/drop_now ile aynı mantık).
+        NOT: Butona bağlama (iha_test_panel_view.abort_test_requested →
+        bu slot) main_window.py işidir — burada YAPILMADI.
+        """
+        self._enqueue({"action": "abort_test"}, high_priority=True)
 
     def stop(self) -> None:
         self.requestInterruption()

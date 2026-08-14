@@ -10,7 +10,7 @@ import logging
 from PyQt6.QtCore import pyqtSignal, pyqtSlot, Qt, QPoint, QUrl, QTimer, QPointF, QRectF
 from PyQt6.QtGui import (
     QPainter, QPen, QBrush, QColor, QPixmap,
-    QFont, QImage, QPolygon, QTransform,
+    QFont, QFontMetrics, QImage, QPolygon, QTransform,
 )
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame,
@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox, QFormLayout, QMenu, QTabWidget, QSlider, QScrollArea, QProgressBar
 )
 
+from core import theme
 from core.gcs_config import config
 
 try:
@@ -41,6 +42,51 @@ except ImportError:
     _MV = None
 
 logger = logging.getLogger(__name__)
+
+# ── Aviyonik semantik renkler — temadan bağımsız ─────────────────────────────
+# NEDEN: PFD/HUD ve motor göstergesi renkleri uçuş aleti standardıdır: gökyüzü
+# mavi, yer yeşil, ufuk çizgisi beyaz, uçak referansı sarı, pusula ibresi
+# kırmızı, saat yönü / ters yön rotorlar camgöbeği / kırmızı. Bunlar tema
+# değişse de AYNI kalır — operatör aleti renginden tanır. HUD üzerindeki yarı
+# saydam siyah bantlar ve o bantlara yazılan beyaz/gri metinler de bu gruba
+# girer (açık temada da bant koyu kalır, metin okunur olur).
+HUD_SKY          = "#1a6ea0"   # aviyonik semantik — temadan bağımsız
+HUD_GROUND       = "#4a6e28"   # aviyonik semantik — temadan bağımsız
+HUD_HORIZON      = "#ffffff"   # aviyonik semantik — temadan bağımsız
+HUD_AIRCRAFT     = "#ffff00"   # sarı uçak referansı + yön kutusu — aviyonik semantik
+HUD_ROLL_PTR     = "#ff6600"   # roll göstergesi üçgeni — aviyonik semantik
+HUD_COMPASS_PTR  = "#e94560"   # pusula kırmızı ibresi — aviyonik semantik
+HUD_TEXT         = "#ffffff"   # bant üstü metin — aviyonik semantik
+HUD_TEXT_DIM     = "#aaaaaa"   # bant üstü ikincil metin — aviyonik semantik
+HUD_TICK         = "#777777"   # ara pusula çentiği — aviyonik semantik
+HUD_TICK_FAINT   = "#333333"   # veri akış sayacı — aviyonik semantik
+HUD_GS           = "#4ade80"   # yer hızı — aviyonik semantik
+HUD_VS           = "#4adeb0"   # dikey hız — aviyonik semantik
+HUD_THR          = "#f0a500"   # gaz — aviyonik semantik
+HUD_OK           = "#4ade80"   # normal durum — aviyonik semantik
+HUD_WARN         = "#ff8800"   # uyarı durumu — aviyonik semantik
+HUD_CRIT         = "#ff4444"   # kritik durum — aviyonik semantik
+# HUD bantları (yarı saydam siyah) — aviyonik semantik, temadan bağımsız
+HUD_BAND_TOP     = QColor(0, 0, 0, 175)   # pusula bandı
+HUD_BAND_SIDE    = QColor(0, 0, 0, 155)   # hız / irtifa bandı
+HUD_BAND_FOCUS   = QColor(0, 0, 0, 230)   # bant ortasındaki değer kutusu
+HUD_BAND_HDG     = QColor(0, 0, 0, 220)   # yön derecesi kutusu
+HUD_BAND_BOTTOM  = QColor(0, 0, 0, 215)   # alt bilgi bandı
+
+# Motor (ESC) göstergesi — pervane dönüş yönü renkleri de aviyonik semantiktir
+ESC_CW           = "#00e5ff"   # saat yönü rotor — aviyonik semantik
+ESC_CCW          = "#ff6666"   # ters yön rotor — aviyonik semantik
+ESC_ARROW        = "#ff4444"   # burun (ileri) oku — aviyonik semantik
+ESC_BODY_FILL    = QColor(15, 52, 96, 200)    # gövde dolgusu — aviyonik semantik
+ESC_CW_PROP      = QColor(0, 229, 255, 60)    # saat yönü pervane izi — aviyonik
+ESC_CCW_PROP     = QColor(255, 102, 102, 60)  # ters yön pervane izi — aviyonik
+ESC_PROP_EDGE    = QColor(255, 255, 255, 40)  # pervane kenarı — aviyonik
+ESC_MOTOR_BASE   = "#1a1a24"   # motor gövdesi — aviyonik semantik
+ESC_LABEL_BOX    = QColor(10, 10, 20, 220)    # HUD etiket kutusu — aviyonik
+ESC_LBL_RPM      = "#ffffff"   # aviyonik semantik
+ESC_LBL_VOLT     = "#4ade80"   # aviyonik semantik
+ESC_LBL_AMP      = "#f0a500"   # aviyonik semantik
+ESC_LBL_TEMP     = "#ff4444"   # aviyonik semantik
 
 # ── Esri Uydu + Leaflet + Dönen Drone ──────────────────────────────────────────
 _MAP_HTML = """<!DOCTYPE html>
@@ -106,25 +152,34 @@ class GuidedControlWidget(QWidget):
         self._build()
 
     def _build(self) -> None:
-        self.setStyleSheet("background:transparent;")
+        # NOT: Savunmacı "background:transparent" satırı kaldırıldı — QSS v3
+        # zaten QFrame/QLabel zeminini şeffaf tutuyor (şartname §0).
         root = QVBoxLayout(self)
-        root.setContentsMargins(2, 2, 2, 2)
-        root.setSpacing(3)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(4)
 
-        grp = QGroupBox("Guided Kontrol (m / derece)")
-        grp.setStyleSheet("")
+        # NEDEN: Panel eskiden "Guided Kontrol (m / derece)" başlığıyla " m" sonekli bir
+        # "Mesafe" kutusu gösteriyordu, ama handler bu değeri OKUYUP KULLANMIYOR; sabit
+        # 1.5 m/s HIZ komutu (SET_POSITION_TARGET_LOCAL_NED velocity) emit ediyordu.
+        # Hız komutu yeni komut/DUR gelene kadar geçerli olduğundan operatör "2 m" yazıp
+        # İleri'ye bastığında araç süresiz 1.5 m/s ile gidiyordu (10 sn = 15 m).
+        # Komut kanalı gerçekte HIZ tabanlı olduğu için paneli gerçeğe uygun hale
+        # getiriyoruz: kutu artık mesafe değil HIZ (m/s) giriyor.
+        grp = QGroupBox("Guided Kontrol (m/s / derece)")   # stil: global QSS
         gl = QVBoxLayout(grp)
         gl.setSpacing(3)
 
-        # Mesafe girişi
+        # Hız girişi (eski adı "Mesafe" idi — birim karışıklığı yaratıyordu)
         dist_row = QHBoxLayout()
-        dist_row.addWidget(QLabel("Mesafe:"))
-        self._dist_spin = QDoubleSpinBox()
-        self._dist_spin.setRange(0.1, 500.0)
-        self._dist_spin.setValue(2.0)
-        self._dist_spin.setSuffix(" m")
+        dist_row.addWidget(QLabel("Hız:"))
+        self._dist_spin = QDoubleSpinBox()   # isim korundu (dış bağımlılık kırılmasın)
+        self._dist_spin.setRange(0.2, 5.0)   # NEDEN: makul guided hız aralığı
+        self._dist_spin.setValue(1.0)
+        self._dist_spin.setSuffix(" m/s")
         self._dist_spin.setDecimals(1)
-        self._dist_spin.setStyleSheet("")
+        self._dist_spin.setSingleStep(0.1)
+        self._dist_spin.setToolTip("Guided hız komutu büyüklüğü (m/s). "
+                                   "Komut, DUR'a basılana kadar sürer.")
         self._dist_spin.setFixedWidth(80)
         dist_row.addWidget(self._dist_spin)
         dist_row.addStretch()
@@ -133,7 +188,8 @@ class GuidedControlWidget(QWidget):
         # Yön butonları (3x3 grid)
         dir_grid = QGridLayout()
         dir_grid.setSpacing(3)
-        BTN_STYLE = "background:#0f3460;color:#e0e0e0;"
+        # Yön butonları accent vurgulu ikincil eylem → QSS "ghostButton" class'ı
+        # (eski satır-içi teal stil kaldırıldı; tema ile birlikte değişir).
         MOVE_BTNS = [
             ("↖ Sol-İleri",  0, 0, (-1,  1,  0)),
             ("↑ İleri",      0, 1, ( 0,  1,  0)),
@@ -148,18 +204,26 @@ class GuidedControlWidget(QWidget):
         for lbl, r, c, (dx, dy, _dz) in MOVE_BTNS:
             btn = QPushButton(lbl)
             if lbl == "■ Dur":
-                btn.setStyleSheet("background:#c87800;color:white;")
+                btn.setObjectName("warningButton")
             else:
-                btn.setStyleSheet(BTN_STYLE)
+                btn.setObjectName("ghostButton")
             # dx: sağa (+), dy: ileri (+), NED: x=north, y=east
-            dist = self._dist_spin
+            spd_spin = self._dist_spin
             vx_, vy_ = dy, dx   # NED: forward=x, right=y
+            # NEDEN: Bu bir HIZ komutudur ve yenisi/DUR gelene kadar geçerlidir.
+            # Operatör bunu bilmeli — aksi halde "2 m gider" sanıp araç uçup gider.
+            if lbl == "■ Dur":
+                btn.setToolTip("Tüm hareketi durdur — hız komutunu (0,0,0) yapar.")
+            else:
+                btn.setToolTip("Guided hız komutu gönderir. "
+                               "Komut, DUR'a basılana kadar sürer.")
             def _make_handler(_vx, _vy):
                 def _clicked():
-                    d = dist.value()
-                    spd = 1.5   # m/s sabit hız
+                    # NEDEN: sabit 1.5 m/s yerine kullanıcının girdiği HIZ kullanılır;
+                    # kutu değeri artık gerçekten komuta yansıyor.
+                    spd = float(spd_spin.value())
                     if _vx == 0 and _vy == 0:
-                        self._stop()
+                        self._stop()   # "■ Dur" → (0,0,0)
                     else:
                         mag = math.sqrt(_vx * _vx + _vy * _vy)
                         self.send_velocity.emit(
@@ -173,11 +237,16 @@ class GuidedControlWidget(QWidget):
         # Yükseklik satırı
         alt_row = QHBoxLayout()
         b_up = QPushButton("▲ Yukarı")
-        b_up.setStyleSheet("background:#0f6446;color:white;")
+        b_up.setObjectName("successButton")
         b_dn = QPushButton("▼ Aşağı")
-        b_dn.setStyleSheet("background:#6a0f0f;color:white;")
-        b_up.clicked.connect(lambda: self.send_velocity.emit(0.0, 0.0, -self._dist_spin.value() / 3.0))
-        b_dn.clicked.connect(lambda: self.send_velocity.emit(0.0, 0.0,  self._dist_spin.value() / 3.0))
+        b_dn.setObjectName("dangerButton")
+        # NEDEN: Önceden METRE değeri /3.0 ile bölünüp m/s yerine konuyordu (birim
+        # karışıklığı). Kutu artık m/s tuttuğu için bölme kaldırıldı; NED işaret
+        # mantığı korundu (yukarı = negatif vz).
+        b_up.setToolTip("Yukarı hız komutu. Komut, DUR'a basılana kadar sürer.")
+        b_dn.setToolTip("Aşağı hız komutu. Komut, DUR'a basılana kadar sürer.")
+        b_up.clicked.connect(lambda: self.send_velocity.emit(0.0, 0.0, -float(self._dist_spin.value())))
+        b_dn.clicked.connect(lambda: self.send_velocity.emit(0.0, 0.0,  float(self._dist_spin.value())))
         alt_row.addWidget(b_up)
         alt_row.addWidget(b_dn)
         gl.addLayout(alt_row)
@@ -190,12 +259,11 @@ class GuidedControlWidget(QWidget):
         self._yaw_spin.setValue(45.0)
         self._yaw_spin.setSuffix("°")
         self._yaw_spin.setDecimals(0)
-        self._yaw_spin.setStyleSheet("")
         self._yaw_spin.setFixedWidth(70)
         b_yaw_l = QPushButton("↺ Sol")
-        b_yaw_l.setStyleSheet(BTN_STYLE)
+        b_yaw_l.setObjectName("ghostButton")
         b_yaw_r = QPushButton("↻ Sağ")
-        b_yaw_r.setStyleSheet(BTN_STYLE)
+        b_yaw_r.setObjectName("ghostButton")
         b_yaw_l.clicked.connect(lambda: self.send_yaw.emit(-abs(self._yaw_spin.value()), True))
         b_yaw_r.clicked.connect(lambda: self.send_yaw.emit( abs(self._yaw_spin.value()), True))
         yaw_row.addWidget(self._yaw_spin)
@@ -204,6 +272,7 @@ class GuidedControlWidget(QWidget):
         gl.addLayout(yaw_row)
 
         root.addWidget(grp)
+        root.addStretch()   # kontrolleri üste topla; alttaki ölü boşluğu tek noktada tut
 
     def _stop(self) -> None:
         self.send_velocity.emit(0.0, 0.0, 0.0)
@@ -248,7 +317,8 @@ class VideoSourceDialog(QDialog):
 
         # Bilgi etiketi (Otomatik/Ham/İşlenmiş seçilince çözülen adresi gösterir)
         self._info_lbl = QLabel()
-        self._info_lbl.setStyleSheet("color:#8ab4f8;")
+        self._info_lbl.setObjectName("mutedLabel")   # statik renk → QSS class
+        self._info_lbl.setWordWrap(True)
         form.addRow("", self._info_lbl)
 
         self._cam_idx = QSpinBox()
@@ -328,7 +398,9 @@ class HUDWidget(QWidget):
         super().__init__(parent)
         self.setMinimumSize(280, 240)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setStyleSheet("background:#1a6ea0;")
+        # NOT: Zemin satır-içi stylesheet'i kaldırıldı — paintEvent zaten tüm
+        # dikdörtgeni HUD_SKY ile dolduruyor (özel paintEvent'te QSS zemini
+        # hiç çizilmez, bu satır ölü koddu).
         # Attitude (radyan)
         self._roll  = 0.0
         self._pitch = 0.0
@@ -399,14 +471,14 @@ class HUDWidget(QWidget):
         pitch_deg = math.degrees(self._pitch)
         pitch_px  = int(pitch_deg * h / 50.0)   # 50 derece = tam yükseklik
 
-        # ── Gökyüzü/Yer arka plan ────────────────────────────────────────
-        p.fillRect(0, 0, w, h, QColor("#1a6ea0"))   # varsayilan gökyüzü
+        # ── Gökyüzü/Yer arka plan (aviyonik semantik — temadan bağımsız) ──
+        p.fillRect(0, 0, w, h, QColor(HUD_SKY))   # varsayilan gökyüzü
         p.save()
         p.translate(cx, cy)
         p.rotate(roll_deg)
-        p.fillRect(-w * 2, -h * 2, w * 4, h * 2 + pitch_px, QColor("#1a6ea0"))
-        p.fillRect(-w * 2, pitch_px, w * 4, h * 2, QColor("#4a6e28"))
-        p.setPen(QPen(QColor("white"), 2))
+        p.fillRect(-w * 2, -h * 2, w * 4, h * 2 + pitch_px, QColor(HUD_SKY))
+        p.fillRect(-w * 2, pitch_px, w * 4, h * 2, QColor(HUD_GROUND))
+        p.setPen(QPen(QColor(HUD_HORIZON), 2))
         p.drawLine(-w * 2, pitch_px, w * 2, pitch_px)
 
         # ── Pitch merdiveni ───────────────────────────────────────────────
@@ -419,31 +491,31 @@ class HUDWidget(QWidget):
                 continue
             if abs(deg) % 10 == 0:
                 lw = 48
-                p.setPen(QPen(QColor("white"), 1))
+                p.setPen(QPen(QColor(HUD_TEXT), 1))
                 p.drawLine(-lw, py, lw, py)
-                p.setPen(QColor("white"))
+                p.setPen(QColor(HUD_TEXT))
                 p.drawText(lw + 4, py + 4, str(deg))
                 p.drawText(-lw - 22, py + 4, str(deg))
             else:
                 lw = 24
-                p.setPen(QPen(QColor("white"), 1))
+                p.setPen(QPen(QColor(HUD_TEXT), 1))
                 p.drawLine(-lw, py, lw, py)
         p.restore()
 
         # ── Sabit ucak referansi (sari V) ────────────────────────────────
-        p.setPen(QPen(QColor("#ffff00"), 3))
+        p.setPen(QPen(QColor(HUD_AIRCRAFT), 3))
         p.drawLine(cx - 65, cy,      cx - 18, cy)
         p.drawLine(cx - 18, cy,      cx,      cy + 12)
         p.drawLine(cx,      cy + 12, cx + 18, cy)
         p.drawLine(cx + 18, cy,      cx + 65, cy)
-        p.setBrush(QBrush(QColor("#ffff00")))
+        p.setBrush(QBrush(QColor(HUD_AIRCRAFT)))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawEllipse(cx - 4, cy - 4, 8, 8)
 
         # ── Roll yay (keman) ─────────────────────────────────────────────
         arc_r = min(w, h) // 2 - 2
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(QColor("white"), 1))
+        p.setPen(QPen(QColor(HUD_TEXT), 1))
         for ang in (-60, -45, -30, -20, -10, 0, 10, 20, 30, 45, 60):
             rad = math.radians(ang - 90)
             ix  = int(cx + arc_r * math.cos(rad))
@@ -457,7 +529,7 @@ class HUDWidget(QWidget):
         p.save()
         p.translate(cx, cy)
         p.rotate(roll_deg)
-        p.setBrush(QBrush(QColor("#ff6600")))
+        p.setBrush(QBrush(QColor(HUD_ROLL_PTR)))
         p.setPen(Qt.PenStyle.NoPen)
         pr = -arc_r
         p.drawPolygon(QPolygon([QPoint(0, pr + 2),
@@ -466,7 +538,7 @@ class HUDWidget(QWidget):
         p.restore()
 
         # ── Pusula banti (üst) ───────────────────────────────────────────
-        p.fillRect(0, 0, w, CMP_H, QColor(0, 0, 0, 175))
+        p.fillRect(0, 0, w, CMP_H, HUD_BAND_TOP)
         hdg  = self._heading
         ppd  = w / 60.0
         dirs_map = {0:"N", 45:"NE", 90:"E", 135:"SE",
@@ -479,106 +551,143 @@ class HUDWidget(QWidget):
                 continue
             if ah % 45 == 0:
                 lbl = dirs_map.get(ah, str(ah))
-                p.setPen(QPen(QColor("white"), 2))
+                p.setPen(QPen(QColor(HUD_TEXT), 2))
                 p.drawLine(xp, CMP_H - 10, xp, CMP_H)
-                p.setPen(QColor("white"))
+                p.setPen(QColor(HUD_TEXT))
                 p.drawText(xp - len(lbl) * 4, CMP_H - 12, lbl)
             elif ah % 10 == 0:
-                p.setPen(QPen(QColor("#777"), 1))
+                p.setPen(QPen(QColor(HUD_TICK), 1))
                 p.drawLine(xp, CMP_H - 5, xp, CMP_H)
 
         # Orta yon göstergesi (kirmizi üçgen + derece kutusu)
-        p.setBrush(QBrush(QColor("#e94560")))
+        p.setBrush(QBrush(QColor(HUD_COMPASS_PTR)))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawPolygon(QPolygon([QPoint(cx, CMP_H - 1),
                                  QPoint(cx - 6, CMP_H - 13),
                                  QPoint(cx + 6, CMP_H - 13)]))
-        p.fillRect(cx - 23, 1, 46, 18, QColor(0, 0, 0, 220))
-        p.setPen(QColor("#ffff00"))
+        p.fillRect(cx - 23, 1, 46, 18, HUD_BAND_HDG)
+        p.setPen(QColor(HUD_AIRCRAFT))
         p.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
         p.drawText(cx - 19, 15, f"{hdg:03d}\u00b0")
 
         # ── Hava hizi banti (sol) ─────────────────────────────────────────
         ty = CMP_H
         th = h - CMP_H - BOT_H
-        p.fillRect(0, ty, SIDE_W, th, QColor(0, 0, 0, 155))
-        p.fillRect(0, cy - 16, SIDE_W + 2, 32, QColor(0, 0, 0, 230))
-        p.setPen(QColor("white"))
+        p.fillRect(0, ty, SIDE_W, th, HUD_BAND_SIDE)
+        p.fillRect(0, cy - 16, SIDE_W + 2, 32, HUD_BAND_FOCUS)
+        p.setPen(QColor(HUD_TEXT))
         p.setFont(QFont("Courier New", 16, QFont.Weight.Bold))
         p.drawText(4, cy + 7, f"{self._airspeed:.1f}")
-        p.setPen(QColor("#aaa"))
+        p.setPen(QColor(HUD_TEXT_DIM))
         p.setFont(QFont("Courier New", 8))
         p.drawText(4, ty + 14, "AS m/s")
-        p.setPen(QColor("#4ade80"))
+        p.setPen(QColor(HUD_GS))
         p.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
         p.drawText(4, cy - 23, f"GS {self._groundspeed:.1f}")
-        p.setPen(QColor("#4adeb0"))
+        p.setPen(QColor(HUD_VS))
         p.drawText(4, cy + 33, f"VS {self._climb:+.1f}")
 
         # ── Yükseklik banti (sag) ─────────────────────────────────────────
         rx = w - SIDE_W
-        p.fillRect(rx, ty, SIDE_W, th, QColor(0, 0, 0, 155))
-        p.fillRect(rx - 2, cy - 16, SIDE_W + 2, 32, QColor(0, 0, 0, 230))
-        p.setPen(QColor("white"))
+        p.fillRect(rx, ty, SIDE_W, th, HUD_BAND_SIDE)
+        p.fillRect(rx - 2, cy - 16, SIDE_W + 2, 32, HUD_BAND_FOCUS)
+        p.setPen(QColor(HUD_TEXT))
         p.setFont(QFont("Courier New", 16, QFont.Weight.Bold))
         p.drawText(rx + 4, cy + 7, f"{self._alt:.1f}")
-        p.setPen(QColor("#aaa"))
+        p.setPen(QColor(HUD_TEXT_DIM))
         p.setFont(QFont("Courier New", 8))
         p.drawText(rx + 4, ty + 14, "REL m")
-        p.setPen(QColor("#f0a500"))
+        p.setPen(QColor(HUD_THR))
         p.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
         p.drawText(rx + 4, cy + 33, f"THR {self._throttle}%")
 
         # ── Alt bilgi bari ────────────────────────────────────────────────
         by = h - BOT_H
-        p.fillRect(0, by, w, BOT_H, QColor(0, 0, 0, 215))
+        p.fillRect(0, by, w, BOT_H, HUD_BAND_BOTTOM)
+
+        # ── Adaptif alt bar ──────────────────────────────────────────────────
+        # Dört grup (Batarya | Mod | EKF | GPS) eskiden SABİT x offset'lerine
+        # çiziliyordu; PFD daralınca (pencere min 1280px → orta kolon ~280px)
+        # üst üste biniyorlardı ("12.0GUIDED", "EKGPS"). Artık her metnin
+        # genişliği QFontMetrics ile ölçülür: Batarya sola, GPS sağa yaslanır,
+        # aradaki boşluğa Mod ve EKF ancak SIĞDIĞI kadar yerleştirilir. Yer
+        # yoksa zarifçe elenir (Mod/EKF üst çubukta da görünür) — çakışma yok.
+        f_bat = QFont("Courier New", 9, QFont.Weight.Bold)
+        f_sub = QFont("Courier New", 8)
+        f_mode = QFont("Courier New", 11, QFont.Weight.Bold)
+        f_ekf = QFont("Courier New", 9, QFont.Weight.Bold)
+        fm_bat = QFontMetrics(f_bat)
+        fm_sub = QFontMetrics(f_sub)
+        fm_mode = QFontMetrics(f_mode)
+        fm_ekf = QFontMetrics(f_ekf)
 
         # Batarya (sol)
-        bcol = ("#4ade80" if self._batt_r > 50
-                else "#ff8800" if self._batt_r > 20 else "#ff4444")
-        p.setPen(QColor(bcol))
-        p.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
-        p.drawText(4, by + 16, f"Bat {self._batt_v:.1f}v {self._batt_a:.1f}A {self._batt_r}%")
-        p.setPen(QColor("#aaa"))
-        p.setFont(QFont("Courier New", 8))
+        bcol = (HUD_OK if self._batt_r > 50
+                else HUD_WARN if self._batt_r > 20 else HUD_CRIT)
+        bat_txt = f"Bat {self._batt_v:.1f}v {self._batt_a:.1f}A {self._batt_r}%"
         if self._cell_voltages:
             min_c = min(self._cell_voltages)
             cells_str = " ".join(f"{v:.2f}" for v in self._cell_voltages)
-            p.drawText(4, by + 30, f"Hücre: {cells_str}  min:{min_c:.2f}v")
+            bat_sub = f"Hücre: {cells_str}  min:{min_c:.2f}v"
         else:
             cv = self._batt_v / 3.0 if self._batt_v > 0 else 0.0
-            p.drawText(4, by + 30, f"Cell ~{cv:.2f}v")
+            bat_sub = f"Cell ~{cv:.2f}v"
+        p.setPen(QColor(bcol))
+        p.setFont(f_bat)
+        p.drawText(4, by + 16, bat_txt)
+        p.setPen(QColor(HUD_TEXT_DIM))
+        p.setFont(f_sub)
+        p.drawText(4, by + 30, bat_sub)
+        bat_right = 4 + max(fm_bat.horizontalAdvance(bat_txt),
+                            fm_sub.horizontalAdvance(bat_sub))
 
-        # Mod + Arm (orta)
-        mc = "#ff4444" if self._armed else "#4ade80"
-        p.setPen(QColor(mc))
-        p.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
-        p.drawText(cx - 38, by + 16, self._flight_mode)
-        arm_s = "ARM" if self._armed else "DSRM"
-        p.setPen(QColor("#aaa"))
-        p.setFont(QFont("Courier New", 9))
-        p.drawText(cx - 38, by + 30, arm_s)
-
-        # EKF
-        ekf_ok = (self._ekf_flags & 0x1F) == 0x1F if self._ekf_flags else False
-        ec = "#4ade80" if ekf_ok else "#aaa" if not self._ekf_flags else "#ff4444"
-        p.setPen(QColor(ec))
-        p.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
-        p.drawText(cx + 52, by + 16, "EKF")
-
-        # GPS (sag)
+        # GPS (sağ) — iki satırın en genişine göre ortak sol kenar
         gn = self._gps_name.upper()
-        gc = "#4ade80" if ("3D" in gn or "RTK" in gn) else "#ff8800"
+        gc = HUD_OK if ("3D" in gn or "RTK" in gn) else HUD_WARN
+        gps_txt = f"GPS: {self._gps_name}"
+        sat_txt = f"Sat:{self._gps_sats} HDOP:{self._hdop:.1f}"
+        gps_w = fm_bat.horizontalAdvance(gps_txt)
+        sat_w = fm_sub.horizontalAdvance(sat_txt)
+        gps_x = w - max(gps_w, sat_w) - 8
         p.setPen(QColor(gc))
-        p.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
-        p.drawText(w - 162, by + 16, f"GPS: {self._gps_name}")
-        p.setPen(QColor("#aaa"))
-        p.setFont(QFont("Courier New", 8))
-        p.drawText(w - 162, by + 30, f"Sat:{self._gps_sats} HDOP:{self._hdop:.1f}")
+        p.setFont(f_bat)
+        p.drawText(gps_x, by + 16, gps_txt)
+        p.setPen(QColor(HUD_TEXT_DIM))
+        p.setFont(f_sub)
+        p.drawText(gps_x, by + 30, sat_txt)
+
+        # Mod + EKF — batarya ile GPS arasındaki boşluğa sığdığı kadar
+        span_l = bat_right + 10
+        span_r = gps_x - 10
+        span_w = span_r - span_l
+        mode_w = fm_mode.horizontalAdvance(self._flight_mode)
+        ekf_w = fm_ekf.horizontalAdvance("EKF")
+        mc = HUD_CRIT if self._armed else HUD_OK
+        arm_s = "ARM" if self._armed else "DSRM"
+        ekf_ok = (self._ekf_flags & 0x1F) == 0x1F if self._ekf_flags else False
+        ec = HUD_OK if ekf_ok else HUD_TEXT_DIM if not self._ekf_flags else HUD_CRIT
+
+        if span_w >= mode_w + ekf_w + 12:
+            # İkisi de sığar: Mod sol tarafa, EKF sağ tarafa dağıtılır
+            mode_x = span_l
+            p.setPen(QColor(mc)); p.setFont(f_mode)
+            p.drawText(mode_x, by + 16, self._flight_mode)
+            p.setPen(QColor(HUD_TEXT_DIM)); p.setFont(f_sub)
+            p.drawText(mode_x, by + 30, arm_s)
+            p.setPen(QColor(ec)); p.setFont(f_ekf)
+            p.drawText(span_r - ekf_w, by + 16, "EKF")
+        elif span_w >= mode_w:
+            # Sadece Mod sığar → boşlukta ortala (EKF üst çubukta zaten var)
+            mode_x = span_l + (span_w - mode_w) // 2
+            p.setPen(QColor(mc)); p.setFont(f_mode)
+            p.drawText(mode_x, by + 16, self._flight_mode)
+            p.setPen(QColor(HUD_TEXT_DIM)); p.setFont(f_sub)
+            p.drawText(mode_x, by + 30, arm_s)
+        # aksi halde: aşırı dar — Mod/EKF elenir (üst çubukta görünür)
 
         # Güncelleme sayaci (veri akisi göstergesi)
         tick = getattr(self, "_update_tick", 0)
-        p.setPen(QColor("#333"))
+        p.setPen(QColor(HUD_TICK_FAINT))
         p.setFont(QFont("Courier New", 7))
         p.drawText(w - 32, by + 42, f"#{tick}")
 
@@ -587,13 +696,16 @@ class HUDWidget(QWidget):
 
 # ── Hizli Veri (MP Hizli Veri Stili - Büyük Sayilar) ─────────────────────────
 class QuickDataWidget(QWidget):
+    # NOT: Üçüncü alan eskiden alan başına ham hex renkti ama HİÇ kullanılmıyordu
+    # (tüm değerler tek accent renk — şartname §1). Yapı korunuyor, renk yerine
+    # tema token'ı yazıldı ki ileride kullanılırsa theme.c(...) ile çözülsün.
     _FIELDS = [
-        ("alt",         "Bağıl İrtifa (m)", "#bb86fc"),
-        ("groundspeed", "Yer Hizi (m/s)",  "#ffb347"),
-        ("dist_wp",     "WP Mesafesi (m)", "#ff7eb3"),
-        ("yaw_deg",     "Yaw (°)",         "#4ade80"),
-        ("climb",       "Dikey Hiz (m/s)", "#cfff70"),
-        ("heading",     "Iz Açisi (°)",    "#00e5ff"),
+        ("alt",         "Bağıl İrtifa (m)", "accent"),
+        ("groundspeed", "Yer Hizi (m/s)",  "accent"),
+        ("dist_wp",     "WP Mesafesi (m)", "accent"),
+        ("yaw_deg",     "Yaw (°)",         "accent"),
+        ("climb",       "Dikey Hiz (m/s)", "accent"),
+        ("heading",     "Iz Açisi (°)",    "accent"),
     ]
 
     def __init__(self, parent=None):
@@ -603,23 +715,24 @@ class QuickDataWidget(QWidget):
 
     def _build(self) -> None:
         g = QGridLayout(self)
-        g.setSpacing(3)
-        g.setContentsMargins(2, 2, 2, 2)
-        for i, (key, title, col) in enumerate(self._FIELDS):
+        g.setSpacing(6)   # kartlar arası 6px (şartname §2)
+        g.setContentsMargins(6, 6, 6, 6)
+        for i, (key, title, _col) in enumerate(self._FIELDS):
             row, c = divmod(i, 2)
             cell = QFrame()
             # cell stili QSS'ten alınacak
             fl = QVBoxLayout(cell)
-            fl.setContentsMargins(4, 2, 4, 2)
+            fl.setContentsMargins(6, 6, 6, 6)   # kart iç dolgusu min 6px
             fl.setSpacing(0)
             tl = QLabel(title)
             tl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            tl.setStyleSheet("color:#777;font-size:9px;font-family:'Segoe UI';")
+            tl.setWordWrap(True)   # uzun TR başlıklar kırpılmasın, alt satıra sarsın
+            tl.setObjectName("mutedLabel")   # statik renk → QSS class
             vl = QLabel("0,00")
             vl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            vl.setStyleSheet(
-                f"color:{col};font-size:22px;font-weight:bold;font-family:'Segoe UI';"
-            )
+            # Büyük accent değer → QSS "valueLabel" class'ı (18px bold accent).
+            # Tüm değerler tek accent renk (şartname §1) — alan başına renk yok.
+            vl.setObjectName("valueLabel")
             fl.addWidget(tl)
             fl.addWidget(vl)
             self._value_labels[key] = vl
@@ -673,7 +786,7 @@ class MapWidget(QWidget):
         else:
             lbl = QLabel("Harita: PyQt6-WebEngine kurulu degil")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("color:#888;font-size:13px;")
+            lbl.setObjectName("mutedLabel")   # statik renk → QSS class
             layout.addWidget(lbl)
 
     def _load_map(self) -> None:
@@ -751,25 +864,26 @@ class EscTelemetry2DWidget(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
         w, h = self.width(), self.height()
-        
-        # Premium Background
-        painter.fillRect(0, 0, w, h, QColor("#0d0d16"))
-        
+
+        # Panel zemini ve çerçevesi TEMADAN gelir (paint sırasında okunur —
+        # __init__'te cachelenmez, tema değişince otomatik doğru renge geçer).
+        painter.fillRect(0, 0, w, h, QColor(theme.c("chart_bg")))
+
         # Frame Border
-        painter.setPen(QPen(QColor(15, 52, 96, 150), 1))
+        painter.setPen(QPen(QColor(theme.c("border")), 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRoundedRect(1, 1, w - 2, h - 2, 6, 6)
-        
+
         # Titles
-        painter.setPen(QColor("#00e5ff"))
+        painter.setPen(QColor(theme.c("accent")))
         painter.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         painter.drawText(12, 22, "ESC TELEMETRİ (2D)")
-        
+
         # Top-Right Info (Total Current and Consumption) - Moved down to prevent overlap
         painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         info_text = f"SİSTEM AKIMI: {self._sys_current:.1f} A   |   TÜKETİM: {self._total_mah:.0f} mAh"
         fm = painter.fontMetrics()
-        painter.setPen(QColor("#4ade80"))
+        painter.setPen(QColor(theme.c("success")))
         # Draw on the right side but slightly lower
         painter.drawText(w - fm.horizontalAdvance(info_text) - 12, 40, info_text)
         
@@ -779,20 +893,21 @@ class EscTelemetry2DWidget(QWidget):
         scale = min(w, h) * 0.35
         arm_len = scale * 0.55
         
-        # Drone Center Body
+        # Drone Center Body (gövde + burun oku aviyonik semantik)
         body_rect = QRectF(-20, -20, 40, 40)
-        painter.setPen(QPen(QColor("#00e5ff"), 2))
-        painter.setBrush(QColor(15, 52, 96, 200))
+        painter.setPen(QPen(QColor(ESC_CW), 2))
+        painter.setBrush(ESC_BODY_FILL)
         painter.drawRoundedRect(body_rect, 8, 8)
-        
+
         # Drone Direction Arrow (North/Forward)
-        painter.setBrush(QColor("#ff4444"))
+        painter.setBrush(QColor(ESC_ARROW))
         painter.setPen(Qt.PenStyle.NoPen)
         arrow_poly = QPolygon([QPoint(0, -15), QPoint(-6, -5), QPoint(6, -5)])
         painter.drawPolygon(arrow_poly)
-        
-        # Arms
-        painter.setPen(QPen(QColor("#2a2a35"), 6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+
+        # Arms — panel zemini üstünde çizildiği için TEMA rengi kullanır
+        painter.setPen(QPen(QColor(theme.c("text_muted")), 6,
+                            Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         painter.drawLine(int(-arm_len), int(-arm_len), int(arm_len), int(arm_len))
         painter.drawLine(int(-arm_len), int(arm_len), int(arm_len), int(-arm_len))
         
@@ -808,17 +923,17 @@ class EscTelemetry2DWidget(QWidget):
             painter.save()
             painter.translate(pos[0], pos[1])
             
-            # Motor Base
-            painter.setBrush(QColor("#1a1a24"))
-            painter.setPen(QPen(QColor("#00e5ff" if i in (0,2) else "#ff6666"), 2))
+            # Motor Base — halka rengi dönüş yönünü gösterir (aviyonik semantik)
+            painter.setBrush(QColor(ESC_MOTOR_BASE))
+            painter.setPen(QPen(QColor(ESC_CW if i in (0, 2) else ESC_CCW), 2))
             painter.drawEllipse(QPointF(0, 0), 12, 12)
-            
+
             # Spinning Propeller Effect
             painter.rotate(self._spin_angle[i])
             prop_len = arm_len * 0.8
-            prop_color = QColor(0, 229, 255, 60) if i in (0, 2) else QColor(255, 102, 102, 60)
+            prop_color = ESC_CW_PROP if i in (0, 2) else ESC_CCW_PROP
             painter.setBrush(prop_color)
-            painter.setPen(QPen(QColor(255, 255, 255, 40), 1))
+            painter.setPen(QPen(ESC_PROP_EDGE, 1))
             painter.drawEllipse(QPointF(0, 0), prop_len, 6)
             painter.drawEllipse(QPointF(0, 0), 6, prop_len)
             
@@ -833,21 +948,22 @@ class EscTelemetry2DWidget(QWidget):
             box_x = pos[0] + offset_x
             box_y = pos[1] + offset_y
             
-            # Glassmorphism box
-            painter.setBrush(QColor(10, 10, 20, 220))
-            painter.setPen(QPen(QColor("#00e5ff" if i in (0,2) else "#ff6666"), 1))
+            # Glassmorphism box — HUD kromu: koyu kutu + parlak metin, açık
+            # temada da okunur kalsın diye aviyonik sabit olarak korunur.
+            painter.setBrush(ESC_LABEL_BOX)
+            painter.setPen(QPen(QColor(ESC_CW if i in (0, 2) else ESC_CCW), 1))
             painter.drawRoundedRect(int(box_x), int(box_y), box_w, box_h, 4, 4)
-            
+
             painter.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
-            
+
             # Values
-            painter.setPen(QColor("#ffffff"))
+            painter.setPen(QColor(ESC_LBL_RPM))
             painter.drawText(int(box_x) + 5, int(box_y) + 14, f"RPM: {self._esc_rpm[i]}")
-            painter.setPen(QColor("#4ade80"))
+            painter.setPen(QColor(ESC_LBL_VOLT))
             painter.drawText(int(box_x) + 5, int(box_y) + 26, f"V  : {self._esc_voltage[i]:.1f}")
-            painter.setPen(QColor("#f0a500"))
+            painter.setPen(QColor(ESC_LBL_AMP))
             painter.drawText(int(box_x) + 5, int(box_y) + 38, f"A  : {self._esc_current[i]:.1f}")
-            painter.setPen(QColor("#ff4444"))
+            painter.setPen(QColor(ESC_LBL_TEMP))
             painter.drawText(int(box_x) + 5, int(box_y) + 50, f"°C : {self._esc_temp[i]}")
 
 
@@ -857,44 +973,121 @@ class DashboardView(QWidget):
     video_source_changed = pyqtSignal(str)   # → video_worker.set_source
     send_servo_action = pyqtSignal(str, str, int) # target, state, angle
 
+    # NEDEN: Tespit kartları sınırsız birikip bellek/layout yükü yaratıyordu.
+    _MAX_AI_CARDS = 50   # ekranda tutulacak en yeni tespit kartı sayısı
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._last_detection_time = None
+        # Fix: kart referansları — eskiyenler layout'tan çıkarılıp silinsin
+        self._ai_cards: list = []
+        # Fix: yol haritası son uygulanan durum listesi (gereksiz stylesheet parse'ı önler)
+        self._last_roadmap_statuses = None
+        # Fix: gimbal debounce — son gönderilen açı (tekrar komut göndermemek için)
+        self._last_gimbal_sent = None
+        # Fix: sağlık göstergeleri gerçek veri gelene kadar "—" gösterir
+        self._hw_seen = {"ping": False, "rssi": False, "loss": False,
+                         "cpu": False, "ram": False, "temp": False}
+        # Tema değişince İHA durum etiketini aynı veriyle yeniden kurmak için
+        self._last_rpi_status: dict | None = None
+        self._health_bars: list = []
         self._build_ui()
+        # Kurulumda yazılan satır-içi renkler tema değişince bayat kalır —
+        # sinyale bağlanıp hepsini son duruma göre yeniden yazıyoruz.
+        theme.notifier().changed.connect(lambda _n: self._apply_theme_colors())
+
+    # ── Satır-içi stil üreticileri (tek renk kaynağı: theme.c) ─────────────
+    @staticmethod
+    def _log_css(token: str) -> str:
+        """Mesaj günlüğü (QTextEdit) — mono yazı + anlamsal metin rengi."""
+        return (f"color:{theme.c(token)};font-family:'Courier New';"
+                f"font-size:12px;border:none;")
+
+    @staticmethod
+    def _video_frame_css() -> str:
+        """Video çerçevesi — 'kaynak yok' zemini tema kuyusundan gelir."""
+        return (f"QFrame#videoFrame{{background:{theme.c('well')};"
+                f"border:1px solid {theme.c('border')};}}")
+
+    @staticmethod
+    def _servo_panel_css() -> str:
+        return (f"QFrame#servoPanel{{background-color:{theme.c('panel')};"
+                f"border:1px solid {theme.c('border')};border-radius:8px;}}")
+
+    @staticmethod
+    def _gimbal_val_css() -> str:
+        return (f"font-weight:bold;color:{theme.c('accent')};"
+                f"font-size:11px;padding-left:4px;")
+
+    @staticmethod
+    def _bar_chunk_css(token: str) -> str:
+        """Yalnız dolgu rengi — çubuk gövdesi global QSS'ten gelir."""
+        return f"QProgressBar::chunk{{background-color:{theme.c(token)};}}"
+
+    @staticmethod
+    def _det_card_css(token: str) -> str:
+        """Tespit kartı — sol kenar rengi tespit sınıfına göre (dinamik)."""
+        return (f"QFrame#detCard{{background-color:{theme.c('panel')};"
+                f"border:1px solid {theme.c('border')};"
+                f"border-left:4px solid {theme.c(token)};border-radius:4px;}}")
+
+    @staticmethod
+    def _step_box_css(bg_token: str, border_token: str) -> str:
+        return (f"QFrame#panelFrame{{background-color:{theme.c(bg_token)};"
+                f"border:1px solid {theme.c(border_token)};border-radius:4px;}}")
+
+    def _apply_health_bar_colors(self) -> None:
+        """Sağlık çubuklarının anlamsal dolgu renklerini (yeniden) yazar."""
+        for bar, token in self._health_bars:
+            bar.setStyleSheet(self._bar_chunk_css(token))
+
+    def _apply_theme_colors(self) -> None:
+        """Tema değişince TÜM satır-içi renkleri son duruma göre yeniden yazar.
+
+        NEDEN: Satır-içi stiller kurulumda BİR KEZ yazılır; tema değişince eski
+        paletle bayat kalırlar. Burada hepsi güncel palete göre tazelenir."""
+        self._msg_log.setStyleSheet(self._log_css("info"))
+        self._rpi_msg_log.setStyleSheet(self._log_css("success"))
+        self._video_frame.setStyleSheet(self._video_frame_css())
+        self._servo_panel.setStyleSheet(self._servo_panel_css())
+        self.lbl_gimbal_val.setStyleSheet(self._gimbal_val_css())
+        self._apply_health_bar_colors()
+        # Yol haritası: son bilinen durum listesiyle yeniden boyanır
+        self._apply_roadmap_styles(
+            self._last_roadmap_statuses or ["pending"] * len(self._road_steps)
+        )
+        # Tespit kartları: her kart kendi anlam token'ını taşır
+        for card in self._ai_cards:
+            token = getattr(card, "_accent_token", "warning")
+            card.setStyleSheet(self._det_card_css(token))
+        # İHA durum etiketi HTML renkleri: son veriyle yeniden kurulur
+        if self._last_rpi_status is not None:
+            self.update_rpi_status(self._last_rpi_status)
 
     def _build_ui(self) -> None:
-        self.setStyleSheet("color:#e0e0e0;")
         root = QHBoxLayout(self)
-        root.setContentsMargins(4, 4, 4, 4)
-        root.setSpacing(4)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
 
-        # ── Sol panel (sabit 400 px, daha geniş) ──────────────────────────────────────
+        # ── Sol panel (sabit 340 px — şartname §4) ────────────────────────────────────
         left = QWidget()
-        left.setFixedWidth(400)
+        left.setFixedWidth(340)
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
         ll.setSpacing(4)
 
         # Hizli Veri
+        # NOT: Yerel QGroupBox stil override'ı SİLİNDİ — başlık/kenarlık/dolgu
+        # artık global QSS'ten gelir (şartname §0).
         qd_grp = QGroupBox("Hızlı Veri")
-        qd_grp.setStyleSheet(
-            "QGroupBox{border:1px solid #0f3460;color:#aaa;font-weight:bold;"
-            "padding-top:16px;margin-top:4px;}"
-        )
         qdl = QVBoxLayout(qd_grp)
-        qdl.setContentsMargins(2, 2, 2, 2)
+        qdl.setContentsMargins(6, 6, 6, 6)
         self._quick_data = QuickDataWidget()
         qdl.addWidget(self._quick_data)
         ll.addWidget(qd_grp)
 
-        # Hizli Komutlar
+        # Hizli Komutlar (grup + buton stilleri global QSS'ten — şartname §0)
         cmd_grp = QGroupBox("Hızlı Komutlar")
-        cmd_grp.setStyleSheet(
-            "QGroupBox{border:1px solid #0f3460;color:#aaa;font-weight:bold;"
-            "padding-top:16px;margin-top:4px;}"
-            "QPushButton{border-radius:4px;padding:5px 4px;"
-            "font-weight:bold;font-size:11px;}"
-        )
         cgl = QVBoxLayout(cmd_grp)
         cgl.setSpacing(4)
 
@@ -914,7 +1107,6 @@ class DashboardView(QWidget):
         self._alt_spin.setRange(1, 120)
         self._alt_spin.setValue(10)
         self._alt_spin.setSuffix(" m")
-        self._alt_spin.setStyleSheet("")
         b_to = QPushButton("TAKEOFF")
         b_to.setObjectName("successButton")
         b_to.clicked.connect(self._takeoff)
@@ -963,43 +1155,46 @@ class DashboardView(QWidget):
 
         # Mesaj Sekmeler (Drone + RPi Görev)
         msg_tabs = QTabWidget()
-        msg_tabs.setStyleSheet("")
+        msg_tabs.setMinimumHeight(150)
+        # 400 px sol panelde 4 alt-sekme kaydırma oku olmadan sığsın:
+        # kısa etiketler + dar padding + kaydırma butonlarını kapat.
+        msg_tabs.setUsesScrollButtons(False)
+        msg_tabs.setElideMode(Qt.TextElideMode.ElideNone)
+        _msg_tabbar = msg_tabs.tabBar()
+        if _msg_tabbar is not None:
+            _msg_tabbar.setExpanding(False)
+        msg_tabs.setStyleSheet(
+            "QTabBar::tab{padding:4px 8px;font-size:10px;margin-right:1px;}"
+        )
 
         # Sekme 1: Drone / FC mesajları
         drone_tab = QWidget()
         dtl = QVBoxLayout(drone_tab)
-        dtl.setContentsMargins(2, 2, 2, 2)
+        dtl.setContentsMargins(6, 6, 6, 6)
         self._msg_log = QTextEdit()
         self._msg_log.document().setMaximumBlockCount(500)   # sınırsız büyümeyi engelle
         self._msg_log.setReadOnly(True)
-        self._msg_log.setStyleSheet(
-            "color:#3daee9;font-family:'Courier New';"
-            "font-size:12px;border:none;"
-        )
-        dtl.addWidget(self._msg_log)
-        msg_tabs.addTab(drone_tab, "Drone / FC")
+        self._msg_log.setStyleSheet(self._log_css("info"))
+        dtl.addWidget(self._msg_log, stretch=1)
+        msg_tabs.addTab(drone_tab, "Drone/FC")
 
         # Sekme 2: RPi görev mesajları
         rpi_tab = QWidget()
         rtl = QVBoxLayout(rpi_tab)
-        rtl.setContentsMargins(2, 2, 2, 2)
+        rtl.setContentsMargins(6, 6, 6, 6)
         # İHA canlı durum özeti (hedef tespit / yük / servo) — companion'dan gelir
         self._iha_status_lbl = QLabel("İHA durumu bekleniyor...")
         self._iha_status_lbl.setWordWrap(True)
-        self._iha_status_lbl.setStyleSheet(
-            "color:#8ab4f8;font-size:11px;padding:4px;"
-            "background:#0d1117;border:1px solid #1f2733;border-radius:3px;"
-        )
+        # Kutu görünümlü bilgi etiketi → QSS "hintLabel" class'ı (zemin/kenar/renk
+        # temadan gelir; içerideki durum renkleri HTML span'lerinde dinamiktir).
+        self._iha_status_lbl.setObjectName("hintLabel")
         rtl.addWidget(self._iha_status_lbl)
         self._rpi_msg_log = QTextEdit()
         self._rpi_msg_log.document().setMaximumBlockCount(500)
         self._rpi_msg_log.setReadOnly(True)
-        self._rpi_msg_log.setStyleSheet(
-            "color:#10b981;font-family:'Courier New';"
-            "font-size:12px;border:none;"
-        )
-        rtl.addWidget(self._rpi_msg_log)
-        msg_tabs.addTab(rpi_tab, "Yardımcı Bilgisayar")
+        self._rpi_msg_log.setStyleSheet(self._log_css("success"))
+        rtl.addWidget(self._rpi_msg_log, stretch=1)
+        msg_tabs.addTab(rpi_tab, "Yardımcı")
 
         # Sekme 3: Guided Kontrol
         self._guided_ctrl = GuidedControlWidget()
@@ -1010,7 +1205,7 @@ class DashboardView(QWidget):
         # Sekme 4: TOF (Durum Makinesi)
         if TofWidget:
             self._tof_widget = TofWidget()
-            msg_tabs.addTab(self._tof_widget, "TOF (Durum)")
+            msg_tabs.addTab(self._tof_widget, "TOF")
 
         ll.addWidget(msg_tabs, stretch=1)
 
@@ -1023,12 +1218,16 @@ class DashboardView(QWidget):
         cl.setSpacing(4)
 
         self._hud = HUDWidget()
-        cl.addWidget(self._hud, stretch=1)
+        cl.addWidget(self._hud, stretch=2)
 
         # Video — HUD ile eşit yükseklik (her ikisi stretch=1)
         vframe = QFrame()
+        vframe.setObjectName("videoFrame")
         vframe.setMinimumHeight(140)
-        vframe.setStyleSheet("background:#000;border:1px solid #3b3b45;")
+        # ID seçicisi: bare stylesheet çocuklara yayılıp "Kaynak" butonunun
+        # primaryButton stilini eziyordu. Zemin/kenar artık tema token'ından.
+        self._video_frame = vframe
+        vframe.setStyleSheet(self._video_frame_css())
         vfl = QVBoxLayout(vframe)
         vfl.setContentsMargins(0, 0, 0, 0)
         vfl.setSpacing(0)
@@ -1044,54 +1243,58 @@ class DashboardView(QWidget):
         vfl.addLayout(_vtop)
         self._video_label = QLabel("Video Bekleniyor...")
         self._video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._video_label.setStyleSheet("color:#555;font-size:13px;")
+        self._video_label.setObjectName("mutedLabel")   # statik renk → QSS class
         vfl.addWidget(self._video_label, stretch=1)
         # Video HUD'dan daha büyük olacak ve dikey alanı dolduracak
         cl.addWidget(vframe, stretch=3)
 
         # ── Otonom Yük & Servo (Sonsuz Derece Premium Grid Düzen) ──────────────────────
         servo_grp = QFrame()
-        servo_grp.setStyleSheet("background-color:#141419; border:1px solid #2b2b35; border-radius:6px;")
+        # NOT: objectName "servoPanel" DEĞİŞMEZ — main_window RBAC kilidi bu adı
+        # arayarak paneli devre dışı bırakıyor.
+        servo_grp.setObjectName("servoPanel")
+        # Seçicisiz (bare) stylesheet çocuklara da yayılıp butonların
+        # dangerButton/primaryButton/successButton QSS class'larını eziyordu —
+        # ID seçicisiyle yalnızca panelin kendisine kapsamlandı.
+        self._servo_panel = servo_grp
+        servo_grp.setStyleSheet(self._servo_panel_css())
         servo_lay = QGridLayout(servo_grp)
         servo_lay.setContentsMargins(12, 10, 12, 10)
         servo_lay.setSpacing(6)
-        
-        # Stil tanımlamaları
-        lbl_style = "color:#8f90a6; font-weight:bold; font-size:11px; border:none;"
-        
+
+        # Satır etiketleri: statik soluk metin → QSS "mutedLabel" class'ı
+
         # 1. Kırmızı Yük
         lbl_red = QLabel("Kırmızı Yük:")
-        lbl_red.setStyleSheet(lbl_style)
+        lbl_red.setObjectName("mutedLabel")
         btn_drop_red_open = QPushButton("Aç")
-        btn_drop_red_open.setStyleSheet("background-color:#3a1f22; color:#ff8a85; border:1px solid #7a3b3b; border-radius:6px; padding:6px; font-weight:600; font-size:11px;")
-        btn_drop_red_close = QPushButton("Kapat")
-        btn_drop_red_close.setStyleSheet("background-color:#1f2a33; color:#8996a3; border:1px solid #35424d; border-radius:6px; padding:6px; font-weight:600; font-size:11px;")
+        btn_drop_red_open.setObjectName("dangerButton")
+        btn_drop_red_close = QPushButton("Kapat")   # nötr — global QSS
         
         # 2. Mavi Yük
         lbl_blue = QLabel("Mavi Yük:")
-        lbl_blue.setStyleSheet(lbl_style)
+        lbl_blue.setObjectName("mutedLabel")
         btn_drop_blue_open = QPushButton("Aç")
-        btn_drop_blue_open.setStyleSheet("background-color:#182a3d; color:#7db8f0; border:1px solid #35597a; border-radius:6px; padding:6px; font-weight:600; font-size:11px;")
-        btn_drop_blue_close = QPushButton("Kapat")
-        btn_drop_blue_close.setStyleSheet("background-color:#1f2a33; color:#8996a3; border:1px solid #35424d; border-radius:6px; padding:6px; font-weight:600; font-size:11px;")
+        btn_drop_blue_open.setObjectName("primaryButton")
+        btn_drop_blue_close = QPushButton("Kapat")   # nötr — global QSS
         
         # 3. Yük Alma Kapakları
         lbl_grab = QLabel("Yük Kapak:")
-        lbl_grab.setStyleSheet(lbl_style)
+        lbl_grab.setObjectName("mutedLabel")
         btn_grab_open = QPushButton("Aç")
-        btn_grab_open.setStyleSheet("background-color:#1c3a2a; color:#6ee7a0; border:1px solid #2f6b48; border-radius:6px; padding:6px; font-weight:600; font-size:11px;")
-        btn_grab_close = QPushButton("Kapat")
-        btn_grab_close.setStyleSheet("background-color:#1f2a33; color:#8996a3; border:1px solid #35424d; border-radius:6px; padding:6px; font-weight:600; font-size:11px;")
+        btn_grab_open.setObjectName("successButton")
+        btn_grab_close = QPushButton("Kapat")   # nötr — global QSS
         
         # 4. Gimbal
         lbl_gimbal = QLabel("Gimbal Açısı:")
-        lbl_gimbal.setStyleSheet(lbl_style)
+        lbl_gimbal.setObjectName("mutedLabel")
         self.gimbal_slider = QSlider(Qt.Orientation.Horizontal)
         self.gimbal_slider.setRange(30, 90)
         self.gimbal_slider.setValue(60)
-        self.gimbal_slider.setStyleSheet("border:none;")
+        # Küçük accent değer — valueLabel (18px) bu ızgara satırına sığmıyor,
+        # bu yüzden satır-içi kalıyor ama rengi tema token'ından geliyor.
         self.lbl_gimbal_val = QLabel("60°")
-        self.lbl_gimbal_val.setStyleSheet("font-weight:bold; color:#00e5ff; font-size:11px; border:none; padding-left:4px;")
+        self.lbl_gimbal_val.setStyleSheet(self._gimbal_val_css())
         
         # Sinyal bağlantıları
         btn_drop_red_open.clicked.connect(lambda: self.send_servo_action.emit("red_drop", "open", 0))
@@ -1101,11 +1304,26 @@ class DashboardView(QWidget):
         
         btn_grab_open.clicked.connect(lambda: self.send_servo_action.emit("grabber", "open", 0))
         btn_grab_close.clicked.connect(lambda: self.send_servo_action.emit("grabber", "close", 0))
+        # Etiket anlık güncellenir (ucuz, yerel)
         self.gimbal_slider.valueChanged.connect(lambda v: self.lbl_gimbal_val.setText(f"{v}°"))
-        self.gimbal_slider.valueChanged.connect(lambda val: self.send_servo_action.emit("gimbal", "", val))
+        # NEDEN: valueChanged sürükleme boyunca her adımda tetikleniyordu → 30-90
+        # aralığında tek sürükleme ~60 ayrı TCP servo komutu üretiyor, komut kuyruğu
+        # (maxsize=10) taşıyor, komutlar düşüyor ve abort/drop gibi kritik komutlar
+        # aynı öncelik sınıfında sırada bekliyordu. Komut artık YALNIZCA sürükleme
+        # bittiğinde (sliderReleased) tek sefer gönderilir.
+        self.gimbal_slider.sliderReleased.connect(self._send_gimbal_cmd)
+        # Klavye/fare tekerleği ile değişimde sliderReleased tetiklenmez → 250 ms
+        # debounce ile tek komut gönderilir (sürükleme sırasında bastırılır).
+        self._gimbal_debounce = QTimer(self)
+        self._gimbal_debounce.setSingleShot(True)
+        self._gimbal_debounce.setInterval(250)
+        self._gimbal_debounce.timeout.connect(self._send_gimbal_cmd)
+        self.gimbal_slider.valueChanged.connect(
+            lambda _v: self._gimbal_debounce.start()
+        )
         
         # Sizing Policies to prevent cramping
-        btn_height = 24
+        btn_height = 26   # dense grid buton yüksekliği ≥26 (şartname §3)
         for btn in [btn_drop_red_open, btn_drop_red_close, btn_drop_blue_open, btn_drop_blue_close, btn_grab_open, btn_grab_close]:
             btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             btn.setFixedHeight(btn_height)
@@ -1133,17 +1351,15 @@ class DashboardView(QWidget):
         
         cl.addWidget(servo_grp, stretch=0)
 
-        # Center paneli ile sağ panel arasındaki genişlik dengesini düzelt (siyah boşlukları gidermek için 3:4 oran)
+        # Kolon oranı: GÖREV İZLEME (PFD + video + yük paneli) haritadan belirgin
+        # şekilde geniş olmalı — operatör uçuşu buradan takip eder. Minimum genişlik
+        # şart: yalnız stretch vermek yetmez, harita sekmesi kendi boyut ipucuyla
+        # alanı geri kapabiliyor.
+        self._center_panel.setMinimumWidth(560)
         root.addWidget(self._center_panel, stretch=3)
 
         # ── Sağ panel (Sekmeli Premium Panel: Harita, ESC, Tespit Geçmişi, Sağlık & Görev Adımları) ────────────
-        right_tabs = QTabWidget()
-        right_tabs.setStyleSheet(
-            "QTabWidget::pane { border: 1px solid #2b2b35; background: #0c0c12; border-radius: 6px; }"
-            "QTabBar::tab { background: #141419; color: #8f90a6; font-weight: bold; font-size: 11px; padding: 6px 12px; border-top-left-radius: 4px; border-top-right-radius: 4px; border: 1px solid #2b2b35; border-bottom: none; margin-right: 2px; }"
-            "QTabBar::tab:selected { background: #0c0c12; color: #00e5ff; border-bottom: 2px solid #00e5ff; }"
-            "QTabBar::tab:hover { background: #222232; color: #fff; }"
-        )
+        right_tabs = QTabWidget()   # sekme stili global QSS'ten gelir (şartname §4)
 
         # 1. Harita Sekmesi
         map_tab = QWidget()
@@ -1167,12 +1383,12 @@ class DashboardView(QWidget):
         ai_lay.setContentsMargins(8, 8, 8, 8)
         
         lbl_ai_title = QLabel("Canlı Görüntü İşleme Hedef Algılama Kaydı")
-        lbl_ai_title.setStyleSheet("color:#00e5ff; font-weight:bold; font-size:11px; border:none; background:none;")
+        lbl_ai_title.setObjectName("sectionTitle")
         ai_lay.addWidget(lbl_ai_title)
-        
+
         self._ai_scroll = QScrollArea()
         self._ai_scroll.setWidgetResizable(True)
-        self._ai_scroll.setStyleSheet("background-color:#0d0d16; border:1px solid #2a2a35; border-radius:4px;")
+        self._ai_scroll.setObjectName("cardFrame")   # bare stylesheet yerine QSS class
         
         self._ai_container = QWidget()
         self._ai_container_lay = QVBoxLayout(self._ai_container)
@@ -1191,40 +1407,42 @@ class DashboardView(QWidget):
         hw_lay.setSpacing(10)
         
         lbl_hw_title = QLabel("Sistem Sağlığı & Sinyal Kalitesi")
-        lbl_hw_title.setStyleSheet("color:#00e5ff; font-weight:bold; font-size:11px; border:none; background:none;")
+        lbl_hw_title.setObjectName("sectionTitle")
         hw_lay.addWidget(lbl_hw_title)
         
         # Telemetry ve Ping Grubu
-        net_grp = QGroupBox("Kablosuz Bağlantı Kalitesi")
-        net_grp.setStyleSheet("color:#3daee9; font-weight:bold; border:1px solid #2a2a35; background-color:#14141d;")
+        net_grp = QGroupBox("Kablosuz Bağlantı Kalitesi")   # stil: global QSS
         net_lay = QFormLayout(net_grp)
         net_lay.setContentsMargins(8, 12, 8, 8)
         net_lay.setVerticalSpacing(8)
         
+        # NEDEN: Bu göstergeler önceden sahte başlangıç değerleriyle (98/92/35/42/44)
+        # açılıyordu; hiçbir veri gelmemişken bile YKİ "%92 sinyal gücü", "44°C" gibi
+        # gerçek görünen ama tamamen uydurma bilgiler gösteriyordu (bağlı olmayan
+        # sistemde tehlikeli yanlış güven). Hepsi 0 ile başlar ve ilk GERÇEK veri
+        # gelene kadar "—" (veri yok) yazar.
+        # NOT: Çubuk gövdesi (zemin/kenar/yazı) artık global QSS'ten gelir;
+        # burada YALNIZCA anlamsal dolgu rengi (chunk) satır-içi verilir ve
+        # tema değişince _apply_theme_colors yeniden yazar.
         self._ping_bar = QProgressBar()
         self._ping_bar.setRange(0, 100)
-        self._ping_bar.setValue(98)
-        self._ping_bar.setFormat("%v ms")
-        self._ping_bar.setStyleSheet("QProgressBar { background-color:#1a1a24; border:1px solid #2a2a35; border-radius:3px; text-align:center; color:#fff; font-weight:bold; height:18px; }"
-                                     "QProgressBar::chunk { background-color:#2e7d32; }")
-        
+        self._ping_bar.setValue(0)
+        self._ping_bar.setFormat("—")
+
         self._rssi_bar = QProgressBar()
         self._rssi_bar.setRange(0, 100)
-        self._rssi_bar.setValue(92)
-        self._rssi_bar.setFormat("%p%")
-        self._rssi_bar.setStyleSheet("QProgressBar { background-color:#1a1a24; border:1px solid #2a2a35; border-radius:3px; text-align:center; color:#fff; font-weight:bold; height:18px; }"
-                                     "QProgressBar::chunk { background-color:#3daee9; }")
-        
+        self._rssi_bar.setValue(0)
+        self._rssi_bar.setFormat("—")
+
         self._loss_bar = QProgressBar()
         self._loss_bar.setRange(0, 100)
         self._loss_bar.setValue(0)
-        self._loss_bar.setFormat("%v%")
-        self._loss_bar.setStyleSheet("QProgressBar { background-color:#1a1a24; border:1px solid #2a2a35; border-radius:3px; text-align:center; color:#fff; font-weight:bold; height:18px; }"
-                                     "QProgressBar::chunk { background-color:#c62828; }")
-                                     
-        lbl_p = QLabel("Gecikme (Ping):"); lbl_p.setStyleSheet("color:#aaa; border:none; background:none;")
-        lbl_r = QLabel("Sinyal Gücü (RSSI):"); lbl_r.setStyleSheet("color:#aaa; border:none; background:none;")
-        lbl_l = QLabel("Paket Kaybı:"); lbl_l.setStyleSheet("color:#aaa; border:none; background:none;")
+        self._loss_bar.setFormat("—")   # veri gelene kadar "0%" da yanıltıcı
+
+
+        lbl_p = QLabel("Gecikme (Ping):"); lbl_p.setObjectName("mutedLabel")
+        lbl_r = QLabel("Sinyal Gücü (RSSI):"); lbl_r.setObjectName("mutedLabel")
+        lbl_l = QLabel("Paket Kaybı:"); lbl_l.setObjectName("mutedLabel")
         
         net_lay.addRow(lbl_p, self._ping_bar)
         net_lay.addRow(lbl_r, self._rssi_bar)
@@ -1232,34 +1450,42 @@ class DashboardView(QWidget):
         hw_lay.addWidget(net_grp)
         
         # Donanım Kaynak Grubu
-        rpi_grp = QGroupBox("Yardımcı Bilgisayar (RPi 4)")
-        rpi_grp.setStyleSheet("color:#10b981; font-weight:bold; border:1px solid #2a2a35; background-color:#14141d;")
+        rpi_grp = QGroupBox("Yardımcı Bilgisayar (RPi 4)")   # stil: global QSS
         rpi_lay = QFormLayout(rpi_grp)
         rpi_lay.setContentsMargins(8, 12, 8, 8)
         rpi_lay.setVerticalSpacing(8)
         
+        # NEDEN: sahte başlangıç değerleri kaldırıldı (bkz. yukarıdaki not) —
+        # companion bağlı değilken CPU/RAM/sıcaklık uydurulmaz.
         self._cpu_bar = QProgressBar()
         self._cpu_bar.setRange(0, 100)
-        self._cpu_bar.setValue(35)
-        self._cpu_bar.setStyleSheet("QProgressBar { background-color:#1a1a24; border:1px solid #2a2a35; border-radius:3px; text-align:center; color:#fff; font-weight:bold; height:18px; }"
-                                    "QProgressBar::chunk { background-color:#10b981; }")
-                                    
+        self._cpu_bar.setValue(0)
+        self._cpu_bar.setFormat("—")
+
         self._ram_bar = QProgressBar()
         self._ram_bar.setRange(0, 100)
-        self._ram_bar.setValue(42)
-        self._ram_bar.setStyleSheet("QProgressBar { background-color:#1a1a24; border:1px solid #2a2a35; border-radius:3px; text-align:center; color:#fff; font-weight:bold; height:18px; }"
-                                    "QProgressBar::chunk { background-color:#10b981; }")
-                                    
+        self._ram_bar.setValue(0)
+        self._ram_bar.setFormat("—")
+
         self._temp_bar = QProgressBar()
         self._temp_bar.setRange(0, 100)
-        self._temp_bar.setValue(44)
-        self._temp_bar.setFormat("%v°C")
-        self._temp_bar.setStyleSheet("QProgressBar { background-color:#1a1a24; border:1px solid #2a2a35; border-radius:3px; text-align:center; color:#fff; font-weight:bold; height:18px; }"
-                                     "QProgressBar::chunk { background-color:#f57c00; }")
-                                     
-        lbl_c = QLabel("CPU Kullanımı:"); lbl_c.setStyleSheet("color:#aaa; border:none; background:none;")
-        lbl_rm = QLabel("RAM Kullanımı:"); lbl_rm.setStyleSheet("color:#aaa; border:none; background:none;")
-        lbl_t = QLabel("İşlemci Sıcaklığı:"); lbl_t.setStyleSheet("color:#aaa; border:none; background:none;")
+        self._temp_bar.setValue(0)
+        self._temp_bar.setFormat("—")
+
+        # (çubuk, anlam token'ı) — tema değişiminde topluca yeniden uygulanır
+        self._health_bars = [
+            (self._ping_bar, "success"),
+            (self._rssi_bar, "info"),
+            (self._loss_bar, "danger"),
+            (self._cpu_bar,  "success"),
+            (self._ram_bar,  "success"),
+            (self._temp_bar, "warning"),
+        ]
+        self._apply_health_bar_colors()
+
+        lbl_c = QLabel("CPU Kullanımı:"); lbl_c.setObjectName("mutedLabel")
+        lbl_rm = QLabel("RAM Kullanımı:"); lbl_rm.setObjectName("mutedLabel")
+        lbl_t = QLabel("İşlemci Sıcaklığı:"); lbl_t.setObjectName("mutedLabel")
         
         rpi_lay.addRow(lbl_c, self._cpu_bar)
         rpi_lay.addRow(lbl_rm, self._ram_bar)
@@ -1276,7 +1502,7 @@ class DashboardView(QWidget):
         road_lay.setSpacing(10)
         
         lbl_road_title = QLabel("Canlı Görev Yol Haritası")
-        lbl_road_title.setStyleSheet("color:#00e5ff; font-weight:bold; font-size:11px; border:none; background:none;")
+        lbl_road_title.setObjectName("sectionTitle")
         road_lay.addWidget(lbl_road_title)
         
         # Yol haritası adımları
@@ -1294,25 +1520,25 @@ class DashboardView(QWidget):
         for idx, (name, desc) in enumerate(steps_data):
             step_box = QFrame()
             step_box.setFixedHeight(48)
-            step_box.setStyleSheet("background-color:#14141d; border:1px solid #22222d; border-radius:4px;")
-            
+            # Bare stylesheet yerine QSS class (şartname §5); durum renkleri
+            # çalışma anında ID-kapsamlı stylesheet ile güncellenir.
+            step_box.setObjectName("panelFrame")
+
             s_lay = QHBoxLayout(step_box)
             s_lay.setContentsMargins(10, 4, 10, 4)
             s_lay.setSpacing(10)
-            
-            # State indicator (Tick or dot)
+
+            # State indicator (Tick or dot) — renkler _apply_roadmap_styles'ta
             lbl_indicator = QLabel("-")
-            lbl_indicator.setStyleSheet("font-size:12px; border:none; background:none;")
-            
+
             # Step Text
             t_box = QVBoxLayout()
             t_box.setSpacing(1)
-            
+
             lbl_name = QLabel(f"{idx+1}. {name}")
-            lbl_name.setStyleSheet("color:#aaa; font-weight:bold; font-size:11px; border:none; background:none;")
             lbl_desc = QLabel(desc)
-            lbl_desc.setStyleSheet("color:#666; font-size:9px; border:none; background:none;")
-            
+
+
             t_box.addWidget(lbl_name)
             t_box.addWidget(lbl_desc)
             
@@ -1322,12 +1548,43 @@ class DashboardView(QWidget):
             
             road_lay.addWidget(step_box)
             self._road_steps.append((step_box, lbl_indicator, lbl_name, lbl_desc))
-            
+
+        # Başlangıç görünümü: tüm adımlar "bekliyor"
+        self._apply_roadmap_styles(["pending"] * len(steps_data))
+
         road_lay.addStretch()
         right_tabs.addTab(road_tab, "Adımlar")
 
-        # Sağ panelin genişliği korunarak orta panel dengesi sürdürülür
-        root.addWidget(right_tabs, stretch=4)
+        # Harita/yan sekmeler: okunur kalsın ama görev izleme alanını yutmasın.
+        # Üst sınır olmadan QWebEngineView'in boyut ipucu tüm artan alanı çekiyordu.
+        right_tabs.setMinimumWidth(340)
+        right_tabs.setMaximumWidth(760)
+        root.addWidget(right_tabs, stretch=2)
+
+    # ── Sağlık göstergeleri: "veri yok" → gerçek değer geçişi ──────────────
+    def _hw_set(self, bar, key: str, value: int, fmt: str) -> None:
+        """Sağlık çubuğuna GERÇEK veri yaz; ilk veride "—" formatını asıl formatla
+        değiştirir. NEDEN: veri gelmeden sahte/uydurma değer gösterilmemeli."""
+        if not self._hw_seen.get(key, False):
+            self._hw_seen[key] = True
+            bar.setFormat(fmt)
+        bar.setValue(int(value))
+
+    # ── Gimbal komutu (debounce'lu) ────────────────────────────────────────
+    def _send_gimbal_cmd(self) -> None:
+        """Gimbal açısını TEK komut olarak gönderir.
+
+        NEDEN: Sürükleme sırasında komut gönderilmez (kuyruk taşmasını ve kritik
+        komutların düşmesini engeller); yalnızca bırakıldığında veya klavye/tekerlek
+        değişiminden 250 ms sonra tek komut gider."""
+        if self.gimbal_slider.isSliderDown():
+            return   # hâlâ sürükleniyor — sliderReleased'de gönderilecek
+        self._gimbal_debounce.stop()
+        val = int(self.gimbal_slider.value())
+        if val == self._last_gimbal_sent:
+            return   # aynı açı — gereksiz komut yok
+        self._last_gimbal_sent = val
+        self.send_servo_action.emit("gimbal", "", val)
 
     # ── MAVLink komutlari ──────────────────────────────────────────────────
     def _arm(self, arm: bool) -> None:
@@ -1372,12 +1629,9 @@ class DashboardView(QWidget):
     ]
 
     def _open_mode_menu(self) -> None:
+        # NOT: Yerel QMenu stili SİLİNDİ — global QSS zaten aynı görünümü
+        # (overlay zemin + accent seçim) tema uyumlu olarak veriyor.
         menu = QMenu(self)
-        menu.setStyleSheet(
-            "QMenu{background:#0d0d1e;color:#e0e0e0;border:1px solid #0f3460;}"
-            "QMenu::item{padding:6px 18px;}"
-            "QMenu::item:selected{background:#1a1a5e;color:#00e5ff;}"
-        )
         for mode_id, mode_name in self._ALL_MODES:
             act = menu.addAction(mode_name)
             if act is not None:
@@ -1431,11 +1685,13 @@ class DashboardView(QWidget):
                 if rssi_raw == 255:
                     self._rssi_bar.setValue(0)   # RC sinyali yok (ör. tezgâhta verici kapalı)
                 else:
-                    self._rssi_bar.setValue(int(max(0, min(100, rssi_raw / 254.0 * 100))))
+                    self._hw_set(self._rssi_bar, "rssi",
+                                 max(0, min(100, rssi_raw / 254.0 * 100)), "%p%")
             # Paket Kaybı — FC'nin bildirdiği GERÇEK haberleşme düşme oranı (% = c%/100)
             drop = data.get("drop_rate_comm")
             if drop is not None:
-                self._loss_bar.setValue(int(max(0, min(100, drop / 100.0))))
+                self._hw_set(self._loss_bar, "loss",
+                             max(0, min(100, drop / 100.0)), "%v%")
         except Exception:
             pass
 
@@ -1458,30 +1714,43 @@ class DashboardView(QWidget):
         self._last_detection_time = QDateTime.currentDateTime()
         ts = self._last_detection_time.toString("hh:mm:ss")
         
-        # Renk kodlaması (Kırmızı/Mavi)
-        accent_color = "#e24c4c" if "red" in label.lower() or "kirmizi" in label.lower() else "#3daee9" if "blue" in label.lower() or "mavi" in label.lower() else "#ffaa00"
-        
+        # Renk kodlaması (Kırmızı/Mavi) — tema token'ı olarak saklanır
+        low = label.lower()
+        if "red" in low or "kirmizi" in low:
+            accent_token = "danger"
+        elif "blue" in low or "mavi" in low:
+            accent_token = "info"
+        else:
+            accent_token = "warning"
+
         card = QFrame()
         card.setFixedHeight(62)
-        card.setStyleSheet(f"background-color:#1e1e2d; border:1px solid #2a2a3f; border-left: 4px solid {accent_color}; border-radius:4px;")
-        
+        # ID-kapsamlı stil: bare stylesheet çocuk label'lara yayılmasın (şartname §5).
+        # Sol kenar accent rengi tespit sınıfına göre çalışma anında belirlenir.
+        card.setObjectName("detCard")
+        # Token kartla birlikte saklanır — tema değişince aynı anlamla yeniden boyanır
+        card._accent_token = accent_token   # type: ignore[attr-defined]
+        card.setStyleSheet(self._det_card_css(accent_token))
+
         clay = QVBoxLayout(card)
         clay.setContentsMargins(8, 4, 8, 4)
         clay.setSpacing(2)
-        
+
         # Üst Satır: Başlık ve Zaman
         r1 = QHBoxLayout()
         lbl_head = QLabel(f"{label.upper()} (%{conf:.0f})")
-        lbl_head.setStyleSheet("color:#ffffff; font-weight:bold; font-size:11px; border:none; background:none;")
+        # Rengi QSS'ten (varsayılan metin) — burada yalnız yazı tipi ayarı
+        lbl_head.setStyleSheet("font-weight:bold;font-size:11px;")
         lbl_ts = QLabel(ts)
-        lbl_ts.setStyleSheet("color:#777; font-size:10px; border:none; background:none;")
+        lbl_ts.setObjectName("mutedLabel")
         r1.addWidget(lbl_head)
         r1.addStretch()
         r1.addWidget(lbl_ts)
-        
-        # Alt Satır: Koordinatlar
+
+        # Alt Satır: Koordinatlar (renk mutedLabel class'ından, yazı tipi mono)
         lbl_coord = QLabel(f"Enlem: {lat:.6f} | Boylam: {lon:.6f}")
-        lbl_coord.setStyleSheet("color:#aaa; font-family:'Courier New'; font-size:10px; border:none; background:none;")
+        lbl_coord.setObjectName("mutedLabel")
+        lbl_coord.setStyleSheet("font-family:'Courier New';")
         
         clay.addLayout(r1)
         clay.addWidget(lbl_coord)
@@ -1489,11 +1758,29 @@ class DashboardView(QWidget):
         # Kartı en üste ekle (spacer'ın hemen önüne)
         self._ai_container_lay.insertWidget(self._ai_container_lay.count() - 1, card)
 
+        # NEDEN: Önceden her tespitte yeni QFrame + 3 QLabel yaratılıyor ve HİÇ
+        # silinmiyordu → uzun görevde yüzlerce/binlerce widget birikip bellek ve
+        # layout maliyetini sürekli artırıyordu. Son _MAX_AI_CARDS kart tutulur,
+        # fazlası layout'tan çıkarılıp deleteLater() ile yok edilir.
+        self._ai_cards.append(card)
+        while len(self._ai_cards) > self._MAX_AI_CARDS:
+            old = self._ai_cards.pop(0)   # en eski kart
+            try:
+                self._ai_container_lay.removeWidget(old)
+                old.setParent(None)
+                old.deleteLater()
+            except Exception:
+                pass
+
     def update_mission_roadmap(self, data: dict) -> None:
         """Telemetri durumuna göre görev adımlarını canlı olarak günceller."""
         is_armed = data.get("armed", False)
         alt = data.get("alt", 0.0)
-        mode = data.get("mode", "STABILIZE")
+        # NEDEN: Gerçek MavlinkWorker telemetride "flight_mode" anahtarını üretiyor;
+        # burada yalnızca "mode" okunduğu için mod her zaman varsayılan kalıyordu ve
+        # RTL/LAND koşulu hiç sağlanmıyordu → yol haritasının 6. ve 7. adımı hiç
+        # aktifleşmiyordu. İki anahtar da desteklenir.
+        mode = data.get("flight_mode", data.get("mode", "")) or ""
         wp_idx = data.get("wp_index", 0)
         
         # Uçuş aşamalarını analiz et
@@ -1521,8 +1808,8 @@ class DashboardView(QWidget):
             statuses[3] = "completed"
             statuses[4] = "active"
             
-        # Eğer mod RTL veya LAND ise görevin son adımı
-        if mode in ["RTL", "LAND"]:
+        # Eğer mod RTL / SMART_RTL / LAND ise görevin son adımı
+        if mode in ("RTL", "SMART_RTL", "LAND"):
             statuses[0] = "completed"
             statuses[1] = "completed"
             statuses[2] = "completed"
@@ -1533,40 +1820,60 @@ class DashboardView(QWidget):
             if alt < 0.3 and not is_armed:
                 statuses[6] = "completed"
                 
-        # UI Elemanlarını Güncelle
+        # NEDEN: update_telemetry ~15 Hz çağrılıyor ve bu döngü her seferinde
+        # 7 adım × 4 setStyleSheet = 28 stylesheet parse + yeniden stil hesabı
+        # yapıyordu (sürekli CPU yükü, görsel değişiklik olmasa bile). Durum
+        # listesi bir öncekiyle aynıysa hiçbir şey yapmaya gerek yok.
+        if statuses == self._last_roadmap_statuses:
+            return
+        self._last_roadmap_statuses = list(statuses)
+        self._apply_roadmap_styles(statuses)
+
+    def _apply_roadmap_styles(self, statuses: list) -> None:
+        """Adım kutularını verilen durum listesine göre boyar.
+
+        Ayrı metot: hem canlı güncellemede hem de tema değişiminde (son bilinen
+        durumla) çağrılır — tüm renkler tema token'larından okunur."""
         for idx, (step_box, lbl_indicator, lbl_name, lbl_desc) in enumerate(self._road_steps):
-            stat = statuses[idx]
+            stat = statuses[idx] if idx < len(statuses) else "pending"
             if stat == "completed":
                 lbl_indicator.setText("✓")
-                lbl_indicator.setStyleSheet("color:#10b981; font-weight:bold; font-size:12px; border:none; background:none;")
-                lbl_name.setStyleSheet("color:#10b981; font-weight:bold; font-size:11px; border:none; background:none;")
-                lbl_desc.setStyleSheet("color:#4e8869; font-size:9px; border:none; background:none;")
-                step_box.setStyleSheet("background-color:#0b1e15; border:1px solid #10b981; border-radius:4px;")
+                lbl_indicator.setStyleSheet(
+                    f"color:{theme.c('success')};font-weight:bold;font-size:12px;")
+                lbl_name.setStyleSheet(
+                    f"color:{theme.c('success')};font-weight:bold;font-size:11px;")
+                lbl_desc.setStyleSheet(f"color:{theme.c('text_muted')};font-size:10px;")
+                step_box.setStyleSheet(self._step_box_css("success_bg", "success"))
             elif stat == "active":
                 lbl_indicator.setText("▶")
-                lbl_indicator.setStyleSheet("color:#00e5ff; font-weight:bold; font-size:12px; border:none; background:none;")
-                lbl_name.setStyleSheet("color:#ffffff; font-weight:bold; font-size:11px; border:none; background:none;")
-                lbl_desc.setStyleSheet("color:#00e5ff; font-size:9px; border:none; background:none;")
-                step_box.setStyleSheet("background-color:#0d1e26; border:1px solid #00e5ff; border-radius:4px;")
+                lbl_indicator.setStyleSheet(
+                    f"color:{theme.c('accent')};font-weight:bold;font-size:12px;")
+                lbl_name.setStyleSheet(
+                    f"color:{theme.c('text')};font-weight:bold;font-size:11px;")
+                lbl_desc.setStyleSheet(f"color:{theme.c('accent')};font-size:10px;")
+                step_box.setStyleSheet(self._step_box_css("accent_soft", "accent"))
             else:
                 lbl_indicator.setText("-")
-                lbl_indicator.setStyleSheet("color:#555; border:none; background:none;")
-                lbl_name.setStyleSheet("color:#aaa; font-weight:bold; font-size:11px; border:none; background:none;")
-                lbl_desc.setStyleSheet("color:#666; font-size:9px; border:none; background:none;")
-                step_box.setStyleSheet("background-color:#14141d; border:1px solid #22222d; border-radius:4px;")
+                lbl_indicator.setStyleSheet(
+                    f"color:{theme.c('idle')};font-size:12px;")
+                lbl_name.setStyleSheet(
+                    f"color:{theme.c('text_muted')};font-weight:bold;font-size:11px;")
+                lbl_desc.setStyleSheet(f"color:{theme.c('text_disabled')};font-size:10px;")
+                step_box.setStyleSheet(self._step_box_css("panel", "border"))
 
     @pyqtSlot(str, int)
     def add_status_message(self, text: str, severity: int) -> None:
+        # Önem derecesi → tema token'ı (renk çalışma anında theme.c ile çözülür)
         _C = {
-            0: "#ff4444", 1: "#ff4444", 2: "#ff4444",
-            3: "#ff8800", 4: "#ffbb00", 5: "#e0e0e0",
-            6: "#4ade80", 7: "#888888",
+            0: "danger", 1: "danger", 2: "danger",
+            3: "warning", 4: "warning", 5: "text",
+            6: "success", 7: "text_muted",
         }
         _N = {
             0: "EMRG", 1: "ALRT", 2: "CRIT", 3: "ERR ",
             4: "WARN", 5: "NOTE", 6: "INFO", 7: "DBG ",
         }
-        col = _C.get(severity, "#e0e0e0")
+        col = theme.c(_C.get(severity, "text"))
         nm  = _N.get(severity, "MSG ")
         self._msg_log.append(f'<span style="color:{col}">[{nm}] {text}</span>')
         sb = self._msg_log.verticalScrollBar()
@@ -1578,7 +1885,8 @@ class DashboardView(QWidget):
         """RPi companion'dan gelen görev mesajlarını siyan renkte gösterir."""
         from PyQt6.QtCore import QDateTime
         ts = QDateTime.currentDateTime().toString("hh:mm:ss")
-        self._rpi_msg_log.append(f'<span style="color:#00e5ff">[{ts}] {text}</span>')
+        self._rpi_msg_log.append(
+            f'<span style="color:{theme.c("accent")}">[{ts}] {text}</span>')
         sb = self._rpi_msg_log.verticalScrollBar()
         if sb is not None:
             sb.setValue(sb.maximum())
@@ -1587,6 +1895,8 @@ class DashboardView(QWidget):
     def update_rpi_status(self, data: dict) -> None:
         """Companion durum JSON'undan İHA canlı durumunu görselleştir:
         TOF mesafeleri (TofWidget), hedef tespit, yük, servo durumları."""
+        # Tema değişiminde aynı veriyle yeniden kurulabilsin diye saklanır
+        self._last_rpi_status = data
         # ── Sağlık paneli: GERÇEK companion sistem metrikleri (psutil, 5602) ──
         # cpu_pct/mem_pct/temp_c companion status_server._sys_stats()'tan gelir.
         # ping_ms RpiStatusWorker'ın LAN RTT ölçümünden eklenir.
@@ -1595,14 +1905,15 @@ class DashboardView(QWidget):
             mem = data.get("mem_pct")
             tmp = data.get("temp_c")
             png = data.get("ping_ms")
+            # NEDEN: ilk gerçek veride "—" formatı asıl formatla değiştirilir
             if cpu is not None:
-                self._cpu_bar.setValue(int(max(0, min(100, round(cpu)))))
+                self._hw_set(self._cpu_bar, "cpu", max(0, min(100, round(cpu))), "%p%")
             if mem is not None:
-                self._ram_bar.setValue(int(max(0, min(100, round(mem)))))
+                self._hw_set(self._ram_bar, "ram", max(0, min(100, round(mem))), "%p%")
             if tmp is not None:
-                self._temp_bar.setValue(int(max(0, min(120, round(tmp)))))
+                self._hw_set(self._temp_bar, "temp", max(0, min(120, round(tmp))), "%v°C")
             if png is not None:
-                self._ping_bar.setValue(int(max(0, min(100, round(png)))))
+                self._hw_set(self._ping_bar, "ping", max(0, min(100, round(png))), "%v ms")
         except Exception:
             pass
 
@@ -1619,12 +1930,19 @@ class DashboardView(QWidget):
         servo   = data.get("servo_state", {}) or {}
         payload = data.get("payload_loaded", False)
 
+        # Durum metinleri DİNAMİK renklidir → tema token'ları çalışma anında okunur
+        c_ok    = theme.c("success")
+        c_dim   = theme.c("text_muted")
+        c_faint = theme.c("text_disabled")
+        c_bad   = theme.c("danger")
+        c_warn  = theme.c("warning")
+
         detected = bool(vis.get("target_detected", False))
         cam_ok   = bool(vis.get("connected", False))
         det_txt  = "🎯 HEDEF VAR"   if detected else "hedef yok"
-        det_col  = "#10b981"        if detected else "#888"
-        cam_txt  = "kamera ✓"       if cam_ok   else "<span style='color:#ef4444'>kamera ✗</span>"
-        pl_txt   = ("<span style='color:#f59e0b'>YÜK VAR</span>" if payload else "yük yok")
+        det_col  = c_ok             if detected else c_dim
+        cam_txt  = "kamera ✓"       if cam_ok   else f"<span style='color:{c_bad}'>kamera ✗</span>"
+        pl_txt   = (f"<span style='color:{c_warn}'>YÜK VAR</span>" if payload else "yük yok")
 
         def _s(v):
             return "—" if v is None else str(v)
@@ -1637,9 +1955,9 @@ class DashboardView(QWidget):
         fc = data.get("fc_mission") or {}
         fc_line = ""
         if fc:
-            fc_line = (f"<br><span style='color:#aaa'>FC görevi:</span> "
+            fc_line = (f"<br><span style='color:{c_dim}'>FC görevi:</span> "
                        f"{fc.get('type','?')} {fc.get('wp_count','?')} WP "
-                       f"<span style='color:#888'>({fc.get('source','?')})</span>")
+                       f"<span style='color:{c_faint}'>({fc.get('source','?')})</span>")
 
         # ── Companion MAVLink görüşü (E6) — çapraz kontrol / radyo-kopuk fallback ──
         mav = data.get("mav", {}) or {}
@@ -1648,19 +1966,19 @@ class DashboardView(QWidget):
             batt = mav.get("battery", {}) or {}
             bv = batt.get("v")
             armed = mav.get("armed")
-            arm_txt = ("<span style='color:#ef4444'>ARMED</span>" if armed
+            arm_txt = (f"<span style='color:{c_bad}'>ARMED</span>" if armed
                        else "DISARM")
-            mav_line = (f"<br><span style='color:#666'>İHA(companion): "
+            mav_line = (f"<br><span style='color:{c_faint}'>İHA(companion): "
                         f"{mav.get('mode','?')} {arm_txt} "
                         f"{('%.1fV' % bv) if isinstance(bv,(int,float)) else ''}</span>")
 
         self._iha_status_lbl.setText(
             f"<b style='color:{det_col}'>{det_txt}</b> &nbsp;|&nbsp; {cam_txt} "
             f"&nbsp;|&nbsp; {pl_txt}<br>"
-            f"<span style='color:#aaa'>Gimbal:</span>{gim}° "
-            f"<span style='color:#aaa'>Grab:</span>{grab} "
-            f"<span style='color:#aaa'>Kırmızı:</span>{rdr} "
-            f"<span style='color:#aaa'>Mavi:</span>{bdr}"
+            f"<span style='color:{c_dim}'>Gimbal:</span>{gim}° "
+            f"<span style='color:{c_dim}'>Grab:</span>{grab} "
+            f"<span style='color:{c_dim}'>Kırmızı:</span>{rdr} "
+            f"<span style='color:{c_dim}'>Mavi:</span>{bdr}"
             f"{fc_line}{mav_line}"
         )
 
@@ -1673,20 +1991,18 @@ class DashboardView(QWidget):
             
         px = QPixmap.fromImage(q_img)
 
-        # Orta paneli video en-boy oranına göre ayarla — ama YALNIZCA oran DEĞİŞİNCE.
-        # ÖNCEDEN her karede ideal_w = label.height()*aspect hesaplanıyordu; label
-        # yüksekliği layout'tan etkilendiği için bu, video fps'inde sürekli relayout
-        # (ve salınım) tetikliyordu. Video çözünürlüğü akış boyunca sabit → oran sabit →
-        # tek sefer ayarla, sonra dokunma.
-        h = self._video_label.height()
-        if h > 0 and q_img.height() > 0:
-            aspect = round(q_img.width() / q_img.height(), 3)
-            if aspect != getattr(self, "_last_video_aspect", None):
-                self._last_video_aspect = aspect
-                self._video_label.setMinimumWidth(0)
-                self._video_label.setMaximumWidth(16777215)
-                self._center_panel.setFixedWidth(int(h * aspect))
-                
+        # NOT: Burada ÖNCEDEN `self._center_panel.setFixedWidth(h * aspect)` vardı —
+        # orta panel video en-boy oranına göre SABİTLENİYORDU. Bunun iki kötü etkisi
+        # oldu: (a) root layout'taki stretch oranları tamamen etkisiz kaldı, çünkü
+        # sabit genişlikli widget stretch'e katılmaz; (b) kalan tüm yatay alanı sağdaki
+        # harita sekmesi yuttu (1920px ekranda orta ~275px, harita ~1205px ölçüldü) —
+        # görev izleme alanı okunamayacak kadar küçülüyordu.
+        # Videonun oranı zaten aşağıda KeepAspectRatio ile korunuyor, dolayısıyla
+        # paneli sabitlemeye GEREK YOK. Oran bilgisi yalnızca bilgi amaçlı saklanır.
+        if q_img.height() > 0:
+            self._last_video_aspect = round(q_img.width() / q_img.height(), 3)
+
+
         # Scale with KeepAspectRatio to be safe, but since parent width is matched, there will be no black bars!
         self._video_label.setPixmap(
             px.scaled(

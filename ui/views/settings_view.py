@@ -5,36 +5,36 @@ Tüm IP/port değerleri burada düzenlenir ve settings.json'a kaydedilir.
 Kaydet butonuna basınca workers yeniden yapılandırılır.
 """
 import logging
-from PyQt6.QtCore import pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import pyqtSignal, QObject, QEvent, Qt
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QSpinBox, QPushButton,
     QGroupBox, QFrame, QMessageBox,
+    QAbstractSpinBox, QComboBox,
 )
 
 from core.gcs_config import config, DEFAULTS
+from core import theme
 
 logger = logging.getLogger(__name__)
 
-_LABEL_STYLE = "color: #aaa; font-size: 12px;"
-_INPUT_STYLE = (
-    " color:#e0e0e0; border:1px solid #0f3460;"
-    "border-radius:4px; padding:4px 8px; font-size:12px;"
-)
-_BTN_SAVE = (
-    " color:white; font-weight:bold; padding:8px 24px;"
-    "border-radius:6px; font-size:13px;"
-)
-_BTN_RESET = (
-    " color:#aaa; padding:8px 16px;"
-    "border-radius:6px; font-size:12px;"
-)
-_GROUP_STYLE = (
-    "QGroupBox { color:#4ade80; font-weight:bold; font-size:13px;"
-    "border:1px solid #0f3460; border-radius:6px; margin-top:8px; padding:12px; }"
-    "QGroupBox::title { subcontrol-origin:margin; left:10px; padding:0 4px; }"
-)
+
+# ── Fare Tekerleği Koruması ───────────────────────────────────────────────────
+# NEDEN: Ayar paneli tekerlekle kaydırılırken imlecin ALTINDAKİ QSpinBox
+# (port alanları) değeri SESSİZCE değişiyordu — operatör farkına varmadan
+# görev/durum/video/MAVLink portu bozuluyor ve bağlantı kopuyordu.
+# ÇÖZÜM: Widget odakta DEĞİLKEN tekerlek olayını yut (ignore + return True) →
+# olay üst widget'a (scroll alanı) gider, panel kayar ama değer değişmez.
+# StrongFocus: widget artık tekerlekle odak almaz, yalnızca tıklama/Tab ile.
+class _WheelGuard(QObject):
+    """Odakta OLMAYAN spin/combo widget'larında fare tekerleğini etkisizleştirir."""
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt API)
+        if event is not None and event.type() == QEvent.Type.Wheel:
+            if isinstance(obj, QWidget) and not obj.hasFocus():
+                event.ignore()   # kabul etme → olay üst widget'a (scroll) gider
+                return True      # widget'a teslim etme → değer değişmez
+        return super().eventFilter(obj, event)
 
 
 class SettingsView(QWidget):
@@ -45,31 +45,85 @@ class SettingsView(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._fields: dict[str, QLineEdit | QSpinBox] = {}
+        self._separators: list[QFrame] = []
+        self._wheel_guard = _WheelGuard(self)   # referans tutulmazsa GC'ye gider
         self._build_ui()
+        self._install_wheel_guards()
         self._load_current()
+        theme.notifier().changed.connect(lambda _n: self._apply_theme_colors())
+
+    def _install_wheel_guards(self) -> None:
+        """Paneldeki tüm spin/combo widget'larına tekerlek korumasını kurar.
+
+        NEDEN: Tek tek eklemek yerine tarayarak kuruyoruz; ileride eklenecek yeni
+        bir QSpinBox/QDoubleSpinBox/QComboBox da otomatik korunur.
+        """
+        for cls in (QAbstractSpinBox, QComboBox):   # QAbstractSpinBox = QSpinBox + QDoubleSpinBox
+            for wdg in self.findChildren(cls):
+                wdg.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+                wdg.installEventFilter(self._wheel_guard)
+
+    def _signal_connected(self, signal) -> bool:
+        """Sinyalin gerçekten bir slota bağlı olup olmadığını döndürür.
+
+        NEDEN: Bağlanmamış bir sinyale emit etmek sessizce hiçbir şey yapmaz.
+        Kullanıcıya "uygulandı" demeden ÖNCE komutun bir alıcıya gittiğini
+        doğruluyoruz (bu paneldeki "ölü kontrol" hatalarının kök nedeni buydu).
+        """
+        try:
+            return self.receivers(signal) > 0
+        except (TypeError, RuntimeError):
+            return True   # tespit edilemiyorsa akışı engelleme
 
     # ── UI ────────────────────────────────────────────────────────────
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(32, 24, 32, 24)
-        root.setSpacing(20)
+        root.setContentsMargins(16, 12, 16, 12)
+        root.setSpacing(12)
 
         title = QLabel("Bağlantı Ayarları")
-        title.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
-        title.setStyleSheet("color: white;")
+        title.setObjectName("pageTitle")
         root.addWidget(title)
 
-        sub = QLabel("Degisiklikler kaydedilince worker'lar yeniden yapilandirilir.")
-        sub.setStyleSheet("color: #888; font-size: 11px;")
+        # NEDEN (dürüstlük): Eski metin "worker'lar yeniden yapılandırılır" diyordu
+        # ama MAVLink adresi hiçbir worker'a uygulanmıyor (main_window sadece
+        # companion + video worker'larını tazeliyor). Metin kapsamı daraltıldı.
+        sub = QLabel("Companion ve video ayarları kaydedilince ANINDA uygulanır. "
+                     "MAVLink adresi için TopBar'dan yeniden bağlanmanız gerekir.")
+        sub.setObjectName("mutedLabel")
+        sub.setWordWrap(True)
         root.addWidget(sub)
 
         root.addWidget(self._separator())
 
+        # ── Görünüm / Tema ────────────────────────────────────────────
+        # Tema ANINDA uygulanır ve settings.json'a yazılır (Kaydet beklemez):
+        # kullanıcı seçimin sonucunu görerek karar verir.
+        appearance_grp = QGroupBox("Görünüm")
+        appearance_grp.setMaximumWidth(640)
+        appearance_lay = QGridLayout(appearance_grp)
+        appearance_lay.setSpacing(6)
+        appearance_lay.addWidget(QLabel("Tema:"), 0, 0)
+
+        self._theme_combo = QComboBox()
+        self._theme_combo.addItem("Koyu (Aviyonik)", theme.DARK)
+        self._theme_combo.addItem("Açık (Gündüz)", theme.LIGHT)
+        self._theme_combo.setMaximumWidth(220)
+        self._theme_combo.setToolTip(
+            "Açık tema güneş altında/aydınlık ortamda okunabilirlik için.\n"
+            "Seçim anında uygulanır ve kaydedilir."
+        )
+        self._theme_combo.currentIndexChanged.connect(self._on_theme_changed)
+        appearance_lay.addWidget(self._theme_combo, 0, 1)
+        appearance_lay.setColumnStretch(2, 1)
+
+        root.addWidget(appearance_grp)
+
         # ── Companion ─────────────────────────────────────────────────
         comp_grp = QGroupBox("Yardımcı Bilgisayar (Companion)")
-        comp_grp.setStyleSheet(_GROUP_STYLE)
+        comp_grp.setMaximumWidth(640)
         comp_layout = QGridLayout(comp_grp)
-        comp_layout.setSpacing(10)
+        comp_layout.setSpacing(6)
 
         self._add_field(comp_layout, 0, "IP Adresi",
                         "companion_host", is_spin=False,
@@ -85,9 +139,9 @@ class SettingsView(QWidget):
 
         # ── MAVLink ───────────────────────────────────────────────────
         mav_grp = QGroupBox("MAVLink Bağlantısı (SITL / FCU)")
-        mav_grp.setStyleSheet(_GROUP_STYLE)
+        mav_grp.setMaximumWidth(640)
         mav_layout = QGridLayout(mav_grp)
-        mav_layout.setSpacing(10)
+        mav_layout.setSpacing(6)
 
         self._add_field(mav_layout, 0, "Host / IP",
                         "mavlink_host", is_spin=False,
@@ -95,11 +149,33 @@ class SettingsView(QWidget):
         self._add_field(mav_layout, 1, "Port",
                         "mavlink_port", is_spin=True, spin_range=(1, 65535))
 
+        # NEDEN (ölü kontrol düzeltmesi): Bu iki alan settings.json'a yazılıyor
+        # ama çalışan MAVLink bağlantısına UYGULANMIYOR — main_window'un
+        # _on_settings_changed'i yalnızca companion adreslerini ve video URL'lerini
+        # tazeliyor; config.mavlink_address kod tabanında hiçbir yerden okunmuyor.
+        # TopBar'ın adres kutusu da bu değerle DOLDURULMUYOR. Kullanıcı "kaydettim,
+        # oldu" sanmasın diye gerçek davranış alanların yanında açıkça yazıyor.
+        mav_note = QLabel(
+            "ℹ️ Bu değerler yalnızca kayıt/referans içindir. Aktif MAVLink bağlantısını "
+            "DEĞİŞTİRMEZ.<br>Uygulamak için: TopBar'daki adres kutusuna "
+            "<b>tcp:host:port</b> yazıp <b>Bağlan</b>'a basın "
+            "(ya da uygulamayı yeniden başlatın)."
+        )
+        mav_note.setObjectName("warningText")
+        mav_note.setWordWrap(True)
+        mav_layout.addWidget(mav_note, 2, 0, 1, 3)
+
+        _mav_tip = ("Kaydedilir ancak çalışan bağlantıya uygulanmaz — "
+                    "TopBar'dan 'Bağlan' ile yeniden bağlanın.")
+        self._fields["mavlink_host"].setToolTip(_mav_tip)
+        self._fields["mavlink_port"].setToolTip(_mav_tip)
+
         root.addWidget(mav_grp)
 
         # ── Mevcut değerler önizleme ───────────────────────────────────
         self._preview = QLabel()
-        self._preview.setStyleSheet("color:#888; font-size:11px; font-family:monospace;")
+        self._preview.setObjectName("monoLabel")
+        self._preview.setStyleSheet(f"color:{theme.c('text_muted')};")
         self._preview.setWordWrap(True)
         root.addWidget(self._preview)
 
@@ -110,12 +186,12 @@ class SettingsView(QWidget):
         btn_row.addStretch()
 
         btn_reset = QPushButton("Varsayilanlara Sifirla")
-        btn_reset.setStyleSheet(_BTN_RESET)
         btn_reset.clicked.connect(self._on_reset)
         btn_row.addWidget(btn_reset)
 
         btn_save = QPushButton("Kaydet ve Uygula")
-        btn_save.setStyleSheet(_BTN_SAVE)
+        btn_save.setObjectName("primaryButton")
+        btn_save.setMinimumHeight(34)
         btn_save.clicked.connect(self._on_save)
         btn_row.addWidget(btn_save)
 
@@ -125,19 +201,16 @@ class SettingsView(QWidget):
                    key: str, is_spin: bool, placeholder: str = "",
                    spin_range: tuple = (1, 65535)) -> None:
         lbl = QLabel(label + ":")
-        lbl.setStyleSheet(_LABEL_STYLE)
         layout.addWidget(lbl, row, 0)
 
         if is_spin:
             widget = QSpinBox()
             widget.setRange(*spin_range)
-            widget.setStyleSheet(_INPUT_STYLE)
-            widget.setFixedWidth(120)
+            widget.setMaximumWidth(140)
         else:
             widget = QLineEdit()
             widget.setPlaceholderText(placeholder)
-            widget.setStyleSheet(_INPUT_STYLE)
-            widget.setFixedWidth(200)
+            widget.setMaximumWidth(200)
 
         layout.addWidget(widget, row, 1)
         layout.setColumnStretch(2, 1)
@@ -146,8 +219,25 @@ class SettingsView(QWidget):
     def _separator(self) -> QFrame:
         f = QFrame()
         f.setFrameShape(QFrame.Shape.HLine)
-        f.setStyleSheet("color: #0f3460;")
+        f.setStyleSheet(f"color:{theme.c('border')};")
+        self._separators.append(f)
         return f
+
+    # ── Tema ──────────────────────────────────────────────────────────
+    def _on_theme_changed(self, _index: int) -> None:
+        """Tema seçimi — anında uygula + kalıcı kaydet."""
+        name = self._theme_combo.currentData()
+        if not name or name == theme.current():
+            return
+        theme.set_theme(name)
+        config.set("ui_theme", name)
+        config.save()
+
+    def _apply_theme_colors(self) -> None:
+        """Tema değişince yeniden kurulması gereken inline renkler."""
+        self._preview.setStyleSheet(f"color:{theme.c('text_muted')};")
+        for sep in self._separators:
+            sep.setStyleSheet(f"color:{theme.c('border')};")
 
     # ── Değer yönetimi ────────────────────────────────────────────────
     def _load_current(self) -> None:
@@ -158,6 +248,12 @@ class SettingsView(QWidget):
                 widget.setValue(int(val) if val is not None else 0)
             else:
                 widget.setText(str(val) if val is not None else "")
+        # Tema kutusu _fields'te değil (anında uygulanır, Kaydet'e bağlı değil);
+        # sinyali susturarak yükle ki açılışta tema yeniden uygulanmasın.
+        self._theme_combo.blockSignals(True)
+        idx = self._theme_combo.findData(theme.current())
+        self._theme_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._theme_combo.blockSignals(False)
         self._update_preview()
 
     def _update_preview(self) -> None:
@@ -177,6 +273,46 @@ class SettingsView(QWidget):
         return result
 
     # ── Slotlar ───────────────────────────────────────────────────────
+    def _persist(self, vals: dict) -> bool:
+        """Değerleri settings.json'a yazar ve dinleyicilere duyurur.
+
+        NEDEN: Kaydetme yolu tek noktaya alındı; "Varsayılanlara Sıfırla" eskiden
+        yalnızca widget'ları dolduruyor, config.set/save ÇAĞIRMIYORDU → kullanıcı
+        sıfırlayıp uygulamayı kapatınca eski ayarlar geri geliyordu. Artık her iki
+        buton da aynı gerçek kaydetme yolunu kullanıyor.
+
+        Dönüş: settings_changed sinyalinin gerçekten bir alıcıya ulaşıp ulaşmadığı.
+        """
+        for key, value in vals.items():
+            config.set(key, value)
+        config.save()
+        self._update_preview()
+
+        delivered = self._signal_connected(self.settings_changed)
+        self.settings_changed.emit(vals)
+        if not delivered:
+            logger.warning("settings_changed hiçbir slota bağlı değil — "
+                           "worker'lar yeniden yapılandırılamadı.")
+        return delivered
+
+    def _applied_text(self, delivered: bool) -> str:
+        """Kaydetme sonrası DÜRÜST özet metni.
+
+        NEDEN: Eski metin "Bağlantı worker'ları yeniden yapılandırıldı" diyordu;
+        oysa MAVLink adresi hiçbir worker'a uygulanmıyor. Neyin anında geçerli
+        olduğu ile neyin yeniden bağlanma gerektirdiği ayrı ayrı yazılıyor.
+        """
+        if not delivered:
+            return ("Ayarlar dosyaya kaydedildi.\n\n"
+                    "⚠ Ancak ayar kanalı bağlı değil — çalışan worker'lar "
+                    "güncellenmedi. Değişikliklerin geçerli olması için "
+                    "uygulamayı yeniden başlatın.")
+        return ("Ayarlar kaydedildi.\n\n"
+                "• Companion (görev/durum) ve video worker'ları yeniden "
+                "yapılandırıldı — anında geçerli.\n"
+                "• MAVLink host/port UYGULANMADI: TopBar'dan 'Kes' → 'Bağlan' ile "
+                "yeniden bağlanın (ya da uygulamayı yeniden başlatın).")
+
     def _on_save(self) -> None:
         vals = self._collect()
 
@@ -188,32 +324,38 @@ class SettingsView(QWidget):
             QMessageBox.warning(self, "Hata", "MAVLink host bos birakilamaz.")
             return
 
-        for key, value in vals.items():
-            config.set(key, value)
-        config.save()
-
-        self._update_preview()
-        self.settings_changed.emit(vals)
+        delivered = self._persist(vals)
         logger.info("Ayarlar kaydedildi ve uygulanmaya gönderildi.")
 
-        QMessageBox.information(
-            self, "Kaydedildi",
-            "Ayarlar kaydedildi.\n"
-            "Bağlantı worker'lari yeniden yapılandırıldı."
-        )
+        QMessageBox.information(self, "Kaydedildi", self._applied_text(delivered))
 
     def _on_reset(self) -> None:
+        # NEDEN (ölü kontrol düzeltmesi): Onay metni "fabrika değerlerine dönecek"
+        # diyordu ama eski kod yalnızca widget'ları dolduruyordu — kayıt yok,
+        # sinyal yok. Artık gerçekten kaydediliyor; diyalog metni de bunu söylüyor.
         reply = QMessageBox.question(
             self, "Sifirla",
-            "Tüm ayarlar fabrika değerlerine dönecek. Emin misiniz?",
+            "Tüm ayarlar fabrika değerlerine dönecek ve HEMEN kaydedilecek.\n"
+            "Mevcut companion/MAVLink adresleriniz kaybolur. Emin misiniz?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
-        if reply == QMessageBox.StandardButton.Yes:
-            for key, widget in self._fields.items():
-                val = DEFAULTS[key]
-                if isinstance(widget, QSpinBox):
-                    widget.setValue(int(val))
-                else:
-                    widget.setText(str(val))
-            self._update_preview()
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        for key, widget in self._fields.items():
+            val = DEFAULTS[key]
+            if isinstance(widget, QSpinBox):
+                widget.setValue(int(val))
+            else:
+                widget.setText(str(val))
+
+        vals = self._collect()
+        delivered = self._persist(vals)
+        logger.info("Ayarlar varsayılanlara sıfırlandı ve kaydedildi.")
+
+        QMessageBox.information(
+            self, "Sıfırlandı",
+            "Ayarlar fabrika değerlerine döndürüldü ve kaydedildi.\n\n"
+            + self._applied_text(delivered)
+        )

@@ -93,10 +93,11 @@ def main() -> None:
     app.setFont(_ui_font)
     app.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
 
-    style_path = Path(__file__).parent / "assets" / "style.qss"
-    if style_path.exists():
-        with open(style_path, "r", encoding="utf-8") as f:
-            app.setStyleSheet(f.read())
+    # Tema (koyu/açık) — palet + QSS şablonu core/theme.py'de; kayıtlı seçim
+    # settings.json'daki ui_theme'den gelir, Ayarlar ekranından değiştirilir.
+    from core.gcs_config import config as _cfg
+    from core import theme
+    theme.apply(app, _cfg.ui_theme)
 
     # ── 2. SQLite Başlat ──────────────────────────────────────────────────────
     logger.info("SQLite başlatılıyor...")

@@ -7,11 +7,12 @@ import logging
 import os
 import time
 from PyQt6.QtCore import pyqtSignal, pyqtSlot, QTimer, Qt
-from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QWidget, QHBoxLayout, QLabel, QPushButton,
-    QProgressBar, QComboBox, QFrame,
+    QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton,
+    QProgressBar, QComboBox, QFrame, QSizePolicy,
 )
+
+from core import theme
 
 try:
     import serial.tools.list_ports as _list_ports
@@ -63,7 +64,9 @@ class TopBar(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(52)
+        # İki satırlı araç çubuğu — tüm kontroller kırpılmadan sığsın diye
+        # yükseklik 84px (şartname §4).
+        self.setFixedHeight(84)
         self._connected = False
         self._rpi_connected = False
         self._last_hb_secs: float = 0.0
@@ -75,7 +78,31 @@ class TopBar(QWidget):
         # ölçmesi gerekiyor — veri akmasa bile bu ilerlemeye devam eder.
         self._last_telemetry_wallclock: float = 0.0
         self._link_stale = False
-        self._base_style = "TopBar { background-color: #151b23; border-bottom: 1px solid #30363d; }"
+        # ── Acil kontrol (DURDUR/RTL, ŞİMDİ BIRAK) etkinlik durumu ───────────
+        # NEDEN: Bu butonlar ÖNCEDEN yalnızca "bu YKİ oturumunda Başlat'a
+        # basıldıysa" aktifleşiyordu. Görev uçarken YKİ çöker/yeniden başlarsa
+        # ya da görev companion tarafından otonom başlatılırsa acil durdurma
+        # butonu DEVRE DIŞI kalıyor, operatör görevi durduramıyordu.
+        # Artık iki KAYNAK birleştirilir (VEYA):
+        #   _mission_active   → companion durum akışındaki GERÇEK görev durumu
+        #                       (main_window._on_rpi_status → set_mission_active)
+        #   _session_started  → bu oturumda Başlat'a basıldı (companion durumu
+        #                       daha gelmeden geçen birkaç saniyeyi kapatır)
+        # Böylece oturum geçmişi yalnızca EK bir kaynak; tek dayanak değil.
+        self._mission_active = False
+        self._session_started = False
+        # ── Görsel durum belleği (tema değişince renkleri yeniden kurmak için) ──
+        # NEDEN: Kurulumda yazılan her satır-içi renk, tema değişince BAYAT kalır.
+        # Renkleri yeniden hesaplayabilmek için son bilinen DURUM saklanır; tema
+        # değişince aynı yardımcılar tekrar çağrılır. Telemetri sözlüğünü olduğu
+        # gibi tekrar update_telemetry'ye vermek YANLIŞ olurdu — o metot heartbeat
+        # zaman damgasını da tazeliyor, yani kopuk bağlantıyı taze gösterirdi.
+        self._bat_percent: int | None = None    # None → hiç telemetri gelmedi
+        self._armed: bool | None = None         # None → mod bilinmiyor (renksiz)
+        self._ekf_flags: int | None = None      # None → EKF verisi yok
+        self._link_state: bool | None = None    # None → bağlantı durumu bilinmiyor
+        self._separators: list[QFrame] = []
+        self._base_style = self._make_base_style()
 
         self._build_ui()
 
@@ -85,50 +112,123 @@ class TopBar(QWidget):
         self._hb_timer.timeout.connect(self._check_heartbeat)
         self._hb_timer.start()
 
-    def _build_ui(self) -> None:
-        self.setStyleSheet(self._base_style)
+        # Tema değişince satır-içi renkler yeniden yazılır
+        theme.notifier().changed.connect(lambda _n: self._apply_theme_colors())
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 3, 8, 3)
-        layout.setSpacing(6)
+    def _build_ui(self) -> None:
+        self._apply_link_style()
+
+        # İki satırlı yerleşim: ÜST satır bağlantı + Yardımcı PC kontrolleri,
+        # ALT satır görev butonları + durum göstergeleri. Tek satırda tüm içerik
+        # ~2000px sürüyordu ve 1600/1366px'de metinler kırpılıyordu; iki satıra
+        # bölünce her şey 1366px'e kadar kırpılmadan sığar.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 4, 8, 4)
+        outer.setSpacing(4)
+
+        row1 = QHBoxLayout()
+        row1.setContentsMargins(0, 0, 0, 0)
+        row1.setSpacing(6)
+        row2 = QHBoxLayout()
+        row2.setContentsMargins(0, 0, 0, 0)
+        row2.setSpacing(6)
+        outer.addLayout(row1)
+        outer.addLayout(row2)
 
         # ── Bağlantı Paneli ──────────────────────────────────────────────────
         self._conn_type = QComboBox()
         self._conn_type.addItems(["Serial", "TCP", "UDP"])
-        self._conn_type.setFixedWidth(68)
+        self._conn_type.setMinimumWidth(78)
+        self._conn_type.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self._conn_type.setToolTip("Bağlantı tipi")
         self._conn_type.currentIndexChanged.connect(self._on_conn_type_changed)
 
         # Adres combo (Serial → COM listesi, TCP → port seçimi)
         self._conn_addr = QComboBox()
         self._conn_addr.setEditable(True)
-        self._conn_addr.setFixedWidth(160)
+        self._conn_addr.setMinimumWidth(180)
+        self._conn_addr.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self._conn_addr.setToolTip("Bağlantı adresi / port")
         self._conn_addr.lineEdit().setPlaceholderText("Bağlantı adresi")  # type: ignore[union-attr]
 
         # Baudrate seçici (yalnızca Serial modunda görünür)
         self._baud_combo = QComboBox()
         self._baud_combo.addItems(["57600", "115200", "9600", "19200", "38400", "230400"])
         self._baud_combo.setCurrentText("57600")
-        self._baud_combo.setFixedWidth(78)
+        self._baud_combo.setMinimumWidth(90)
+        self._baud_combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self._baud_combo.setToolTip("Baudrate")
 
         # Veri tipi seçici (yalnızca Serial modunda görünür)
         self._data_type_combo = QComboBox()
         self._data_type_combo.addItems(["Drone", "Gimbal"])
-        self._data_type_combo.setFixedWidth(70)
-        self._data_type_combo.setToolTip("Bu porttaki veri tipi")
+        self._data_type_combo.setMinimumWidth(92)
+        self._data_type_combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        # NEDEN: "Gimbal" seçeneğinin arkasında çalışan bir worker YOK
+        # (kod tabanında gimbal_worker tanımlı değil). Seçenek kaldırılmadı ki
+        # ileride desteklenince yer değişmesin; ancak seçilirse main_window
+        # _on_connect_requested içinde açık bir "desteklenmiyor" uyarısı verir ve
+        # durum çubuğuna BAŞARI yazmaz. Kullanıcı bunu tıklamadan önce görsün:
+        self._data_type_combo.setToolTip(
+            "Bu porttaki veri tipi.\n"
+            "UYARI: 'Gimbal' bu sürümde DESTEKLENMİYOR — seçilirse bağlantı kurulmaz."
+        )
 
         # Seri port yenile butonu
         self._btn_refresh = QPushButton("↺")
-        self._btn_refresh.setFixedWidth(28)
+        self._btn_refresh.setFixedWidth(32)
         self._btn_refresh.setToolTip("Portları Tara")
         self._btn_refresh.clicked.connect(self._refresh_ports)
 
         self._btn_connect = QPushButton("Bağlan")
+        self._btn_connect.setObjectName("primaryButton")
+        self._btn_connect.setMinimumWidth(76)
         self._btn_connect.clicked.connect(self._on_connect_click)
 
+        # ── Yardımcı PC (RPi companion) bağlantı kontrolleri ─────────────────
+        self._rpi_addr = QComboBox()
+        self._rpi_addr.setEditable(True)
+        self._rpi_addr.addItems([
+            "192.168.1.10:5602",     # Companion (RPi) — kanonik (bkz. gcs_config)
+            "127.0.0.1:5602",        # Localhost (sim)
+        ])
+        self._rpi_addr.setMinimumWidth(180)
+        self._rpi_addr.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self._rpi_addr.lineEdit().setPlaceholderText("Yardımcı PC IP:Port")  # type: ignore[union-attr]
+        self._rpi_addr.setToolTip("Yardımcı Bilgisayar durum akışı adresi (StatusBroadcaster TCP)")
+
+        self._btn_rpi_connect = QPushButton("Yard. PC Bağlan")
+        self._btn_rpi_connect.setMinimumWidth(140)
+        self._btn_rpi_connect.clicked.connect(self._on_rpi_connect_click)
+
+        self._rpi_light = QLabel("●")
+        self._rpi_light.setToolTip("Yardımcı Bilgisayar bağlantı durumu")
+        self._apply_rpi_light_style()
+
+        # Üst satırı kur: drone bağlantı grubu SOLDA, esnek boşluk ortada,
+        # Yardımcı PC grubu SAĞDA (şartname §4 — satır dengeli dolar,
+        # pencere genişleyince boşluk ortada açılır, iki uç da kırpılmaz).
+        row1.addWidget(QLabel("Bağlantı:"))
+        row1.addWidget(self._conn_type)
+        row1.addWidget(self._conn_addr)
+        row1.addWidget(self._baud_combo)
+        row1.addWidget(self._data_type_combo)
+        row1.addWidget(self._btn_refresh)
+        row1.addWidget(self._btn_connect)
+        row1.addStretch(1)
+        row1.addWidget(QLabel("Yard. PC:"))
+        row1.addWidget(self._rpi_addr)
+        row1.addWidget(self._btn_rpi_connect)
+        row1.addWidget(self._rpi_light)
+
+        # İlk durum: bağlantı tipine göre adres listesini doldur
+        self._on_conn_type_changed(0)
+
         # ── GÖREVİ BAŞLAT — yüklü görev için arm + AUTO ──────────────────────
-        self._btn_start = QPushButton("▶ YARD. PC\nGÖREV BAŞLAT")
-        self._btn_start.setMinimumWidth(112)
+        # Tek satırlı başlıklar; dört görev butonu da AYNI (30px) yükseklikte,
+        # genişlik içerikten gelir (şartname §3).
+        self._btn_start = QPushButton("▶ Görev Başlat (Yard. PC)")
+        self._btn_start.setMinimumHeight(30)
         self._btn_start.setEnabled(False)
         self._btn_start.setObjectName("successButton")
         self._btn_start.setToolTip(
@@ -137,8 +237,8 @@ class TopBar(QWidget):
         )
         self._btn_start.clicked.connect(self._on_start_click)
 
-        self._btn_start_fcu = QPushButton("▶ FCU\nGÖREV BAŞLAT")
-        self._btn_start_fcu.setMinimumWidth(104)
+        self._btn_start_fcu = QPushButton("▶ Görev Başlat (FCU)")
+        self._btn_start_fcu.setMinimumHeight(30)
         self._btn_start_fcu.setEnabled(False)
         self._btn_start_fcu.setObjectName("successButton")
         self._btn_start_fcu.setToolTip(
@@ -148,127 +248,177 @@ class TopBar(QWidget):
         self._btn_start_fcu.clicked.connect(self._on_fcu_start_click)
 
         # ── DURDUR / RTL — çalışan görevi iptal et (companion abort + doğrudan RTL) ──
-        self._btn_abort = QPushButton("■ DURDUR / RTL")
-        self._btn_abort.setMinimumWidth(116)
+        self._btn_abort = QPushButton("■ Durdur / RTL")
+        self._btn_abort.setMinimumHeight(30)
         self._btn_abort.setObjectName("dangerButton")
         self._btn_abort.setEnabled(False)
         self._btn_abort.setToolTip(
             "Çalışan görevi durdurur: Yardımcı Bilgisayar görevini iptal eder VE\n"
-            "FC'yi doğrudan RTL (Eve Dön) moduna alır. Görev başlatılınca aktifleşir."
+            "FC'yi doğrudan RTL (Eve Dön) moduna alır.\n"
+            "Görev GERÇEKTEN çalışıyorken aktiftir — görevi bu YKİ oturumu\n"
+            "başlatmamış olsa bile (otonom başlatma / YKİ yeniden başlatma)."
         )
         self._btn_abort.clicked.connect(self._on_abort_click)
 
         # ── ŞİMDİ BIRAK — manuel yük bırakma (autonomous_drop=False modunda) ──
-        self._btn_drop = QPushButton("⬇ ŞİMDİ BIRAK")
-        self._btn_drop.setMinimumWidth(112)
+        self._btn_drop = QPushButton("⬇ Şimdi Bırak")
+        self._btn_drop.setMinimumHeight(30)
+        self._btn_drop.setObjectName("warningButton")
         self._btn_drop.setEnabled(False)
         self._btn_drop.setToolTip(
             "Manuel yük bırakma (Görev 2/3 manuel mod): hedef üzerinde kilitliyken\n"
-            "operatör bu butonla bırakır. Görev başlatılınca aktifleşir."
+            "operatör bu butonla bırakır. Görev GERÇEKTEN çalışıyorken aktiftir.\n"
+            "Onay diyaloğu ile korunur (yanlış tıklama yükü havada bırakmasın)."
         )
         self._btn_drop.clicked.connect(self._on_drop_click)
 
-
-        layout.addWidget(QLabel("Bağlantı:"))
-        layout.addWidget(self._conn_type)
-        layout.addWidget(self._conn_addr)
-        layout.addWidget(self._baud_combo)
-        layout.addWidget(self._data_type_combo)
-        layout.addWidget(self._btn_refresh)
-        layout.addWidget(self._btn_connect)
-        layout.addWidget(self._btn_start_fcu)
-        layout.addWidget(self._btn_start)
-        layout.addWidget(self._btn_abort)
-        layout.addWidget(self._btn_drop)
-
-        # İlk durum: TCP seçeneği için varsayılan dolgu
-        self._on_conn_type_changed(0)
-
-        layout.addWidget(self._separator())
-
-        # ── RPi Companion Bağlantı ────────────────────────────────────────────
-        layout.addWidget(QLabel("Yard. PC:"))
-
-        self._rpi_addr = QComboBox()
-        self._rpi_addr.setEditable(True)
-        self._rpi_addr.addItems([
-            "192.168.1.10:5602",     # Companion (RPi) — kanonik (bkz. gcs_config)
-            "127.0.0.1:5602",        # Localhost (sim)
-        ])
-        self._rpi_addr.setFixedWidth(150)
-        self._rpi_addr.lineEdit().setPlaceholderText("Yardımcı PC IP:Port")  # type: ignore[union-attr]
-        self._rpi_addr.setToolTip("Yardımcı Bilgisayar durum akışı adresi (StatusBroadcaster TCP)")
-
-        self._btn_rpi_connect = QPushButton("Yard. PC Bağlan")
-        self._btn_rpi_connect.setMinimumWidth(130)
-        self._btn_rpi_connect.clicked.connect(self._on_rpi_connect_click)
-
-        self._rpi_light = QLabel("●")
-        self._rpi_light.setStyleSheet("color: #555; font-size: 14px;")
-        self._rpi_light.setToolTip("Yardımcı Bilgisayar bağlantı durumu")
-
-        layout.addWidget(self._rpi_addr)
-        layout.addWidget(self._btn_rpi_connect)
-        layout.addWidget(self._rpi_light)
-
-        # Tek esnek boşluk: kontroller solda, durum göstergeleri sağda toplanır
-        layout.addStretch(1)
-
-        layout.addWidget(self._separator())
-
-        # ── Batarya ──────────────────────────────────────────────────────────
+        # ── Durum göstergeleri (batarya / EKF / mod / GPS) ───────────────────
         self._bat_label = QLabel("BAT")
         self._bat_bar = QProgressBar()
-        self._bat_bar.setFixedWidth(80)
-        self._bat_bar.setFixedHeight(18)
+        self._bat_bar.setFixedWidth(90)
+        self._bat_bar.setFixedHeight(16)
         self._bat_bar.setRange(0, 100)
         self._bat_bar.setValue(0)
         self._bat_bar.setTextVisible(True)
-        layout.addWidget(self._bat_label)
-        layout.addWidget(self._bat_bar)
 
-        layout.addWidget(self._separator())
-
-        # ── EKF ─────────────────────────────────────────────────────────────
+        # Durum etiketleri: ilk kurulumdaki font, update_telemetry'nin bastığı
+        # inline stille AYNI (11px bold) — bağlantı öncesi/sonrası zıplamasın.
         self._ekf_indicator = QLabel("EKF ●")
-        self._ekf_indicator.setStyleSheet("color: #888;")
-        layout.addWidget(self._ekf_indicator)
+        self._apply_ekf_style()
 
-        layout.addWidget(self._separator())
-
-        # ── Uçuş Modu ────────────────────────────────────────────────────────
         self._mode_label = QLabel("MODU: —")
-        self._mode_label.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        layout.addWidget(self._mode_label)
+        self._apply_mode_style()
 
-        layout.addWidget(self._separator())
-
-        # ── GPS ──────────────────────────────────────────────────────────────
         self._gps_label = QLabel("GPS: —")
-        layout.addWidget(self._gps_label)
+        self._gps_label.setStyleSheet("font-size:11px; font-weight:bold;")
 
-        # ── Bağlantı durumu ışığı ─────────────────────────────────────────────
         self._status_light = QLabel("●")
-        self._status_light.setStyleSheet("color: #555; font-size: 16px;")
-        layout.addWidget(self._status_light)
+        self._apply_status_light_style()
+
+        # Alt satırı kur: görev butonları solda, esnek boşluk, durum
+        # göstergeleri sağa yaslı (esnek boşluk sayesinde en sağdaki BAT/EKF/
+        # MOD/GPS çipleri asla ekran dışına itilmez ve tam görünür).
+        # Durum göstergeleri ve ayraçlar 30px'lik buton satırına göre dikeyde
+        # ORTALANIR (şartname §4 — iki dengeli satır, hiza kaymasın).
+        vcenter = Qt.AlignmentFlag.AlignVCenter
+        row2.addWidget(self._btn_start_fcu)
+        row2.addWidget(self._btn_start)
+        row2.addWidget(self._btn_abort)
+        row2.addWidget(self._btn_drop)
+        row2.addStretch(1)
+        row2.addWidget(self._separator(), 0, vcenter)
+        row2.addWidget(self._bat_label, 0, vcenter)
+        row2.addWidget(self._bat_bar, 0, vcenter)
+        row2.addWidget(self._separator(), 0, vcenter)
+        row2.addWidget(self._ekf_indicator, 0, vcenter)
+        row2.addWidget(self._separator(), 0, vcenter)
+        row2.addWidget(self._mode_label, 0, vcenter)
+        row2.addWidget(self._separator(), 0, vcenter)
+        row2.addWidget(self._gps_label, 0, vcenter)
+        row2.addWidget(self._status_light, 0, vcenter)
 
     def _separator(self) -> QFrame:
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.VLine)
-        sep.setStyleSheet("color: #30363d;")
+        # AlignVCenter ile eklendiğinde sizeHint'e büzülmesin diye sabit boy
+        sep.setFixedHeight(18)
+        sep.setStyleSheet(f"color: {theme.c('border')};")
+        # Tema değişince rengi tazelenebilsin diye referansı sakla
+        self._separators.append(sep)
         return sep
+
+    # ── Tema: satır-içi renk yardımcıları ─────────────────────────────────────
+    # Her biri SON BİLİNEN duruma bakıp rengi yeniden hesaplar; hem kurulumda
+    # hem telemetri geldiğinde hem de tema değişiminde aynı yol kullanılır.
+
+    def _make_base_style(self) -> str:
+        """TopBar'ın normal (sağlıklı bağlantı) zemin/kenar stili."""
+        return (
+            f"TopBar {{ background-color: {theme.c('toolbar')}; "
+            f"border-bottom: 1px solid {theme.c('border_soft')}; }}"
+        )
+
+    def _apply_link_style(self) -> None:
+        """Bağlantı sağlığına göre TopBar zeminini uygular (stale → kırmızı)."""
+        self._base_style = self._make_base_style()
+        if self._link_stale:
+            self.setStyleSheet(
+                self._base_style +
+                f"TopBar {{ border-bottom: 3px solid {theme.c('danger')}; "
+                f"background: {theme.c('danger_bg')}; }}"
+            )
+        else:
+            self.setStyleSheet(self._base_style)
+
+    def _apply_battery_style(self) -> None:
+        """Batarya çubuğu: <=%20 danger, <=%50 warning, üstü success."""
+        if self._bat_percent is None:
+            return   # hiç telemetri gelmedi → QSS varsayılan chunk rengi kalsın
+        if self._bat_percent <= 20:
+            color = theme.c("danger")
+        elif self._bat_percent <= 50:
+            color = theme.c("warning")
+        else:
+            color = theme.c("success")
+        self._bat_bar.setStyleSheet(f"QProgressBar::chunk {{ background: {color}; }}")
+
+    def _apply_mode_style(self) -> None:
+        """Mod etiketi: ARM ise danger, DSM ise success (durum bilinmiyorsa renksiz)."""
+        base = "font-size:11px; font-weight:bold;"
+        if self._armed is None:
+            self._mode_label.setStyleSheet(base)
+        elif self._armed:
+            self._mode_label.setStyleSheet(f"color:{theme.c('danger')}; {base}")
+        else:
+            self._mode_label.setStyleSheet(f"color:{theme.c('success')}; {base}")
+
+    def _apply_ekf_style(self) -> None:
+        """EKF ışığı: tam çözüm success, kısmi warning, hata danger, veri yok idle.
+
+        NOT: font-size/weight ilk kurulumla AYNI tutulur — yalnız renk değişir
+        (çalışma anında değişen renk için minimal inline stil istisnası)."""
+        flags = self._ekf_flags
+        if flags is None:
+            color = theme.c("idle")
+        elif (flags & 0x1F) == 0x1F:   # attitude+vel_h+vel_v+pos_h+pos_v
+            color = theme.c("success")
+        elif flags & 0x01:
+            color = theme.c("warning")
+        else:
+            color = theme.c("danger")
+        self._ekf_indicator.setStyleSheet(f"color:{color}; font-size:11px; font-weight:bold;")
+
+    def _apply_status_light_style(self) -> None:
+        """Durum ışığı: bağlı success / kopuk danger / bilinmiyor idle."""
+        if self._link_state is None:
+            color = theme.c("idle")
+        else:
+            color = theme.c("success") if self._link_state else theme.c("danger")
+        self._status_light.setStyleSheet(f"color: {color}; font-size: 16px;")
+
+    def _apply_rpi_light_style(self) -> None:
+        """Yardımcı PC ışığı: bağlı success / bağlı değil idle."""
+        color = theme.c("success") if self._rpi_connected else theme.c("idle")
+        self._rpi_light.setStyleSheet(f"color: {color}; font-size: 14px;")
+
+    def _apply_theme_colors(self) -> None:
+        """Tema değişince TÜM satır-içi renkleri son duruma göre yeniden yazar."""
+        self._apply_link_style()
+        self._apply_battery_style()
+        self._apply_mode_style()
+        self._apply_ekf_style()
+        self._apply_status_light_style()
+        self._apply_rpi_light_style()
+        for sep in self._separators:
+            sep.setStyleSheet(f"color: {theme.c('border')};")
 
     # ── Slot: Telemetri ───────────────────────────────────────────────────────
     @pyqtSlot(dict)
     def update_telemetry(self, data: dict) -> None:
         bat = int(data.get("battery_remaining", 0))
         self._bat_bar.setValue(max(0, min(100, bat)))
-        if bat <= 20:
-            self._bat_bar.setStyleSheet("QProgressBar::chunk { background: #e94560; }")
-        elif bat <= 50:
-            self._bat_bar.setStyleSheet("QProgressBar::chunk { background: #f0a500; }")
-        else:
-            self._bat_bar.setStyleSheet("QProgressBar::chunk { background: #4ade80; }")
+        self._bat_percent = bat
+        self._apply_battery_style()
 
         # GPS
         sats = data.get("gps_sats", "—")
@@ -280,28 +430,21 @@ class TopBar(QWidget):
         armed = data.get("armed", False)
         arm_txt = " ▲ARM" if armed else " ▽DSM"
         self._mode_label.setText(f"{mode}{arm_txt}")
-        if armed:
-            self._mode_label.setStyleSheet("color:#e94560; font-weight:bold; font-size:11px;")
-        else:
-            self._mode_label.setStyleSheet("color:#4ade80; font-weight:bold; font-size:11px;")
+        self._armed = bool(armed)
+        self._apply_mode_style()
 
         # EKF
         ekf_flags = data.get("ekf_flags", None)
+        self._ekf_flags = ekf_flags
+        self._ekf_indicator.setText("EKF ●")
+        self._apply_ekf_style()
         if ekf_flags is None:
-            self._ekf_indicator.setText("EKF ●")
-            self._ekf_indicator.setStyleSheet("color:#888;")
             self._ekf_indicator.setToolTip("EKF verisi yok")
         elif (ekf_flags & 0x1F) == 0x1F:   # attitude+vel_h+vel_v+pos_h+pos_v
-            self._ekf_indicator.setText("EKF ●")
-            self._ekf_indicator.setStyleSheet("color:#4ade80;")
             self._ekf_indicator.setToolTip(f"EKF İYİ (0x{ekf_flags:04x})")
         elif ekf_flags & 0x01:
-            self._ekf_indicator.setText("EKF ●")
-            self._ekf_indicator.setStyleSheet("color:#f0a500;")
             self._ekf_indicator.setToolTip(f"EKF KISMI (0x{ekf_flags:04x}): attitude OK, pos eksik")
         else:
-            self._ekf_indicator.setText("EKF ●")
-            self._ekf_indicator.setStyleSheet("color:#e94560;")
             self._ekf_indicator.setToolTip(f"EKF HATA (0x{ekf_flags:04x})")
 
         hb_age = data.get("last_heartbeat_age", 0)
@@ -317,12 +460,12 @@ class TopBar(QWidget):
         # bağlantı kesme stiliyle çakışabilir.
         self._link_stale = False
         self._last_telemetry_wallclock = 0.0
-        self.setStyleSheet(self._base_style)
+        self._apply_link_style()
+        self._link_state = bool(connected)
+        self._apply_status_light_style()
         if connected:
-            self._status_light.setStyleSheet("color: #4ade80; font-size: 16px;")
             self._btn_connect.setText("Kes")
         else:
-            self._status_light.setStyleSheet("color: #e94560; font-size: 16px;")
             self._btn_connect.setText("Bağlan")
             self._bat_bar.setValue(0)
             self._mode_label.setText("MODU: —")
@@ -339,13 +482,10 @@ class TopBar(QWidget):
         stale = elapsed > HEARTBEAT_TIMEOUT_SECS or self._last_hb_secs > HEARTBEAT_TIMEOUT_SECS
         if stale and not self._link_stale:
             self._link_stale = True
-            self.setStyleSheet(
-                self._base_style +
-                "TopBar { border-bottom: 3px solid #e94560; background: #2a0a10; }"
-            )
+            self._apply_link_style()
         elif not stale and self._link_stale:
             self._link_stale = False
-            self.setStyleSheet(self._base_style)
+            self._apply_link_style()
 
     def link_is_healthy(self) -> bool:
         """
@@ -386,9 +526,11 @@ class TopBar(QWidget):
             # E1: tek başlatma yolu — diğer başlatmayı da kilitle, durdur/bırak aç
             self._btn_start_fcu.setEnabled(False)
             self._btn_start.setEnabled(False)
-            self._btn_start_fcu.setText("▶ BAŞLATILIYOR...")
-            self._btn_abort.setEnabled(True)
-            self._btn_drop.setEnabled(True)
+            self._btn_start_fcu.setText("▶ Başlatılıyor...")
+            # Companion "görev aktif" durumu birkaç saniye sonra gelir; o boşlukta
+            # acil kontroller kapalı kalmasın diye oturum bayrağı da işaretlenir.
+            self._session_started = True
+            self._sync_mission_controls()
 
     def _on_start_click(self) -> None:
         """Görevi başlat butonu — onay diyaloğu sonra sinyali yayar."""
@@ -398,7 +540,7 @@ class TopBar(QWidget):
         from PyQt6.QtWidgets import QMessageBox
         reply = QMessageBox.question(
             self, "Görevi Başlat",
-            "Yardımcı bilgisayarna görev başlatma komutu gönderilecek.\n"
+            "Yardımcı bilgisayara görev başlatma komutu gönderilecek.\n"
             "Drone ARM edilecek ve görevi otomatik uçacak.\n\n"
             "Başlatılsın mı?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -409,9 +551,10 @@ class TopBar(QWidget):
             # E1: tek başlatma yolu — FCU başlatmayı da kilitle, durdur/bırak aç
             self._btn_start.setEnabled(False)
             self._btn_start_fcu.setEnabled(False)
-            self._btn_start.setText("▶ BAŞLATILIYOR...")
-            self._btn_abort.setEnabled(True)
-            self._btn_drop.setEnabled(True)
+            self._btn_start.setText("▶ Başlatılıyor...")
+            # Bkz. _on_fcu_start_click — oturum bayrağı yalnızca ek kaynaktır.
+            self._session_started = True
+            self._sync_mission_controls()
 
     def _on_abort_click(self) -> None:
         """DURDUR / RTL — çalışan görevi iptal et + drone'u eve döndür."""
@@ -425,25 +568,77 @@ class TopBar(QWidget):
         )
         if reply == QMessageBox.StandardButton.Yes:
             self.abort_mission_requested.emit()
-            # Görev durdu → başlat butonları tekrar kullanılabilir, durdur/bırak pasif
-            self._btn_abort.setEnabled(False)
-            self._btn_drop.setEnabled(False)
+            # Görev durdu → başlat butonları tekrar kullanılabilir
             self._btn_start.setEnabled(True)
             self._btn_start_fcu.setEnabled(True)
-            self._btn_start.setText("▶ YARD. PC\nGÖREV BAŞLAT")
-            self._btn_start_fcu.setText("▶ FCU\nGÖREV BAŞLAT")
+            self._btn_start.setText("▶ Görev Başlat (Yard. PC)")
+            self._btn_start_fcu.setText("▶ Görev Başlat (FCU)")
+            # NEDEN: Durdur/bırak butonları ARTIK körü körüne kapatılmıyor.
+            # Oturum bayrağı düşer, ama companion hâlâ "görev aktif" bildiriyorsa
+            # DURDUR/RTL açık kalır — ilk abort komutu araca ulaşmamış olabilir ve
+            # operatörün tekrar deneyebilmesi gerekir. Görev gerçekten bitince
+            # set_mission_active(False) ile kendiliğinden pasifleşir.
+            self._session_started = False
+            self._sync_mission_controls()
 
     def _on_drop_click(self) -> None:
-        """ŞİMDİ BIRAK — manuel yük bırakma komutu (companion'a)."""
-        self.drop_now_requested.emit()
+        """ŞİMDİ BIRAK — manuel yük bırakma komutu (companion'a).
+
+        NEDEN onay: Yük bırakma GERİ ALINAMAZ bir komut — yanlış tıklama yükü
+        havada, hedef dışında bırakır. DURDUR/RTL'de zaten onay diyaloğu vardı;
+        aynı desen (Türkçe metin, varsayılan buton 'Hayır') buraya da uygulandı.
+        """
+        from PyQt6.QtWidgets import QMessageBox
+        reply = QMessageBox.question(
+            self, "Yükü Şimdi Bırak",
+            "Yük ŞİMDİ bırakılacak. Bu işlem GERİ ALINAMAZ.\n\n"
+            "Aracın hedef üzerinde ve doğru irtifada olduğunu doğrulayın.\n\n"
+            "Onaylıyor musunuz?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.drop_now_requested.emit()
 
     @pyqtSlot(bool)
     def set_mission_ready(self, ready: bool) -> None:
         """Görev yükleme sonucuna göre Başlat butonunu aktive et."""
         self._btn_start.setEnabled(ready)
         self._btn_start_fcu.setEnabled(ready)
-        self._btn_start.setText("▶ YARD. PC\nGÖREV BAŞLAT")
-        self._btn_start_fcu.setText("▶ FCU\nGÖREV BAŞLAT")
+        self._btn_start.setText("▶ Görev Başlat (Yard. PC)")
+        self._btn_start_fcu.setText("▶ Görev Başlat (FCU)")
+
+    @pyqtSlot(bool)
+    def set_mission_active(self, active: bool) -> None:
+        """Companion durum akışındaki GERÇEK görev durumunu bildirir (KRİTİK).
+
+        main_window._on_rpi_status her durum paketinde çağırır. Acil kontroller
+        (DURDUR/RTL, ŞİMDİ BIRAK) artık bu GERÇEK duruma bağlıdır; "bu oturumda
+        Başlat'a basıldı mı" geçmişine değil. Böylece:
+          • görev uçarken YKİ yeniden başlatılsa,
+          • ya da görevi companion otonom başlatsa,
+        operatör yine de görevi durdurabilir.
+
+        NOT: Çağıran taraf RBAC'i uygular (VIEWER için False geçirilir) — burada
+        rol kontrolü yapılmaz, tek sorumluluk kaynağı main_window'dur.
+        """
+        self._mission_active = bool(active)
+        self._sync_mission_controls()
+
+    def mission_controls_live(self) -> bool:
+        """Acil kontrollerin şu an etkin olup olmadığı (test/teşhis amaçlı)."""
+        return self._mission_active or self._session_started
+
+    def _sync_mission_controls(self) -> None:
+        """Acil kontrollerin etkinliğini iki kaynağın BİRLEŞİMİNE göre ayarlar.
+
+        Etkin = (companion 'görev aktif' diyor) VEYA (bu oturum görevi başlattı).
+        VEYA kullanılır çünkü iki kaynak da tek başına eksiktir: companion durumu
+        gecikmeli/kopuk olabilir, oturum geçmişi ise YKİ yeniden başlarsa silinir.
+        """
+        live = self.mission_controls_live()
+        self._btn_abort.setEnabled(live)
+        self._btn_drop.setEnabled(live)
 
     def _on_rpi_connect_click(self) -> None:
         if self._rpi_connected:
@@ -465,11 +660,10 @@ class TopBar(QWidget):
     @pyqtSlot(bool)
     def set_rpi_connection_status(self, connected: bool) -> None:
         self._rpi_connected = connected
+        self._apply_rpi_light_style()
         if connected:
-            self._rpi_light.setStyleSheet("color: #4ade80; font-size: 14px;")
             self._btn_rpi_connect.setText("Yard. PC Kes")
         else:
-            self._rpi_light.setStyleSheet("color: #555; font-size: 14px;")
             self._btn_rpi_connect.setText("Yard. PC Bağlan")
 
     def _on_connect_click(self) -> None:

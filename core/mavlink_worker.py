@@ -54,6 +54,21 @@ _MSG_INTERVALS_TRANSFER = {
     11030: 2_000_000,  11031: 2_000_000, 11032: 2_000_000, 11033: 2_000_000,
 }
 
+# ── Yeniden bağlanma geri çekilme (backoff) merdiveni ─────────────────────────
+# NEDEN: Seri port erişilemezken (USB çekilmiş / sürücü hatası, ör.
+# "Bağlantı kurulamadı: Could not configure port: (5, 'Girdi/Çıktı hatası')")
+# run() sabit ~8 s aralıkla AYNI hatayı üretip duruyordu: log dosyası ve
+# audit_log şişiyor, port faydasız biçimde tekrar tekrar açılmaya çalışılıyor,
+# üstteki bar "Bağlantı kesildi" derken worker arka planda dönmeye devam ettiği
+# için operatör gerçek durumu göremiyordu. Üstel geri çekilme hem gürültüyü hem
+# de faydasız deneme sıklığını düşürür; başarılı bağlantıda merdiven sıfırlanır.
+_RECONNECT_BACKOFF_STEPS = (2.0, 4.0, 8.0, 15.0, 30.0)   # saniye, tavan 30 s
+# Aynı hata metni ardışık tekrarlanırsa log/UI bildirimi bu kadar denemede bir
+# yapılır (ilki her zaman yazılır) — log boğulmasını engeller.
+_ERROR_REPEAT_NOTIFY_EVERY = 5
+# Backoff beklemesi bu dilimlerle uyunur (interrupt + watchdog canlılığı için)
+_BACKOFF_SLICE_S = 0.2
+
 
 class MavlinkWorker(QThread):
     # Sinyaller
@@ -90,6 +105,13 @@ class MavlinkWorker(QThread):
         # recv_match'iyle AYNI bağlantıya eşzamanlı erişip MAVLink akışını bozabiliyordu.
         self._action_queue: queue.Queue = queue.Queue(maxsize=64)
         self._last_heartbeat_time: float = 0.0
+        # ── Yeniden bağlanma durumu (bkz. run() / _note_connect_failure) ──────
+        # NEDEN: backoff merdiveninde nerede olduğumuzu ve aynı hatanın kaç kez
+        # üst üste tekrarladığını bilmeden ne geri çekilme ne de log boğulma
+        # koruması yapılabilir. Yalnızca worker thread'inden yazılır/okunur.
+        self._reconnect_attempt: int = 0    # ardışık BAŞARISIZ deneme sayısı
+        self._last_error_text: str = ""     # son bağlantı hatası metni
+        self._error_repeat: int = 0         # aynı hatanın ardışık tekrar sayısı
         self._telemetry_accumulator: dict = {}
         self._telemetry_tick: int = 0
         # Zaman tabanlı telemetri throttle — mesaj seli olsa da UI ≤15Hz alır
@@ -139,19 +161,11 @@ class MavlinkWorker(QThread):
         self.set_connection(conn_str, self._baud)
 
     def run(self) -> None:
-        reconnect_backoff = 1.0
         while not self.isInterruptionRequested():
             self.heartbeat_counter += 1  # watchdog: her döngüde artır
             try:
                 self._connect_and_listen()
-                reconnect_backoff = 1.0  # temiz çıkış → backoff sıfırla
             except Exception as exc:
-                # 10038 (WSAENOTSOCK) veya 9 (EBADF) bağlantı manuel kesildiğinde olağandır.
-                if "10038" in str(exc) or "Bad file descriptor" in str(exc):
-                    pass
-                else:
-                    logger.error("MavlinkWorker run() exception: %s", exc)
-                    self.error_occurred.emit(str(exc))
                 self.connection_changed.emit(False)
                 # Eski socket'i kapat, ama bağlantı dizesini KORU →
                 # SITL/uçak yeniden açıldığında otomatik tekrar bağlan.
@@ -161,9 +175,90 @@ class MavlinkWorker(QThread):
                     except Exception:
                         pass
                     self._mav = None
-                # Üstel backoff (1s → 2s → 4s → 8s, max 8s)
-                time.sleep(reconnect_backoff)
-                reconnect_backoff = min(reconnect_backoff * 2.0, 8.0)
+                # NEDEN: Hata raporlaması ve üstel geri çekilme tek yerde
+                # toplandı — log boğulma koruması ve backoff merdiveni birlikte
+                # yürür (bkz. _note_connect_failure). Backoff SIFIRLAMASI artık
+                # "_connect_and_listen temiz döndü" değil, GERÇEKTEN bağlanıldı
+                # olayına bağlı (bağlantı dizesi boşken de temiz dönüyordu).
+                delay = self._note_connect_failure(exc)
+                self._backoff_sleep(delay)
+
+    def _note_connect_failure(self, exc: Exception) -> float:
+        """Bağlantı hatasını raporlar (log'u boğmadan) ve bekleme süresini döndürür.
+
+        NEDEN (canlı gözlenen hata): seri port erişilemezken aynı istisna her
+        denemede hem ERROR olarak log'lanıyor hem de error_occurred ile UI'ya
+        gidiyordu (main_window her hatayı audit_log'a da yazıyor) → dosya ve
+        veritabanı aynı satırla doluyordu. Artık:
+          • İlk hata tam ERROR olarak yazılır,
+          • Ardışık AYNI hata her _ERROR_REPEAT_NOTIFY_EVERY denemede bir
+            "N denemedir aynı hata" özetiyle yazılır, aradakiler DEBUG,
+          • UI'ya giden metin deneme numarası ve bir sonraki denemeye kalan
+            süreyi içerir → operatör "worker sessizce dönüyor" sanmaz.
+        Sinyal şeması KORUNDU: error_occurred hâlâ tek bir str yayar; yeni sinyal
+        eklenmedi (main_window'a dokunulmuyor).
+        """
+        text = str(exc)
+        # 10038 (WSAENOTSOCK) / 9 (EBADF): bağlantı MANUEL kesildiğinde olağandır
+        # — kullanıcıya hata gibi gösterilmez, ama backoff yine de işletilir.
+        quiet = ("10038" in text) or ("Bad file descriptor" in text)
+
+        if text == self._last_error_text:
+            self._error_repeat += 1
+        else:
+            self._last_error_text = text
+            self._error_repeat = 1
+
+        self._reconnect_attempt += 1
+        idx = min(self._reconnect_attempt - 1, len(_RECONNECT_BACKOFF_STEPS) - 1)
+        delay = _RECONNECT_BACKOFF_STEPS[idx]
+
+        if quiet:
+            return delay
+
+        notify = (self._error_repeat == 1
+                  or self._error_repeat % _ERROR_REPEAT_NOTIFY_EVERY == 0)
+
+        if self._error_repeat == 1:
+            logger.error("MavlinkWorker run() exception: %s", text)
+        elif notify:
+            logger.error("MavlinkWorker: %d denemedir aynı hata: %s",
+                         self._error_repeat, text)
+        else:
+            logger.debug("MavlinkWorker bağlantı hatası tekrarı %d/%d: %s",
+                         self._error_repeat, _ERROR_REPEAT_NOTIFY_EVERY, text)
+
+        if notify:
+            if self._error_repeat > 1:
+                self.error_occurred.emit(
+                    f"{text} — {self._error_repeat} denemedir aynı hata; "
+                    f"yeniden deneniyor ({self._reconnect_attempt}. deneme, "
+                    f"{delay:.0f}s sonra)"
+                )
+            else:
+                self.error_occurred.emit(
+                    f"{text} — yeniden deneniyor "
+                    f"({self._reconnect_attempt}. deneme, {delay:.0f}s sonra)"
+                )
+        return delay
+
+    def _backoff_sleep(self, delay: float) -> None:
+        """Backoff beklemesi — küçük dilimlerle uyur.
+
+        NEDEN: Tek parça `time.sleep(30)` iki şeyi bozardı:
+          (a) stop() çağrılsa bile thread 30 s boyunca kapanmaz (uygulama kapanışı
+              donar),
+          (b) heartbeat_counter 30 s sabit kalır; main_window watchdog'u
+              (5 s × 3 tick = 15 s) worker'ı "takıldı" sanıp YENİDEN BAŞLATIR —
+              bu da backoff merdivenini sıfırlayıp düzeltmek istediğimiz hızlı
+              hata döngüsünü aynen geri getirirdi.
+        """
+        deadline = time.monotonic() + delay
+        while time.monotonic() < deadline:
+            if self.isInterruptionRequested():
+                return
+            self.heartbeat_counter += 1   # watchdog: bekleme sırasında da canlıyız
+            time.sleep(_BACKOFF_SLICE_S)
 
     def _connect_and_listen(self) -> None:
         if not self._connection_string:
@@ -176,6 +271,14 @@ class MavlinkWorker(QThread):
             self._mav.wait_heartbeat(timeout=10)
         except Exception as exc:
             raise ConnectionError(f"Bağlantı kurulamadı: {exc}") from exc
+
+        # NEDEN: Backoff merdiveni ve hata tekrar sayacı YALNIZCA gerçekten
+        # bağlanıldığında sıfırlanır. Eskiden `_connect_and_listen()` temiz
+        # döndüğünde sıfırlanıyordu — bağlantı dizesi boşken de temiz döndüğü
+        # için merdiven asla yükselemiyordu.
+        self._reconnect_attempt = 0
+        self._error_repeat = 0
+        self._last_error_text = ""
 
         self.connection_changed.emit(True)
         self._last_heartbeat_time = time.time()

@@ -28,6 +28,10 @@ def hash_password(password: str) -> str:
 class AuthManager(QObject):
     token_refreshed = pyqtSignal(str)
     logout_required = pyqtSignal(str)   # mesaj ile
+    # RBAC rolü DEĞİŞTİĞİNDE yayılır. Bunsuz MainWindow rol değişimini
+    # göremiyordu; sekme kilitleri yalnız açılışta uygulanıyor, oturum
+    # içinde rol düşse bile yetkili sekmeler açık kalıyordu.
+    role_changed = pyqtSignal(int)      # yeni rol
 
     def __init__(self, db_conn, hq_refresh_url: str = "", parent=None):
         super().__init__(parent)
@@ -54,6 +58,7 @@ class AuthManager(QObject):
         if row["password_hash"] != expected:
             return False
         state.set_rbac_role(int(row["role"]))
+        self.role_changed.emit(int(row["role"]))
         state.set_auth_token(f"local:{username}")
         logger.info("Yerel giriş başarılı: %s (rol=%s)", username, row["role"])
         return True
@@ -61,12 +66,14 @@ class AuthManager(QObject):
     def authenticate_jwt(self, token: str, role: int, expiry: float) -> None:
         state.set_auth_token(token)
         state.set_rbac_role(role)
+        self.role_changed.emit(int(role))
         self._token_expiry = expiry
         logger.info("JWT ile giriş yapıldı; expiry=%s", expiry)
 
     def logout(self) -> None:
         state.set_auth_token("")
         state.set_rbac_role(0)
+        self.role_changed.emit(0)
         self._token_expiry = 0.0
         self._refresh_timer.stop()
         logger.info("Kullanıcı çıkış yaptı")

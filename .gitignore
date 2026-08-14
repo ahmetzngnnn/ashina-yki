@@ -8,3 +8,6 @@ settings.json
 .DS_Store
 build/
 dist/
+
+# Yerel yedek kopyalar (settings.json zaten hariç)
+settings.json.bak*

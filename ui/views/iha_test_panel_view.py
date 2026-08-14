@@ -27,6 +27,8 @@ from PyQt6.QtWidgets import (
     QMessageBox,
 )
 
+from core import theme
+
 # Test tanımları (UI için)
 TEST_DEFS = [
     ("01", "Test01Mavlink",        "MAVLink Bağlantı & Telemetri", "BAGLANTI"),
@@ -40,14 +42,22 @@ TEST_DEFS = [
     ("09", "Test09FullMission",    "Tam Görev Entegrasyon",           "ENTEGRASYON"),
 ]
 
-STATUS_COLORS = {
-    "PASS":    "#06d6a0",
-    "FAIL":    "#ef233c",
-    "SKIP":    "#ff8700",
-    "WARNING": "#ff8700",
-    "RUNNING": "#00b4d8",
-    "PENDING": "#8b949e",
+# Test durumu → tema token'ı. Renk SABİT bir sözlükte tutulamaz: tema
+# değişince bayat kalır. Bu yüzden token saklanır, renk `status_color()` ile
+# çalışma anında `theme.c(...)` üzerinden üretilir.
+STATUS_TOKENS = {
+    "PASS":    "success",
+    "FAIL":    "danger",
+    "SKIP":    "warning",
+    "WARNING": "warning",
+    "RUNNING": "info",
+    "PENDING": "text_muted",
 }
+
+
+def status_color(status: str) -> str:
+    """Test durum kodunun aktif temadaki hex rengi (bilinmeyen → soluk metin)."""
+    return theme.c(STATUS_TOKENS.get(status, "text_muted"))
 
 
 class IHATestPanelView(QWidget):
@@ -60,38 +70,46 @@ class IHATestPanelView(QWidget):
         super().__init__(parent)
         self._test_statuses: Dict[str, str] = {t[1]: "PENDING" for t in TEST_DEFS}
         self._running: Optional[str] = None
+        # Genel durum etiketinin son bilinen tema token'ı (None → QSS class'ı
+        # geçerli, inline renk yok). Tema değişince aynı durum yeniden boyanır.
+        self._overall_token: Optional[str] = None
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(1000)
         self._poll_timer.timeout.connect(self._refresh_ui)
         self._build_ui()
+        theme.notifier().changed.connect(lambda _n: self._apply_theme_colors())
 
     # ── UI Kurulumu ──────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
 
         # ── Başlık ──────────────────────────────────────────────────────────
+        header_row = QHBoxLayout()
+        header_row.setSpacing(8)
+
         title = QLabel("İHA Devreye Alma Test Sistemi")
-        title.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
-        title.setStyleSheet("color: #00b4d8; padding: 4px 0;")
-        root.addWidget(title)
+        title.setObjectName("pageTitle")
+        header_row.addWidget(title)
 
         subtitle = QLabel("Her modülü adım adım test et — YKİ üzerinden Companion'a gönder")
-        subtitle.setStyleSheet("color: #8b949e; font-size: 11px;")
-        root.addWidget(subtitle)
+        subtitle.setObjectName("mutedLabel")
+        header_row.addWidget(subtitle, 0, Qt.AlignmentFlag.AlignBottom)
+        header_row.addStretch()
+        root.addLayout(header_row)
 
         # ── Üst Kontroller ───────────────────────────────────────────────────
         ctrl_frame = QFrame()
-        ctrl_frame.setFrameShape(QFrame.Shape.StyledPanel)
-        ctrl_frame.setStyleSheet("QFrame{background:#1c2526;border-radius:6px;padding:4px;}")
+        ctrl_frame.setObjectName("toolbarFrame")
         ctrl_layout = QHBoxLayout(ctrl_frame)
+        ctrl_layout.setContentsMargins(8, 6, 8, 6)
         ctrl_layout.setSpacing(8)
 
         # Mod seçimi
         self._sim_check = QCheckBox("Simülasyon Modu")
         self._sim_check.setChecked(True)
-        self._sim_check.setStyleSheet("color:#e0e0e0;")
         ctrl_layout.addWidget(self._sim_check)
 
         # Seçici
@@ -108,29 +126,20 @@ class IHATestPanelView(QWidget):
 
         # Butonlar
         self._btn_run = QPushButton("▶  Çalıştır")
-        self._btn_run.setStyleSheet(
-            "QPushButton{background:#065ea5;color:white;padding:6px 16px;"
-            "border-radius:4px;font-weight:bold;}"
-            "QPushButton:hover{background:#0078d7;}"
-        )
+        self._btn_run.setObjectName("primaryButton")
+        self._btn_run.setMinimumHeight(30)
         self._btn_run.clicked.connect(self._on_run_clicked)
         ctrl_layout.addWidget(self._btn_run)
 
         self._btn_abort = QPushButton("⏹  Durdur")
-        self._btn_abort.setStyleSheet(
-            "QPushButton{background:#3d1f1f;color:#ef233c;padding:6px 16px;"
-            "border-radius:4px;font-weight:bold;}"
-            "QPushButton:hover{background:#5a2020;}"
-        )
+        self._btn_abort.setObjectName("dangerButton")
+        self._btn_abort.setMinimumHeight(30)
         self._btn_abort.setEnabled(False)
         self._btn_abort.clicked.connect(self.abort_test_requested)
         ctrl_layout.addWidget(self._btn_abort)
 
         self._btn_clear = QPushButton("🗑  Temizle")
-        self._btn_clear.setStyleSheet(
-            "QPushButton{background:#2a2a2a;color:#8b949e;padding:6px 12px;"
-            "border-radius:4px;}"
-        )
+        self._btn_clear.setMinimumHeight(30)
         self._btn_clear.clicked.connect(self._clear_results)
         ctrl_layout.addWidget(self._btn_clear)
 
@@ -138,7 +147,7 @@ class IHATestPanelView(QWidget):
 
         # Genel durum
         self._overall_label = QLabel("Hazır")
-        self._overall_label.setStyleSheet("color:#8b949e;font-weight:bold;")
+        self._overall_label.setObjectName("mutedLabel")
         ctrl_layout.addWidget(self._overall_label)
 
         root.addWidget(ctrl_frame)
@@ -150,9 +159,10 @@ class IHATestPanelView(QWidget):
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
 
         lbl = QLabel("Test Modülleri")
-        lbl.setStyleSheet("color:#8b949e;font-size:10px;padding:2px;")
+        lbl.setObjectName("sectionTitle")
         left_layout.addWidget(lbl)
 
         self._table = QTableWidget()
@@ -162,11 +172,8 @@ class IHATestPanelView(QWidget):
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
-        self._table.setStyleSheet(
-            "QTableWidget{background:#0d1b2a;color:#e0e0e0;border:none;}"
-            "QTableWidget::item:selected{background:#065ea5;}"
-            "QHeaderView::section{background:#1c2526;color:#8b949e;border:none;padding:4px;}"
-        )
+        self._table.verticalHeader().setVisible(False)
+        self._table.verticalHeader().setDefaultSectionSize(30)
 
         for i, (no, cls_name, name, cat) in enumerate(TEST_DEFS):
             self._table.insertRow(i)
@@ -174,7 +181,7 @@ class IHATestPanelView(QWidget):
             self._table.setItem(i, 1, QTableWidgetItem(name))
             self._table.setItem(i, 2, QTableWidgetItem(cat))
             status_item = QTableWidgetItem("BEKLEMEDE")
-            status_item.setForeground(QColor(STATUS_COLORS["PENDING"]))
+            status_item.setForeground(QColor(status_color("PENDING")))
             self._table.setItem(i, 3, status_item)
 
         self._table.resizeColumnsToContents()
@@ -186,15 +193,11 @@ class IHATestPanelView(QWidget):
         self._progress.setRange(0, len(TEST_DEFS))
         self._progress.setValue(0)
         self._progress.setTextVisible(True)
-        self._progress.setStyleSheet(
-            "QProgressBar{background:#1c2526;border-radius:4px;color:white;}"
-            "QProgressBar::chunk{background:#065ea5;border-radius:4px;}"
-        )
         left_layout.addWidget(self._progress)
 
         # Özet
         self._summary_label = QLabel("─")
-        self._summary_label.setStyleSheet("color:#8b949e;font-size:10px;padding:2px;")
+        self._summary_label.setObjectName("mutedLabel")
         left_layout.addWidget(self._summary_label)
 
         splitter.addWidget(left)
@@ -203,43 +206,38 @@ class IHATestPanelView(QWidget):
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(6)
 
         lbl2 = QLabel("Test Çıktısı")
-        lbl2.setStyleSheet("color:#8b949e;font-size:10px;padding:2px;")
+        lbl2.setObjectName("sectionTitle")
         right_layout.addWidget(lbl2)
 
         self._output = QTextEdit()
         self._output.setReadOnly(True)
-        self._output.setFont(QFont("Courier New", 9))
-        self._output.setStyleSheet(
-            "QTextEdit{background:#0d1b2a;color:#a8d8ff;border:none;}"
-        )
+        self._output.setFont(QFont("Courier New", 10))
         right_layout.addWidget(self._output)
 
         # Hızlı butonlar (tek test)
         quick_frame = QFrame()
         quick_layout = QHBoxLayout(quick_frame)
-        quick_layout.setSpacing(4)
+        quick_layout.setSpacing(6)
         for no, _, name, _ in TEST_DEFS:
             btn = QPushButton(f"{no}")
             btn.setToolTip(f"Test {no}: {name}")
-            btn.setFixedWidth(32)
-            btn.setStyleSheet(
-                "QPushButton{background:#1c2526;color:#e0e0e0;border-radius:3px;"
-                "font-size:10px;padding:2px;}"
-                "QPushButton:hover{background:#065ea5;}"
-            )
+            btn.setObjectName("denseButton")   # normal buton padding'i 2 haneyi yutar
+            btn.setFixedWidth(34)
+            btn.setFixedHeight(26)
             btn.clicked.connect(lambda checked, n=no: self._run_single(n))
             quick_layout.addWidget(btn)
         quick_layout.addStretch()
         quick_lbl = QLabel("Tek test çalıştır:")
-        quick_lbl.setStyleSheet("color:#8b949e;font-size:10px;")
+        quick_lbl.setObjectName("mutedLabel")
         quick_layout.insertWidget(0, quick_lbl)
         right_layout.addWidget(quick_frame)
 
         splitter.addWidget(right)
-        splitter.setSizes([380, 620])
-        root.addWidget(splitter)
+        splitter.setSizes([420, 580])
+        root.addWidget(splitter, 1)
 
     # ── Slot'lar ─────────────────────────────────────────────────────────────
 
@@ -258,8 +256,7 @@ class IHATestPanelView(QWidget):
         self._log(f"Test başlatılıyor: {spec}  [{'SİM' if sim_mode else 'GERÇEK'}]")
         self._btn_run.setEnabled(False)
         self._btn_abort.setEnabled(True)
-        self._overall_label.setText("ÇALIŞIYOR...")
-        self._overall_label.setStyleSheet("color:#00b4d8;font-weight:bold;")
+        self._set_overall("ÇALIŞIYOR...", "info")
         self._poll_timer.start()
         self.run_test_requested.emit(spec, sim_mode)
 
@@ -268,10 +265,37 @@ class IHATestPanelView(QWidget):
         self._output.clear()
         self._test_statuses = {t[1]: "PENDING" for t in TEST_DEFS}
         self._refresh_ui()
-        self._overall_label.setText("Hazır")
-        self._overall_label.setStyleSheet("color:#8b949e;font-weight:bold;")
+        self._set_overall("Hazır", "text_muted")
         self._summary_label.setText("─")
         self._progress.setValue(0)
+
+    def _set_overall(self, text: str, token: str | None) -> None:
+        """Genel durum etiketini metin + tema token'ı ile yazar.
+
+        Token saklanır; tema değişince `_apply_theme_colors` aynı durumu
+        yeniden boyar (kurulumda yazılan renk bayat kalmasın)."""
+        self._overall_token = token
+        self._overall_label.setText(text)
+        if token is None:
+            self._overall_label.setStyleSheet("")
+        else:
+            self._overall_label.setStyleSheet(
+                f"color:{theme.c(token)};font-weight:bold;"
+            )
+
+    def _apply_theme_colors(self) -> None:
+        """Tema değişince inline yazılmış renkleri yeniden üretir.
+
+        Genel durum etiketi son bilinen token'la, tablo durum hücreleri ise
+        `_refresh_ui` üzerinden mevcut test durumlarıyla yeniden boyanır.
+
+        NEDEN metin saklanıyor: `_refresh_ui` sonda `_summary_label`'ı sayaçlarla
+        EZİYOR. Tema değişimi salt görsel olmalı — `_finish_run`'ın yazdığı
+        "Test tamamlanamadı — <hata>" gibi mesajlar kaybolmamalı."""
+        self._set_overall(self._overall_label.text(), self._overall_token)
+        _summary = self._summary_label.text()
+        self._refresh_ui()
+        self._summary_label.setText(_summary)
 
     # ── Status Güncelleme ─────────────────────────────────────────────────────
 
@@ -308,16 +332,33 @@ class IHATestPanelView(QWidget):
         failed  = summary.get("failed", 0)
         skipped = summary.get("skipped", 0)
 
+        # Test altyapısı çökerse İHA {"running":None,"error":...} döner —
+        # summary HİÇ gelmez. Eski kod yalnızca `failed == 0` baktığı için
+        # bu durumda yeşil "PASS 0✓" gösteriyordu ve operatör çökmüş bir test
+        # paketini "geçti" sanıp uçuşa devam edebiliyordu. Önce hata/boş
+        # sonuç durumlarını ele al.
+        err = test_status.get("error")
+        aborted = bool(test_status.get("aborted"))
+        if err or aborted or (passed + failed + skipped) == 0:
+            if aborted:
+                txt, tok = "İPTAL EDİLDİ", "warning"
+            elif err:
+                txt, tok = "HATA", "danger"
+            else:
+                txt, tok = "SONUÇ YOK", "danger"
+            self._set_overall(txt, tok)
+            self._summary_label.setText(
+                f"Test tamamlanamadı — {err}" if err else
+                ("Test operatör tarafından iptal edildi" if aborted
+                 else "Companion'dan sonuç gelmedi")
+            )
+            self._log(f"\n✗ Test tamamlanamadı: {err or ('iptal' if aborted else 'sonuç yok')}")
+            return
+
         if failed == 0:
-            self._overall_label.setText(f"PASS  {passed}✓")
-            self._overall_label.setStyleSheet(
-                "color:#06d6a0;font-weight:bold;font-size:12px;"
-            )
+            self._set_overall(f"PASS  {passed}✓", "success")
         else:
-            self._overall_label.setText(f"FAIL  {passed}✓ {failed}✗")
-            self._overall_label.setStyleSheet(
-                "color:#ef233c;font-weight:bold;font-size:12px;"
-            )
+            self._set_overall(f"FAIL  {passed}✓ {failed}✗", "danger")
 
         self._summary_label.setText(
             f"Geçti: {passed}  Başarısız: {failed}  Atlandı: {skipped}"
@@ -343,7 +384,7 @@ class IHATestPanelView(QWidget):
             item = self._table.item(i, 3)
             if item is None:
                 continue
-            color = STATUS_COLORS.get(status, STATUS_COLORS["PENDING"])
+            color = status_color(status)
             label = {
                 "PASS": "✓ PASS", "FAIL": "✗ FAIL", "SKIP": "◌ ATLANIDI",
                 "WARNING": "⚠ UYARI", "RUNNING": "⏳ ÇALIŞIYOR", "PENDING": "○ BEKLEMEDE"

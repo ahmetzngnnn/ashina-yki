@@ -21,6 +21,16 @@ OTOMATİK BAŞLAMA:
   İHA enerji alıp geçerli koordinat göndermeye başladığı an (fix + lat/lon),
   anten home noktası (ayarlanmadıysa) ilk drone civarına/sabit değere kilitlenir
   ve takip otomatik başlar.
+
+⚠ İRTİFA REFERANSI (KRİTİK):
+  Bu worker'daki TÜM irtifalar **AMSL** (deniz seviyesinden metre) tutulur.
+  • Anten home irtifası: anten Pixhawk GPS'inden GLOBAL_POSITION_INT.alt → AMSL.
+  • İHA irtifası: telemetride "alt"/"relative_alt" GÖRELİ'dir (kalkışa göre);
+    HOME_POSITION'dan gelen "home_alt" (AMSL) ile toplanarak AMSL'e çevrilir:
+        drone_amsl = home_alt + relative_alt
+  Karıştırılırsa (örn. 850 m rakımda 30 m göreli irtifa) alt_diff = 30-850 = -820
+  → elevasyon ≈ -76° → anten yere bakar ve link kopar. Bu yüzden home_alt yoksa
+  takip BAŞLATILMAZ; error_occurred sinyali yayınlanır.
 """
 from __future__ import annotations
 import logging
@@ -57,8 +67,14 @@ class AntennaTrackerWorker(QThread):
 
         self._enabled = False
         self._conn = None
-        self._drone = None                   # son drone konumu {lat,lon,alt,fix}
+        # son drone konumu {lat, lon, alt_amsl, rel_alt} — alt_amsl AMSL referanslı
+        self._drone = None
         self._last_send = 0.0
+        # NEDEN: İHA telemetrisi göreli irtifa verir; AMSL'e çevirmek için
+        # HOME_POSITION'dan gelen home_alt (AMSL) gerekir. Gelene kadar takip
+        # yapılamaz — referans uyuşmazlığı anteni yere baktırır.
+        self._drone_home_alt_amsl = None     # AMSL, HOME_POSITION.altitude
+        self._last_ref_warn = 0.0            # hata sinyali kısıtlama (spam engeli)
 
     # ── Kontrol (ana thread'den) ───────────────────────────────────────────
     def enable(self) -> None:
@@ -71,32 +87,62 @@ class AntennaTrackerWorker(QThread):
         logger.info("Anten takip devre dışı.")
 
     def set_antenna_home(self, lat: float, lon: float, alt: float) -> None:
-        """Anten (sabit) konumunu elle ayarla — örn. saha kurulumunda ölçülen GPS."""
+        """Anten (sabit) konumunu elle ayarla — örn. saha kurulumunda ölçülen GPS.
+
+        alt: **AMSL** metre (deniz seviyesi). Göreli irtifa VERİLMEMELİDİR.
+        """
         self._home = {"lat": lat, "lon": lon, "alt": alt}
         self._home_locked = True
-        logger.info("Anten home ayarlandı: %.6f, %.6f, %.1f m", lat, lon, alt)
+        logger.info("Anten home ayarlandı: %.6f, %.6f, %.1f m AMSL", lat, lon, alt)
 
     def set_home_from_current_drone(self) -> bool:
         """Anten home'unu anlık İHA konumuna ayarla (saha kalibrasyonu).
-        Anten ile İHA aynı noktadayken (kalkış öncesi) çağrılır. True=başarılı."""
+        Anten ile İHA aynı noktadayken (kalkış öncesi) çağrılır. True=başarılı.
+
+        NEDEN: İHA'nın AMSL irtifası kullanılır (göreli değil) — anten home'u da
+        AMSL referansında tutulmalı, aksi halde compute_aim referans karıştırır."""
         if self._drone is None:
             logger.warning("Anten home ayarlanamadı — İHA konumu henüz yok.")
             return False
         d = self._drone
-        self.set_antenna_home(d["lat"], d["lon"], d["alt"])
+        if d.get("alt_amsl") is None:
+            msg = ("Anten home ayarlanamadı — İHA AMSL irtifası bilinmiyor "
+                   "(HOME_POSITION/home_alt telemetride yok).")
+            logger.warning(msg)
+            self.error_occurred.emit(msg)
+            return False
+        self.set_antenna_home(d["lat"], d["lon"], float(d["alt_amsl"]))
         return True
 
     @pyqtSlot(dict)
     def update_drone_position(self, telem: dict) -> None:
-        """mavlink_worker.telemetry_updated → İHA konumu beslemesi."""
+        """mavlink_worker.telemetry_updated → İHA konumu beslemesi.
+
+        NEDEN (KRİTİK DÜZELTME): telemetrideki "alt"/"relative_alt" GÖRELİ irtifadır
+        (kalkış noktasına göre), anten home irtifası ise Pixhawk GPS'inden AMSL
+        gelir. İkisi doğrudan çıkarılırsa (drone_alt - ant_alt) rakım kadar hatalı
+        negatif fark oluşur ve anten yere bakar. Burada göreli irtifa,
+        HOME_POSITION'dan gelen home_alt (AMSL) ile toplanarak AMSL'e çevrilir.
+        """
         lat = telem.get("lat"); lon = telem.get("lon")
-        alt = telem.get("alt", telem.get("relative_alt", 0.0))
+        rel = telem.get("relative_alt", telem.get("alt"))
         if lat is None or lon is None:
             return
         # Geçersiz/sıfır fix'i ele
         if abs(lat) < 1e-6 and abs(lon) < 1e-6:
             return
-        self._drone = {"lat": float(lat), "lon": float(lon), "alt": float(alt or 0.0)}
+
+        # İHA kalkış noktası irtifası (AMSL) — HOME_POSITION.altitude
+        home_amsl = telem.get("home_alt", telem.get("home_altitude"))
+        if home_amsl is not None:
+            self._drone_home_alt_amsl = float(home_amsl)
+
+        rel_f = float(rel or 0.0)
+        alt_amsl = (self._drone_home_alt_amsl + rel_f
+                    if self._drone_home_alt_amsl is not None else None)
+
+        self._drone = {"lat": float(lat), "lon": float(lon),
+                       "rel_alt": rel_f, "alt_amsl": alt_amsl}
 
     # ── Worker döngüsü ─────────────────────────────────────────────────────
     def run(self) -> None:
@@ -148,15 +194,18 @@ class AntennaTrackerWorker(QThread):
 
     # ── İç yardımcılar ─────────────────────────────────────────────────────
     def _try_lock_home_from_pixhawk(self) -> None:
-        """Anten Pixhawk GPS'inden home konumunu otomatik al."""
+        """Anten Pixhawk GPS'inden home konumunu otomatik al.
+
+        GLOBAL_POSITION_INT.alt AMSL (mm) → anten home irtifası AMSL olarak saklanır;
+        compute_aim'in beklediği referans budur."""
         try:
             msg = self._conn.recv_match(type="GLOBAL_POSITION_INT", blocking=False)
             if msg and msg.lat != 0:
                 self._home = {"lat": msg.lat / 1e7, "lon": msg.lon / 1e7,
-                              "alt": msg.alt / 1000.0}
+                              "alt": msg.alt / 1000.0}   # AMSL (mm→m)
                 self._home_locked = True
-                logger.info("Anten home Pixhawk GPS'inden alındı: %.6f, %.6f",
-                            self._home["lat"], self._home["lon"])
+                logger.info("Anten home Pixhawk GPS'inden alındı: %.6f, %.6f, %.1f m AMSL",
+                            self._home["lat"], self._home["lon"], self._home["alt"])
         except Exception:
             pass
 
@@ -164,8 +213,31 @@ class AntennaTrackerWorker(QThread):
         from pymavlink import mavutil
         d = self._drone
         h = self._home
+
+        # NEDEN: Referans uyuşmazlığı koruması. İHA AMSL irtifası bilinmiyorsa
+        # (HOME_POSITION henüz gelmediyse) göreli irtifayı AMSL anten irtifasından
+        # çıkarmak anteni yere baktırır → takibi başlatma, kullanıcıyı uyar.
+        drone_amsl = d.get("alt_amsl")
+        if drone_amsl is None:
+            now = time.time()
+            if now - self._last_ref_warn > 10.0:
+                self._last_ref_warn = now
+                self.error_occurred.emit(
+                    "Anten takip bekliyor: İHA irtifa referansı belirsiz "
+                    "(HOME_POSITION/home_alt gelmedi). Göreli irtifa AMSL anten "
+                    "irtifasıyla karşılaştırılamaz — takip duraklatıldı."
+                )
+            self.tracker_status.emit({
+                "azimuth": 0.0, "elevation": 0.0,
+                "ground_distance_m": 0.0, "slant_distance_m": 0.0,
+                "alt_diff_m": 0.0, "tracking": False,
+                "error": "irtifa referansı yok (home_alt)",
+            })
+            return
+
+        # Her iki irtifa da AMSL — compute_aim sözleşmesi (bkz. tracker_math.py)
         aim = tm.compute_aim(h["lat"], h["lon"], h["alt"],
-                             d["lat"], d["lon"], d["alt"])
+                             d["lat"], d["lon"], float(drone_amsl))
 
         tracking = aim["ground_distance_m"] >= self._min_dist
         status = dict(aim); status["tracking"] = tracking
@@ -178,10 +250,15 @@ class AntennaTrackerWorker(QThread):
 
         if self._mode == "forward":
             # İHA konumunu anten Pixhawk'ına ilet — AntennaTracker firmware hesaplar
+            # NEDEN: GLOBAL_POSITION_INT'in 4. alanı `alt` = AMSL (mm), 5. alanı
+            # `relative_alt` = yere/home'a göre (mm). Önceden her iki alana da göreli
+            # irtifa yazılıyordu; AntennaTracker firmware AMSL alanını kullandığı için
+            # elevasyon hesabı bozuluyordu. Artık doğru alanlara doğru referans.
             self._conn.mav.global_position_int_send(
                 int(time.time() * 1000) & 0xFFFFFFFF,
                 int(d["lat"] * 1e7), int(d["lon"] * 1e7),
-                int(d["alt"] * 1000), int(d["alt"] * 1000),
+                int(float(drone_amsl) * 1000),      # alt: AMSL (mm)
+                int(float(d.get("rel_alt", 0.0)) * 1000),  # relative_alt (mm)
                 0, 0, 0, 0,
             )
         else:  # "compute": YKİ hesaplar, mount kontrolü ile yönlendir

@@ -4,7 +4,8 @@ Tüm view'leri barındırır; signal/slot bağlamalarını yapar.
 Watchdog QTimer (5 sn) ile worker heartbeat'lerini izler.
 """
 import logging
-from PyQt6.QtCore import QTimer, pyqtSlot
+import re
+from PyQt6.QtCore import QTimer, pyqtSlot, Qt
 from PyQt6.QtGui import QFont, QShortcut, QKeySequence
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QTabWidget,
@@ -21,6 +22,7 @@ from core.audio_tts_worker import AudioTTSWorker
 from core.rpi_status_worker import RpiStatusWorker
 from core.gcs_config import config
 from core import local_storage
+from core import theme
 
 from ui.top_bar import TopBar
 from ui.auth_manager import AuthManager
@@ -58,7 +60,20 @@ class MainWindow(QMainWindow):
         self._auth = auth_manager
         self._hb_snapshots: dict = {}
         self._hb_stale_count: dict = {}   # ardışık "değişmedi" örnek sayısı (bkz. HANG_CONFIRM_TICKS)
+        # Kurtarılamayan (takılı ve durdurulamayan) worker adları. NEDEN set:
+        # uyarı yalnızca DURUM DEĞİŞİMİNDE bir kez verilsin, her tick'te değil
+        # (bkz. _report_worker_unrecoverable).
+        self._hb_unrecoverable: set = set()
         self._prev_rpi_state: dict = {}   # önceki RPi durumu — değişim tespiti için
+        # Son uygulanan RBAC rolü — çalışma anındaki rol değişimini yakalamak için
+        # (bkz. _check_rbac_change).
+        self._last_rbac_role: int = -1
+        # Durum çubuğu sağ etiketinin SON uygulanan tema token'ı + kalınlığı.
+        # Renk çalışma anında değişiyor (bağlantı/görev/failsafe); tema değişince
+        # aynı DURUMU yeni paletle yeniden boyayabilmek için saklanır
+        # (bkz. _apply_rpi_status_style / _apply_theme_colors).
+        self._rpi_status_token: str = "text_muted"
+        self._rpi_status_bold: bool = False
 
         self.setWindowTitle("ASHİNA YKİ  |  Taktiksel Yer Kontrol İstasyonu v2.0")
         self.setMinimumSize(1280, 768)
@@ -67,8 +82,13 @@ class MainWindow(QMainWindow):
         self._init_workers()
         self._build_ui()
         self._connect_signals()
-        self._apply_rbac()
+        # refresh_rbac (yalın _apply_rbac değil) → _last_rbac_role da damgalanır,
+        # böylece ilk watchdog tick'i sahte bir "rol değişti" tespiti yapmaz.
+        self.refresh_rbac()
         self._start_workers()
+
+        # Tema değişince satır içi yazılmış renkler bayat kalır — yeniden yazdır.
+        theme.notifier().changed.connect(lambda _n: self._apply_theme_colors())
 
         # Tam ekrandan çıkış / tam ekrana geçiş (kiosk modunda pencere çerçevesi yok)
         self._fullscreen_shortcut = QShortcut(QKeySequence("F11"), self)
@@ -89,6 +109,30 @@ class MainWindow(QMainWindow):
     def _apply_style(self) -> None:
         # Global style.qss üzerinden yönetiliyor.
         pass
+
+    # ── Tema ─────────────────────────────────────────────────────────────────
+    def _apply_rpi_status_style(self, token: str, bold: bool = False) -> None:
+        """Durum çubuğu sağ etiketinin rengini tema token'ından uygular.
+
+        Metne DOKUNMAZ (yalnız renk) — bazı çağrılar (failsafe uyarısı) mevcut
+        metni korumak ister. Kullanılan token saklanır; tema değişince
+        _apply_theme_colors aynı token'ı yeni paletle tekrar yazar.
+        """
+        self._rpi_status_token = token
+        self._rpi_status_bold = bold
+        weight = "font-weight: bold; " if bold else ""
+        self._rpi_status_label.setStyleSheet(
+            f"color: {theme.c(token)}; {weight}padding: 0 8px;"
+        )
+
+    def _apply_theme_colors(self) -> None:
+        """Tema değişince kurulumda yazılmış satır içi renkleri yeniden yazar.
+
+        Bu pencerede satır içi renk YALNIZCA durum çubuğu sağ etiketinde var ve
+        değeri duruma bağlı; en son uygulanan token/kalınlık saklandığı için
+        mevcut durum yeni paletle birebir yeniden boyanır.
+        """
+        self._apply_rpi_status_style(self._rpi_status_token, self._rpi_status_bold)
 
     # ── Worker Başlatma ──────────────────────────────────────────────────────
     def _init_workers(self) -> None:
@@ -143,6 +187,15 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self.telemetry_recorder = TelemetryRecorder(self._db_conn, parent=self)
+        # Önceki oturum temiz kapanmadıysa (çökme/güç kesintisi) uçuş yalnızca
+        # .autosave.json olarak kalır ve "Kayıtlar" sekmesinde GÖRÜNMEZ.
+        # Açılışta bunları kalıcı kayda çevir.
+        try:
+            _rec_n = self.telemetry_recorder.recover_orphan_autosaves()
+            if _rec_n:
+                logger.info("Yarım kalmış %d uçuş kaydı kurtarıldı", _rec_n)
+        except Exception as exc:
+            logger.warning("Uçuş kaydı kurtarma başarısız: %s", exc)
 
         # ── Anten Takip Sistemi (RUTX10 + Pixhawk gimbal) ────────────────────
         # İHA telemetrisinden anten azimut/elevasyon hesaplayıp anten Pixhawk'ına iletir.
@@ -185,7 +238,11 @@ class MainWindow(QMainWindow):
 
         # Sekmeler
         self._tabs = QTabWidget()
-        self._tabs.setFont(QFont("Segoe UI", 11))
+        self._tabs.setFont(QFont("Segoe UI", 10))
+        # Tüm sekmeler tek satıra sığsın: kaydırma oklarını kapat, kısaltma yapma
+        self._tabs.setElideMode(Qt.TextElideMode.ElideNone)
+        self._tabs.setUsesScrollButtons(False)
+        self._tabs.tabBar().setExpanding(False)
 
         self._dashboard      = DashboardView()
         self._mission_view   = MissionPlanView()
@@ -202,15 +259,15 @@ class MainWindow(QMainWindow):
         self._antenna_view   = AntennaTrackerView()
 
         self._tabs.addTab(self._dashboard,      "Dashboard")
-        self._tabs.addTab(self._mission_view,   "Görev Planlama (Telemetri)")
-        self._tabs.addTab(self._mission_panel,  "Özel Görevler (Yardımcı Bilgisayar)")
-        self._tabs.addTab(self._iha_test_panel, "🔧 İHA Devreye Alma")   # YENİ sekme
+        self._tabs.addTab(self._mission_view,   "Görev Planlama")
+        self._tabs.addTab(self._mission_panel,  "Özel Görevler")
+        self._tabs.addTab(self._iha_test_panel, "🔧 Devreye Alma")   # YENİ sekme
         self._tabs.addTab(self._test_panel,     "Test Paneli")
         self._tabs.addTab(self._calib_view,     "Kalibrasyon")
         self._tabs.addTab(self._tuning_view,    "PID Tuning")
         self._tabs.addTab(self._advanced_view,  "Gelişmiş")
-        self._tabs.addTab(self._syslog_view,    "Sistem / Log")
-        self._tabs.addTab(self._flight_analysis_view, "Kayıtlar & Analiz")
+        self._tabs.addTab(self._syslog_view,    "Sistem/Log")
+        self._tabs.addTab(self._flight_analysis_view, "Kayıtlar")
         self._tabs.addTab(self._antenna_view,   "📡 Anten Takip")
         self._tabs.addTab(self._settings_view,  "Ayarlar")
 
@@ -222,7 +279,7 @@ class MainWindow(QMainWindow):
         self._status_label = QLabel("Hazır")
         self._statusbar.addWidget(self._status_label)
         self._rpi_status_label = QLabel("Yardımcı Bilgisayar: bağlı değil")
-        self._rpi_status_label.setStyleSheet("color: #8b949e; padding: 0 8px;")
+        self._apply_rpi_status_style("text_muted")
         self._statusbar.addPermanentWidget(self._rpi_status_label)
 
     # ── Sinyal Bağlamaları ───────────────────────────────────────────────────
@@ -257,6 +314,10 @@ class MainWindow(QMainWindow):
 
         # RPi Görev (companion)
         self._mission_panel.mission_ready_to_send.connect(self.ai_worker.send_mission_with_waypoints)
+        # Görev panelindeki hedef tespit bildirimi ÖNCEDEN emit ediliyor ama hiçbir
+        # yere bağlı değildi (sinyal boşa gidiyordu). Dashboard'ın tespit kartlarına
+        # yönlendiriliyor — İHA'dan gelen tespitle aynı yolu kullanır.
+        self._mission_panel.target_detected.connect(self._on_ai_detection)
 
         # TopBar — görev başlatma companion'a (ai_worker)
         self.top_bar.start_mission_requested.connect(self.ai_worker.send_start_command)
@@ -290,11 +351,18 @@ class MainWindow(QMainWindow):
         self.rpi_worker.health_alert.connect(self._on_health_alert)
         self.rpi_worker.mission_notification.connect(self._on_mission_notification)
         self._iha_test_panel.run_test_requested.connect(self.ai_worker.send_run_test)
+        # "⏹ Durdur" butonu ÖNCEDEN hiçbir yere bağlı değildi: operatör çalışan
+        # bir test dizisini (gerçek servo/motor hareketi içerir) durduramıyordu.
+        # İHA tarafına abort_test komutu eklendi; buraya bağlanıyor.
+        self._iha_test_panel.abort_test_requested.connect(self.ai_worker.send_abort_test)
         self.rpi_worker.rpi_status_updated.connect(self._iha_test_panel.update_test_status)
         self.rpi_worker.mission_notification.connect(self._iha_test_panel.append_log)
 
         # Auth
         self._auth.logout_required.connect(self._on_logout_required)
+        # Rol oturum içinde değişirse (JWT yenileme, çıkış) sekme kilitleri ANINDA
+        # tazelensin — yoklamayı beklemeden. Yoklama emniyet ağı olarak kalır.
+        self._auth.role_changed.connect(lambda _r: self.refresh_rbac())
 
         # Log indirme (UI→handler; request_log_list→worker _wire'da)
         self._syslog_view.download_log.connect(self._on_download_log)
@@ -327,6 +395,10 @@ class MainWindow(QMainWindow):
         w.mag_cal_report.connect(self._calib_view.on_mag_cal_report)
         w.status_text_received.connect(self._dashboard.add_status_message)
         w.status_text_received.connect(self._syslog_view.on_status_text)
+        # İvmeölçer kalibrasyonu FC'nin STATUSTEXT yanıtına ("Place vehicle…",
+        # "Calibration successful/FAILED") göre ilerler. Bu bağlantı olmadan panel
+        # adımları körlemesine sayar ve doğrulanmamış "tamamlandı" gösterirdi.
+        w.status_text_received.connect(self._calib_view.on_status_text)
         w.mission_download_done.connect(self._on_mission_download_done)
         w.mission_download_progress.connect(self._on_mission_download_progress)
         w.mission_upload_progress.connect(self._on_mission_upload_progress)
@@ -337,6 +409,10 @@ class MainWindow(QMainWindow):
 
         # UI → worker
         self._calib_view.send_command.connect(w.send_command)
+        # Radyo kalibrasyonu yakalanan uçları RC{n}_MIN/MAX olarak YAZAR — bu
+        # bağlantı olmadan "Kaydet" hiçbir şey kaydetmez (panel bunu algılayıp
+        # kırmızı "KAYDEDİLMEDİ" gösterir, ama asıl çözüm bağlantının olması).
+        self._calib_view.set_param.connect(w.set_param)
         self._tuning_view.send_command.connect(w.send_command)
         self._tuning_view.set_param.connect(w.set_param)
         self._advanced_view.set_param.connect(w.set_param)
@@ -375,16 +451,150 @@ class MainWindow(QMainWindow):
 
     # ── RBAC Erişim Kontrolü ─────────────────────────────────────────────────
     def _apply_rbac(self) -> None:
+        """Rol tabanlı sekme + uçuş komutu kilitleri (C3 — KRİTİK).
+
+        NEDEN: Eski kod SABİT sekme indeksleri kullanıyordu (1..8) ama gerçek
+        sekme sırası 12 sekmeye çıkmıştı. İndeksler kaymış olduğu için:
+          • İndeks 6 "Sys/Log: OPERATOR+" yorumuyla PID Tuning'i açıyordu,
+          • Gerçek Sistem/Log (indeks 8 — içinde KULLANICI YÖNETİMİ var) ve
+            Gelişmiş (indeks 7 — tam parametre yazma) hiç kısıtlanmıyor,
+          • Kayıtlar / Anten Takip / Ayarlar (9/10/11) hiç kısıtlanmıyor,
+          • Dashboard (0 — ARM/TAKEOFF/RTL/yük bırakma) hiç kısıtlanmıyordu.
+        Sonuç: doğrudan yetki yükseltme. Artık indeks yerine WIDGET REFERANSI
+        üzerinden (self._tabs.indexOf(...)) kilitlenir; sekme sırası değişse
+        bile eşleme bozulmaz.
+        """
         role = state.get_rbac_role()
-        # Tab indeksleri
-        self._tabs.setTabEnabled(1, role >= 2)   # Görev Paneli: OPERATOR+
-        self._tabs.setTabEnabled(2, role >= 2)   # Test Paneli: OPERATOR+
-        self._tabs.setTabEnabled(3, role >= 3)   # Calib: ADMIN
-        self._tabs.setTabEnabled(4, role >= 2)   # Tuning: OPERATOR+
-        self._tabs.setTabEnabled(5, role >= 3)   # Advanced: ADMIN
-        self._tabs.setTabEnabled(6, role >= 2)   # Sys/Log: OPERATOR+
-        self._tabs.setTabEnabled(7, role >= 2)   # Uçuş Analizi: OPERATOR+
-        self._tabs.setTabEnabled(8, role >= 2)   # Ayarlar: OPERATOR+
+
+        # Widget → gereken minimum rol (1=VIEWER, 2=OPERATOR, 3=ADMIN)
+        tab_roles = [
+            (self._dashboard,             1),   # Dashboard: görünür kalır (komutlar ayrıca kilitli)
+            (self._mission_view,          2),   # Görev Planlama: OPERATOR+
+            (self._mission_panel,         2),   # Özel Görevler: OPERATOR+
+            (self._iha_test_panel,        2),   # Devreye Alma: OPERATOR+
+            (self._test_panel,            2),   # Test Paneli: OPERATOR+
+            (self._calib_view,            3),   # Kalibrasyon: ADMIN
+            (self._tuning_view,           3),   # PID Tuning: ADMIN
+            (self._advanced_view,         3),   # Gelişmiş (tam param yazma): ADMIN
+            (self._syslog_view,           3),   # Sistem/Log (Kullanıcı Yönetimi): ADMIN
+            (self._flight_analysis_view,  1),   # Kayıtlar: VIEWER+
+            (self._antenna_view,          1),   # Anten Takip: VIEWER+
+            (self._settings_view,         3),   # Ayarlar: ADMIN
+        ]
+        for widget, min_role in tab_roles:
+            idx = self._tabs.indexOf(widget)
+            if idx >= 0:
+                self._tabs.setTabEnabled(idx, role >= min_role)
+
+        # Kilitli bir sekme aktifse Dashboard'a düş (Qt devre dışı sekmeyi
+        # kendiliğinden terk etmez — içerik görünür kalabilirdi).
+        cur = self._tabs.currentIndex()
+        if cur >= 0 and not self._tabs.isTabEnabled(cur):
+            dash_idx = self._tabs.indexOf(self._dashboard)
+            if dash_idx >= 0:
+                self._tabs.setCurrentIndex(dash_idx)
+
+        self._apply_dashboard_rbac(role)
+
+    def _apply_dashboard_rbac(self, role: int) -> None:
+        """Dashboard uçuş komutlarını rol ile kilitler (C3).
+
+        NEDEN: Dashboard sekmesi herkese görünür olmalı (durum izleme), ancak
+        VIEWER (rol 1) ARM/DISARM/TAKEOFF/LAND/RTL/mod değiştirme/GUIDED hız
+        komutu/yük bırakma YAPAMAMALIDIR. dashboard_view.py'de bu kontrolleri
+        kapatan public bir metot YOK ve butonlar yerel değişken (self.* değil),
+        bu yüzden dosyayı DEĞİŞTİRMEDEN kapsayıcı widget'lar üzerinden
+        (QGroupBox "Hızlı Komutlar", QFrame#servoPanel, GuidedControlWidget)
+        devre dışı bırakılır. Kapsayıcıyı kapatmak içindeki tüm butonları da
+        kapatır ve sekme sırası/buton eklenmesinden etkilenmez.
+        """
+        from PyQt6.QtWidgets import QGroupBox
+        can_command = role >= 2   # OPERATOR ve üstü
+        try:
+            # 1) "Hızlı Komutlar" grubu → ARM/DISARM/TAKEOFF/LAND/RTL/mod butonları
+            for grp in self._dashboard.findChildren(QGroupBox):
+                if grp.title().strip() == "Hızlı Komutlar":
+                    grp.setEnabled(can_command)
+                    if not can_command:
+                        grp.setToolTip("Uçuş komutları için OPERATOR yetkisi gerekir")
+
+            # 2) Yük bırakma / grabber / gimbal servo paneli (QFrame#servoPanel)
+            for w in self._dashboard.findChildren(QWidget):
+                if w.objectName() == "servoPanel":
+                    w.setEnabled(can_command)
+                    if not can_command:
+                        w.setToolTip("Yük bırakma için OPERATOR yetkisi gerekir")
+
+            # 3) GUIDED hız/yaw kumandası (GuidedControlWidget — doğrudan
+            #    ned_velocity_cmd üretir, uçuş komutudur)
+            gc = getattr(self._dashboard, "_guided_ctrl", None)
+            if gc is not None:
+                gc.setEnabled(can_command)
+                if not can_command:
+                    gc.setToolTip("Manuel yönlendirme için OPERATOR yetkisi gerekir")
+        except Exception as exc:   # UI kilidi uygulanamazsa sessizce geçme — logla
+            logger.error("Dashboard RBAC kilidi uygulanamadı: %s", exc)
+
+        # TopBar'daki görev başlat / durdur / manuel bırakma da uçuş komutudur.
+        # NOT: Yalnızca KAPATIRIZ, asla açmayız — bu butonların "hazır" durumu
+        # (set_mission_ready) ayrı bir mantıkla yönetilir; burada True yapmak
+        # görev yüklenmeden Başlat'ı açardı.
+        if not can_command:
+            for attr in ("_btn_start", "_btn_start_fcu", "_btn_abort", "_btn_drop"):
+                btn = getattr(self.top_bar, attr, None)
+                if btn is not None:
+                    btn.setEnabled(False)
+            logger.info("RBAC: rol=%s — Dashboard uçuş komutları kilitlendi (salt görüntüleme)", role)
+
+    def _require_command_role(self, islem: str) -> bool:
+        """Uçuş komutu için OPERATOR (rol >= 2) zorunlu (C3).
+
+        NEDEN: UI kilidi tek savunma hattı olmamalıdır — komutu gönderen
+        slot'ta da rol doğrulanır (defense in depth).
+        """
+        role = state.get_rbac_role()
+        if role < 2:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Yetki Yok",
+                f"{islem} için OPERATOR yetkisi gerekir.\n\nMevcut rol seviyeniz: {role}",
+            )
+            logger.warning("Yetkisiz uçuş komutu denemesi: %s (rol=%s)", islem, role)
+            return False
+        return True
+
+    def refresh_rbac(self) -> None:
+        """Rol değiştiğinde (giriş/çıkış/JWT yenileme) dışarıdan çağrılabilir.
+
+        NEDEN: _apply_rbac yalnızca __init__ içinde bir kez çağrılıyordu; rol
+        çalışma anında değişirse kilitler güncellenmiyordu.
+        """
+        self._apply_rbac()
+        self._last_rbac_role = state.get_rbac_role()
+
+    def _check_rbac_change(self) -> None:
+        """Rol çalışma anında değiştiyse RBAC kilitlerini tazele.
+
+        Birincil yol artık SİNYAL: auth_manager.role_changed → refresh_rbac
+        (bkz. _connect_signals). Bu yoklama yalnızca EMNİYET AĞI olarak duruyor —
+        rolü auth_manager dışından değiştiren bir kod yolu eklenirse (doğrudan
+        state.set_rbac_role çağrısı) sinyal yayılmaz ve kilitler eskir.
+        Maliyeti iki tam sayı karşılaştırması; zaten çalışan watchdog tick'inde.
+        """
+        role = state.get_rbac_role()
+        if role == self._last_rbac_role:
+            return
+        logger.info("RBAC rolü değişti: %s → %s — erişim kilitleri yenileniyor",
+                    self._last_rbac_role, role)
+        self._last_rbac_role = role
+        self._apply_rbac()
+        # Rol düştüyse (ör. çıkış) acil kontroller de kapanmalı; yükseldiyse bir
+        # sonraki companion durum paketi (_on_rpi_status) doğru durumu geri yazar.
+        if role < 2:
+            try:
+                self.top_bar.set_mission_active(False)
+            except Exception:
+                pass
 
     # ── Slot'lar ──────────────────────────────────────────────────────────────
     @pyqtSlot(str, str, int, str)
@@ -397,14 +607,25 @@ class MainWindow(QMainWindow):
             conn_str = f"udp:{addr}" if ":" in addr else f"udp:0.0.0.0:{addr}"
 
         if data_type == "gimbal":
-            logger.info("Gimbal bağlantısı: %s  baud=%d", conn_str, baud)
-            self._status_label.setText(f"Gimbal: {conn_str} @ {baud}")
-            # Gimbal worker'ı başlat (varsa) — getattr ile Pylance uyarısı engellenir
-            _gw = getattr(self, "gimbal_worker", None)
-            if _gw is not None:
-                _gw.set_connection(conn_str, baud)
-            else:
-                logger.warning("Gimbal worker mevcut değil — bağlantı yoksayıldı")
+            # NEDEN: Kod tabanında `gimbal_worker` diye bir nesne YOK — eski kod
+            # getattr ile onu arıyor, bulamayınca yalnızca DEBUG/WARNING loglayıp
+            # geçiyordu; ama durum çubuğuna "Gimbal: {adres}" yazdığı için işlem
+            # BAŞARILI görünüyordu. Operatör gimbal'ın bağlandığını sanıyordu.
+            # Artık: bağlantı kurulmadığı açıkça söylenir, durum çubuğuna başarı
+            # yazılmaz. (Seçenek top_bar'da bırakıldı; tooltip'te de uyarılıyor.)
+            logger.warning(
+                "Gimbal bağlantısı istendi ancak bu sürümde desteklenmiyor "
+                "(gimbal worker yok): %s @ %d", conn_str, baud
+            )
+            self._status_label.setText("Gimbal bağlantısı bu sürümde DESTEKLENMİYOR")
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Gimbal Desteklenmiyor",
+                "Gimbal bağlantısı bu sürümde desteklenmiyor — hiçbir bağlantı "
+                "kurulmadı.\n\n"
+                f"İstenen port: {conn_str} @ {baud}\n\n"
+                "Drone telemetrisi için veri tipini 'Drone' seçip tekrar deneyin.",
+            )
         else:
             self.mavlink_worker.set_connection(conn_str, baud)
             logger.info("Drone bağlantısı: %s  baud=%d", conn_str, baud)
@@ -466,6 +687,11 @@ class MainWindow(QMainWindow):
     def _on_abort_mission(self) -> None:
         """E3: Görevi durdur — companion abort + doğrudan FC RTL.
         İki başlatma yolunu da (companion / FCU-direct) kapsar."""
+        # C3: Buton kilidi tek başına yeterli değil — top_bar butonların
+        # etkinliğini kendi mantığıyla da değiştirebiliyor. Yetki, komutun
+        # gönderildiği yerde de doğrulanır.
+        if not self._require_command_role("Görev durdurma / RTL"):
+            return
         logger.warning("GÖREV DURDUR/RTL — companion abort + doğrudan RTL")
         try:
             self.ai_worker.send_abort()          # companion görevini iptal et
@@ -485,6 +711,9 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     def _on_drop_now(self) -> None:
         """E4: Manuel yük bırakma komutu (companion'a)."""
+        # C3: VIEWER (rol 1) yük bırakamaz — komut noktasında doğrulanır.
+        if not self._require_command_role("Manuel yük bırakma"):
+            return
         logger.info("Manuel bırakma (drop_now) gönderiliyor")
         try:
             self.ai_worker.send_drop_now()
@@ -554,10 +783,51 @@ class MainWindow(QMainWindow):
         else:
             self.tts_worker.speak("Bağlantı kesildi")
 
+    # Kritik komut hatası sayılan anahtar kelimeler (M10). Bunlar görev iptali /
+    # yük bırakma gibi geri alınamaz komutlarla ilgilidir; sessizce kaybolmamalı.
+    # NEDEN kelime sınırı (\b): düz `in` araması "alarm"ı ARM, "dropped frame"i
+    # yük bırakma sanıp video worker'ının rutin hatalarında modal açardı.
+    _CRITICAL_ERROR_PATTERN = re.compile(
+        r"\b(abort|drop_now|rtl|arm|disarm|failsafe)\b|bırak|görev durdur",
+        re.IGNORECASE,
+    )
+
     @pyqtSlot(str)
     def _on_error(self, msg: str) -> None:
+        """Worker hatası (M10 — ORTA).
+
+        NEDEN: Eskiden hata YALNIZCA 80 karaktere kırpılıp durum çubuğuna
+        yazılıyordu ve bir sonraki mesaj (telemetri/görev bildirimi) üzerine
+        yazarak siliyordu → operatör hatayı hiç görmeden kaybediyordu. Artık:
+          1) Tam metin Sistem/Log'a kalıcı yazılır (root logger → SystemLogView
+             "YKİ Sistem Logları" kutusu) ve audit_log tablosuna işlenir,
+          2) Kritik komut hataları ayrıca modal QMessageBox.critical gösterir.
+        """
         logger.error("Worker hatası: %s", msg)
         self._status_label.setText(f"HATA: {msg[:80]}")
+
+        # 1) Kalıcı kayıt — audit_log (Sistem/Log ekranındaki canlı log root
+        #    logger üzerinden yukarıdaki logger.error ile zaten besleniyor).
+        try:
+            local_storage.write_audit(self._db_conn, "ERROR", msg)
+        except Exception as exc:
+            logger.debug("Hata audit_log'a yazılamadı: %s", exc)
+
+        # 2) Kritik komut hataları → gözden kaçmayacak modal uyarı.
+        #    Aynı mesaj arka arkaya gelirse (retry döngüsü) tek kutu gösterilir;
+        #    aksi halde modal yığını UI'yi kilitler.
+        if self._CRITICAL_ERROR_PATTERN.search(msg):
+            if msg == getattr(self, "_last_critical_error", None):
+                return
+            self._last_critical_error = msg
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.critical(
+                self, "KRİTİK KOMUT HATASI",
+                "Uçuş güvenliğini ilgilendiren bir komut BAŞARISIZ oldu:\n\n"
+                f"{msg}\n\n"
+                "Komutun araca ulaştığını doğrulayın; gerekirse RC ile manuel "
+                "müdahale edin.",
+            )
 
     @pyqtSlot(dict)
     def _on_settings_changed(self, new_settings: dict) -> None:
@@ -745,16 +1015,65 @@ class MainWindow(QMainWindow):
     def _on_rpi_connection_changed(self, connected: bool) -> None:
         """RPi status port bağlantı değişimi.
         Video akışı status porttan BAĞIMSIZ çalışır — status port kopsa da video durdurmaz.
-        Video yalnızca kullanıcı manuel bağlantıyı kesince durur (_on_disconnect_requested)."""
-        if not connected:
-            logger.info("Yardımcı Bilgisayar status bağlantısı kesildi (video etkilenmez)")
-            # Video burada DURDURULMAZ — VideoStreamWorker kendi retry'ını yapar
+        Video yalnızca kullanıcı manuel bağlantıyı kesince durur (_on_disconnect_requested).
+
+        NEDEN (durum etiketi): Etiket ÖNCEDEN yalnızca _on_rpi_status içinde ve
+        SABİT "🟢" ikonuyla güncelleniyordu. Companion çökerse yeni durum paketi
+        hiç gelmez → durum çubuğu son CPU/RAM/Sıcaklık değerleriyle ve YEŞİL
+        ikonla SONSUZA KADAR donuk kalıyordu; operatör sistemi sağlıklı sanıyordu.
+        Artık bağlantı kopunca etiket açıkça "bağlantı yok" durumuna geçer.
+        """
+        if connected:
+            self._apply_rpi_status_style("accent")
+            self._rpi_status_label.setText("Yardımcı Bilgisayar 🟢: bağlandı, durum bekleniyor")
+            return
+
+        logger.warning("Yardımcı Bilgisayar status bağlantısı kesildi — "
+                       "durum göstergeleri geçersiz (video etkilenmez)")
+        self._apply_rpi_status_style("danger", bold=True)
+        self._rpi_status_label.setText("Yardımcı Bilgisayar 🔴: bağlantı yok")
+        self._reset_rpi_gauges()
+        # NEDEN acil kontrollere DOKUNULMUYOR: companion bağlantısı kopmuş olsa
+        # da araç hâlâ uçuyor olabilir. "DURDUR / RTL" companion'dan BAĞIMSIZ
+        # olarak FC'ye doğrudan RTL de gönderir (_on_abort_mission) — tam da
+        # companion'ın kaybolduğu anda kapatılmaması gereken buton budur.
+        # Video burada DURDURULMAZ — VideoStreamWorker kendi retry'ını yapar
+
+    def _reset_rpi_gauges(self) -> None:
+        """Dashboard'daki companion CPU/RAM/Sıcaklık/Ping göstergelerini "—" yapar.
+
+        NEDEN buradan: dashboard_view.py'de bu göstergeleri sıfırlayan PUBLIC bir
+        metot YOK (yalnızca özel _hw_set) ve o dosyayı değiştirmek yasak. Bu
+        yüzden yalnızca Qt'nin kendi public QProgressBar API'si (setValue/
+        setFormat) kullanılıyor — dashboard_view'in ilk kurulumdaki "—" biçimiyle
+        birebir aynı görünüm. Kalıcı çözüm: dashboard_view'a
+        reset_rpi_status()/set_rpi_offline() gibi public bir metot eklemek.
+        """
+        for attr in ("_cpu_bar", "_ram_bar", "_temp_bar", "_ping_bar"):
+            bar = getattr(self._dashboard, attr, None)
+            if bar is None:
+                continue
+            try:
+                bar.setValue(0)
+                bar.setFormat("—")
+            except Exception as exc:
+                logger.debug("Gösterge %s sıfırlanamadı: %s", attr, exc)
 
     @pyqtSlot(dict)
     def _on_rpi_status(self, data: dict) -> None:
-        cpu = data.get("cpu_pct", 0.0)
-        mem = data.get("mem_pct", 0.0)
-        temp = data.get("temp_c", 0.0)
+        # Ondalık taşmasını önle: yüzdeler tam sayı, sıcaklık tek ondalık.
+        try:
+            cpu = int(round(float(data.get("cpu_pct", 0.0))))
+        except (TypeError, ValueError):
+            cpu = 0
+        try:
+            mem = int(round(float(data.get("mem_pct", 0.0))))
+        except (TypeError, ValueError):
+            mem = 0
+        try:
+            temp = f"{float(data.get('temp_c', 0.0)):.1f}"
+        except (TypeError, ValueError):
+            temp = "0.0"
 
         mission_data = data.get("mission", {})
         m_active = mission_data.get("active", False)
@@ -767,6 +1086,23 @@ class MainWindow(QMainWindow):
             "COMPLETED", "ABORTED", "IDLE", "BEKLEMEDE", "ERROR"
         )
         self._last_mission_running = mission_running
+
+        # ── KRİTİK: Acil kontrolleri GERÇEK göreve bağla ─────────────────────
+        # NEDEN: "DURDUR / RTL" ve "ŞİMDİ BIRAK" ÖNCEDEN yalnızca YKİ'nin BU
+        # OTURUMDA görev başlatmasıyla aktifleşiyordu. Görev uçarken YKİ çökse /
+        # yeniden başlatılsa, ya da görevi companion otonom başlatsa acil
+        # durdurma butonu DEVRE DIŞI kalıyor ve operatör görevi durduramıyordu.
+        # Artık companion durum akışındaki mission.active/mission.state bilgisi
+        # butonları sürer (top_bar bunu kendi oturum bayrağıyla VEYA'lar).
+        # RBAC burada uygulanır: VIEWER (rol < 2) zaten komut gönderemez
+        # (_require_command_role), butonu da açmıyoruz — tek yetki kaynağı burası.
+        try:
+            self.top_bar.set_mission_active(
+                mission_running and state.get_rbac_role() >= 2
+            )
+        except Exception as exc:
+            logger.error("Acil kontrol durumu güncellenemedi: %s", exc)
+
         if not self._video_manual_override:
             desired_video = self._video_url_processed if mission_running else self._video_url_raw
             if desired_video != self._current_video_source:
@@ -775,10 +1111,14 @@ class MainWindow(QMainWindow):
                 self._apply_video_source(desired_video)
 
         # Durum çubuğu etiketi (sağ köşe)
+        # NEDEN "🟢" burada doğru: bu slot yalnızca TAZE bir durum paketi geldiğinde
+        # çalışır, yani bağlantı o an gerçekten canlıdır. Kopma durumu artık ayrıca
+        # _on_rpi_connection_changed içinde "🔴 bağlantı yok" olarak işleniyor —
+        # etiketin eski değerlerle donup yeşil kalması bu sayede mümkün değil.
         conn_icon = "🟢"
-        color = "#00e676" if m_active else "#00e5ff"
+        color_token = "success" if m_active else "accent"
         state_str = str(m_state).upper() if m_state else "HAZIR"
-        self._rpi_status_label.setStyleSheet(f"color: {color}; padding: 0 8px;")
+        self._apply_rpi_status_style(color_token)
         self._rpi_status_label.setText(
             f"Yardımcı Bilgisayar {conn_icon}: {state_str} | CPU:%{cpu} | RAM:%{mem} | Sıc:{temp}C"
         )
@@ -827,7 +1167,11 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     def _on_rpi_disconnect_requested(self) -> None:
         self.rpi_worker.disable()
-        self._rpi_status_label.setText("Yardımcı Bilgisayar: bağlı değil")
+        # NEDEN: Kullanıcı elle kestiğinde de göstergeler donmuş eski değerlerle
+        # kalmasın (bkz. _on_rpi_connection_changed).
+        self._apply_rpi_status_style("text_muted")
+        self._rpi_status_label.setText("Yardımcı Bilgisayar ⚪: bağlantı kapatıldı")
+        self._reset_rpi_gauges()
         # Bağlantı kesildi: manuel override'ı sıfırla, videoyu durdur (yeniden
         # bağlanınca otomatik mod devam etsin)
         self._video_manual_override = False
@@ -853,8 +1197,9 @@ class MainWindow(QMainWindow):
         from PyQt6.QtWidgets import QMessageBox
         logger.warning("FAILSAFE [%s] %s: %s", level, subsystem, message)
 
-        color = "#ef233c" if level == "CRITICAL" else "#ff8700"
-        self._rpi_status_label.setStyleSheet(f"color: {color}; font-weight: bold; padding: 0 8px;")
+        self._apply_rpi_status_style(
+            "danger" if level == "CRITICAL" else "warning", bold=True
+        )
         self._status_label.setText(f"FAILSAFE {level}: {subsystem} — {message[:70]}")
 
         # TTS uyarı
@@ -886,6 +1231,10 @@ class MainWindow(QMainWindow):
 
     # ── Watchdog ─────────────────────────────────────────────────────────────
     def _check_workers(self) -> None:
+        # Rol çalışma anında değişmiş olabilir — kilitleri tazele (bkz. metot
+        # açıklaması: auth_manager'da role_changed sinyali olmadığı için yoklama).
+        self._check_rbac_change()
+
         # critical = çalışıyor olması şart olan worker'lar
         # optional = ayarsız/pasif olabilir, yalnızca gerçekten çökmüşse yeniden başlat
         critical_workers = {
@@ -936,29 +1285,99 @@ class MainWindow(QMainWindow):
 
             if hung or crashed:
                 reason = "takıldı" if hung else "çöktü"
-                logger.warning("Worker %s: %s — yeniden başlatılıyor", name, reason)
+                # Kurtarma DENEMESİ: kesme iste + kısa bekle. UI thread'ini uzun
+                # süre bloke etme (takılı worker zaten timeout'a kadar bitmez).
+                stopped = False
                 try:
                     worker.requestInterruption()
-                    # UI thread'ini uzun süre bloke etme — kısa bekle (takılı worker
-                    # zaten timeout'a kadar bitmez; uzun wait sadece UI'yi dondurur).
-                    worker.wait(800)
+                    stopped = bool(worker.wait(800))
+                except Exception as exc:
+                    logger.debug("Worker %s durdurulamadı: %s", name, exc)
+                    stopped = False
+
+                if not stopped and worker.isRunning():
+                    # NEDEN: QThread::start() ZATEN ÇALIŞAN bir thread üzerinde
+                    # SESSİZCE no-op'tur — yalnızca "Thread is already running"
+                    # uyarısı basar, istisna ATMAZ. Eski kod bunu başarı sayıp her
+                    # 15 sn'de bir "yeniden başlatılıyor" logluyordu; operatör
+                    # sistemin kendini toparladığını sanıyordu. Takılı thread'i
+                    # burada kurtarmanın bir yolu YOK — bunu dürüstçe söylüyoruz.
+                    self._report_worker_unrecoverable(name, reason)
+                else:
+                    logger.warning("Worker %s: %s — yeniden başlatılıyor", name, reason)
+                    try:
+                        worker.start()
+                    except Exception as exc:
+                        logger.error("Worker %s yeniden başlatılamadı: %s", name, exc)
+                    # TTS sadece kritik çöküşlerde (idle restart'larda konuşmasın)
+                    if crashed:
+                        self.tts_worker.speak(f"Alt sistem yeniden başlatıldı: {name}")
+                    # Gerçekten yeniden başlattık → "kurtarılamıyor" damgasını kaldır
+                    self._hb_unrecoverable.discard(name)
+                    # Yeniden başlattık — sayaç sıfırlansın.
+                    # NEDEN yalnızca BU dalda: kurtarılamayan worker'da sayacı
+                    # sıfırlamak `hung`'ı 3 tick boyunca False yapar ve aşağıdaki
+                    # "tekrar yanıt veriyor" dalını heartbeat hiç ilerlemeden
+                    # tetikler → operatöre YANLIŞ "toparlandı" bilgisi giderdi.
+                    self._hb_stale_count[name] = 0
+
+            elif not unchanged and name in self._hb_unrecoverable:
+                # Worker GERÇEKTEN toparladı — heartbeat sayacı yeniden ilerliyor
+                # (yalnızca `hung` bayrağının düşmesi yeterli DEĞİL, bkz. yukarı):
+                # "manuel müdahale gerekli" uyarısı ekranda asılı kalmasın.
+                self._hb_unrecoverable.discard(name)
+                msg = f"Worker '{name}' tekrar yanıt veriyor — otomatik kurtarma tamamlandı"
+                logger.warning(msg)
+                self._status_label.setText(msg)
+                try:
+                    self._dashboard.add_status_message(f"[WATCHDOG] {msg}", 1)
                 except Exception:
                     pass
-                try:
-                    worker.start()
-                except Exception as exc:
-                    logger.error("Worker %s yeniden başlatılamadı: %s", name, exc)
-                # TTS sadece kritik çöküşlerde (idle restart'larda konuşmasın)
-                if crashed:
-                    self.tts_worker.speak(f"Alt sistem yeniden başlatıldı: {name}")
-                self._hb_stale_count[name] = 0   # yeniden başlattık — sayaç sıfırlansın
 
             self._hb_snapshots[name] = current
+
+    def _report_worker_unrecoverable(self, name: str, reason: str) -> None:
+        """Takılı worker kurtarılamadı — operatörü DÜRÜSTÇE ve BİR KEZ uyar.
+
+        NEDEN tek sefer: uyarı her watchdog tick'inde (5 sn) tekrarlanırsa durum
+        çubuğu ve Sistem/Log spam'lenir, gerçek mesajlar kaybolur. Bu yüzden
+        yalnızca DURUM DEĞİŞİMİNDE (sağlıklı → kurtarılamaz) bir kez bildirilir;
+        worker toparlarsa damga silinir ve gerekirse tekrar uyarılabilir.
+        """
+        if name in self._hb_unrecoverable:
+            return   # aynı durum sürüyor — tekrar uyarma
+        self._hb_unrecoverable.add(name)
+
+        msg = (f"Worker '{name}' yanıt vermiyor ({reason}) — OTOMATİK KURTARMA "
+               f"BAŞARISIZ, MANUEL MÜDAHALE GEREKLİ")
+        # Sistem/Log ekranı root logger'dan beslenir → kalıcı kayıt buradan gider
+        logger.error("%s. Thread hâlâ çalışıyor; QThread.start() bu durumda etkisiz. "
+                     "YKİ'yi yeniden başlatmanız gerekebilir.", msg)
+        self._status_label.setText(msg)
+        try:
+            local_storage.write_audit(self._db_conn, "ERROR", msg)
+        except Exception as exc:
+            logger.debug("Watchdog uyarısı audit_log'a yazılamadı: %s", exc)
+        try:
+            self._dashboard.add_status_message(f"[WATCHDOG] {msg}", 3)
+        except Exception:
+            pass
+        try:
+            self.tts_worker.speak(f"Alt sistem yanıt vermiyor: {name}")
+        except Exception:
+            pass
 
     # ── Kapatma ──────────────────────────────────────────────────────────────
     def closeEvent(self, event) -> None:
         logger.info("Uygulama kapatılıyor — tüm worker'lar durduruluyor")
         self._watchdog.stop()
+        # Uçuş kaydı ÖNCE kapatılmalı: worker'lar durunca telemetri kesilir ve
+        # kayıt yalnız armed→disarmed geçişinde yazıldığı için uçuş kaybolurdu.
+        # finalize() senkron yazar (daemon thread kapanışta öldürülebilir).
+        try:
+            self.telemetry_recorder.finalize("uygulama kapanışı")
+        except Exception as exc:
+            logger.warning("Uçuş kaydı kapatılamadı: %s", exc)
         workers_to_stop = [
             self.mavlink_worker, self.ai_worker,
             self.video_worker, self.tts_worker, self.rpi_worker,

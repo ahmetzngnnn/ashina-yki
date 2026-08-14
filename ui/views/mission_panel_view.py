@@ -14,7 +14,7 @@ import math
 import time
 import logging
 
-from PyQt6.QtCore import pyqtSignal, pyqtSlot, Qt, QTimer
+from PyQt6.QtCore import pyqtSignal, pyqtSlot, Qt, QTimer, QObject, QEvent
 from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
   QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QPushButton, QLabel,
@@ -22,7 +22,12 @@ from PyQt6.QtWidgets import (
   QSpinBox, QHeaderView, QTextEdit, QTabWidget, QCheckBox, QMessageBox,
   QFormLayout, QLineEdit, QScrollArea, QListWidget, QListWidgetItem,
   QAbstractItemView, QRadioButton, QButtonGroup, QFrame, QFileDialog,
+  QGridLayout, QInputDialog,
 )
+
+from core import theme
+from core import mission_profiles
+from ui.widgets.collapsible import wrap_group
 
 try:
   from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -34,6 +39,12 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # ── Harita HTML ───────────────────────────────────────────────────────────────
+# NOT: Aşağıdaki Leaflet/CSS renkleri (rota sarısı #f0a500, kalkış yeşili
+# #4ade80, iniş kırmızısı #ff4444, HOME camgöbeği #00e5ff, alan moru #bb86fc,
+# uyarı/durum banner'ları) HARİTA SEMANTİĞİDİR — zeminleri YKİ teması değil
+# UYDU GÖRÜNTÜSÜ belirler. Tema tokenına çevrilirlerse (ör. açık temada koyu
+# metin rengi) koyu asfalt/gölge üzerinde okunamaz hale gelirler. Bu yüzden
+# temadan BAĞIMSIZ sabit tutulur ve _MAP_*_COLOR sabitleriyle birebir aynıdır.
 _MAP_HTML = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
@@ -45,8 +56,16 @@ html,body,#map{width:100%;height:100%;margin:0;padding:0;}
   background:rgba(0,120,215,.9);padding:4px 14px;
   border-radius:12px;font-weight:bold;font-size:12px;z-index:1000;
   display:none;pointer-events:none;}
+/* NEDEN: Seçim modu KAPALIYKEN harita tıklaması sessizce hiçbir şey yapmıyordu;
+   operatör panelin bozuk olduğunu sanıyordu. Artık kısa bir uyarı banner'ı çıkar. */
+#wb{position:absolute;top:8px;left:50%;transform:translateX(-50%);
+  background:rgba(240,165,0,.95);color:#1a1200;padding:5px 14px;
+  border-radius:12px;font-weight:bold;font-size:12px;z-index:1001;
+  display:none;pointer-events:none;
+  font-family:Segoe UI,Arial,sans-serif;}
 </style></head><body>
 <div id="sb">&#127919; HARITA SEÇIM MODU AKTİF — Noktaya Tıkla</div>
+<div id="wb">&#9888; Seçim modu KAPALI — sağ panelden &quot;Harita Seçim Modu&quot;nu açın</div>
 <div id="map"></div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
@@ -59,11 +78,28 @@ L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/Worl
 var wps=[],mrks=[],xtra=[],pend=[],sel=false;
 var rl=L.polyline([],{color:'#f0a500',weight:2,dashArray:'5,4'}).addTo(map);
 
-map.on('click',function(e){if(sel)pend.push({lat:e.latlng.lat,lon:e.latlng.lng});});
+var wbT=null;
+/* Seçim modu kapalıyken tıklanırsa sessiz kalma — kullanıcıyı bilgilendir. */
+function warnSel(){
+ var e=document.getElementById('wb');
+ if(!e)return;
+ e.style.display='block';
+ if(wbT)clearTimeout(wbT);
+ wbT=setTimeout(function(){e.style.display='none';},2800);
+}
+map.on('click',function(e){
+ if(sel){pend.push({lat:e.latlng.lat,lon:e.latlng.lng});}
+ else{warnSel();}
+});
 
 function setSel(on){
  sel=on;
  document.getElementById('sb').style.display=on?'block':'none';
+ if(on){ /* mod açıldı → uyarı banner'ı anlamsız, gizle */
+  var w=document.getElementById('wb');
+  if(w)w.style.display='none';
+  if(wbT)clearTimeout(wbT);
+ }
  map.getContainer().style.cursor=on?'crosshair':'';
 }
 function mkIco(bg,t){
@@ -98,6 +134,41 @@ function drawPoly(pts,col){
 function drawCirc(lat,lon,r,col){
  clearX();
  xtra.push(L.circle([lat,lon],{radius:r,color:col||'#bb86fc',weight:2,fillOpacity:0.1}).addTo(map));
+}
+/* ── ROTA ÖNİZLEME ─────────────────────────────────────────────────────────
+   AYRI katman dizisi (prv), xtra DEĞİL. NEDEN: drawPoly/drawCirc ikisi de
+   girişte clearX() çağırıyor, yani xtra'yı paylaşan her çizim bir öncekini
+   siler. Tarama alanı poligonu ile rota önizlemesi aynı anda görünmeli;
+   aynı diziye konsalardı poligon çizilir çizilmez rota kaybolurdu. */
+var prv=[];
+function clearRoute(){prv.forEach(function(l){map.removeLayer(l);});prv=[];}
+function drawRoute(pts,col,fit){
+ clearRoute();
+ if(!pts||pts.length<2)return;
+ var ll=pts.map(function(p){return[p.lat,p.lon];});
+ /* Altta kalın yarı saydam gövde, üstte ince parlak çizgi: uydu görüntüsü
+    üzerinde tek renk çizgi zeminle karışıyordu (koyu asfalt/gölge). */
+ prv.push(L.polyline(ll,{color:'#000',weight:6,opacity:0.35}).addTo(map));
+ prv.push(L.polyline(ll,{color:col||'#4ade80',weight:2.5,opacity:0.95}).addTo(map));
+ /* Yön göstergesi: rotanın 1/4, 2/4, 3/4 noktalarına gidiş yönünü gösteren
+    üçgen. Ok başı olmadan operatör hangi yönde uçulacağını göremiyor. */
+ [0.25,0.5,0.75].forEach(function(f){
+  var i=Math.max(1,Math.min(ll.length-1,Math.round(f*(ll.length-1))));
+  var a=ll[i-1],b=ll[i];
+  var ang=Math.atan2(b[1]-a[1],b[0]-a[0])*180/Math.PI;
+  prv.push(L.marker(b,{interactive:false,icon:L.divIcon({
+    html:'<div style="width:0;height:0;border-left:5px solid transparent;'+
+         'border-right:5px solid transparent;border-bottom:11px solid '+(col||'#4ade80')+';'+
+         'transform:rotate('+ang+'deg);transform-origin:50% 50%;"></div>',
+    className:'',iconSize:[11,11],iconAnchor:[5,5]})}).addTo(map));
+ });
+ /* Başlangıç/bitiş: aynı noktada birleşen kapalı rotalarda ikisi üst üste
+    gelir, bu yüzden bitiş biraz daha küçük ve içi boş çizilir. */
+ prv.push(L.circleMarker(ll[0],{radius:5,color:'#4ade80',fillColor:'#4ade80',
+   fillOpacity:1,weight:2}).bindTooltip('Rota başı').addTo(map));
+ prv.push(L.circleMarker(ll[ll.length-1],{radius:4,color:'#ff4444',
+   fillOpacity:0,weight:2}).bindTooltip('Rota sonu').addTo(map));
+ if(fit){try{map.fitBounds(L.latLngBounds(ll),{padding:[40,40]});}catch(e){}}
 }
 function setHome(lat,lon){
  if(window._hm)map.removeLayer(window._hm);
@@ -138,16 +209,79 @@ function getPend(){var p=JSON.stringify(pend);pend=[];return p;}
 </script></body></html>"""
 
 # ── Stil Sabitleri ────────────────────────────────────────────────────────────
-_SS = ("QGroupBox{border:1px solid #0f3460;font-weight:bold;"
-    "padding-top:18px;margin-top:6px;border-radius:4px;}")
-_SB = "QPushButton{border-radius:4px;padding:6px 10px;font-weight:bold;}"
-_SBR = "QPushButton{border-radius:4px;padding:6px 10px;font-weight:bold;}"
-_SBG = ("QPushButton{border-radius:4px;"
-    "padding:8px 12px;font-weight:bold;font-size:13px;}"
-    "QPushButton:hover{}")
-_SBW = "QPushButton{border-radius:4px;padding:6px 10px;font-weight:bold;}"
-_SC = "border:1px solid #0f3460;padding:4px;border-radius:3px;"
+# Renk/kenarlık QSS temasından gelir (yki_design_spec §1) — burada yalnız
+# zararsız tipografi sabiti kaldı.
 _SL = "font-size:12px;"
+
+# ── Harita katman renkleri — aviyonik semantik, temadan bağımsız ──────────────
+# NEDEN sabit: bu renkler UI kromu değil, UYDU GÖRÜNTÜSÜ üzerine çizilen harita
+# katmanlarıdır (Leaflet). Zeminleri tema değil ortofoto belirler; açık temada
+# tema tokenına çevrilirlerse (ör. koyu metin rengi) koyu asfalt/gölge üzerinde
+# okunamaz hale gelirler. Yeşil=başlangıç/rota, kırmızı=iniş, amber=waypoint
+# eşlemesi ayrıca _MAP_HTML içindeki JS ile birebir aynı kalmalıdır.
+_MAP_ROUTE_COLOR = "#4ade80"   # rota önizleme çizgisi
+_MAP_AREA_COLOR  = "#bb86fc"   # tarama poligonu / yarıçap çemberi
+_MAP_POLE1_COLOR = "#ffd700"   # Direk 1 çemberi
+_MAP_POLE2_COLOR = "#ff8c00"   # Direk 2 çemberi
+
+# ── Fare Tekerleği Koruması ───────────────────────────────────────────────────
+# NEDEN: Sağ parametre paneli tekerlekle kaydırılırken imlecin ALTINDAKİ
+# QSpinBox/QDoubleSpinBox/QComboBox değeri sessizce değişiyordu (canlı testte
+# "Bırakma Yarıçapı" 4.0 → 1.0 düştü ve fark edilmedi). Uçuş parametresinin
+# operatör farkında olmadan bozulması kritik güvenlik riski.
+#
+# ÇÖZÜM: Widget odakta DEĞİLKEN tekerlek olayını yut. event.ignore() + return
+# True kombinasyonu Qt'nin wheel yayılım döngüsünde olayı ÜST widget'a
+# (QScrollArea) taşır → panel normal şekilde kaydırılmaya devam eder, yalnızca
+# değer değişmez. Kullanıcı alana TIKLADIKTAN (odak aldıktan) sonra tekerlek
+# yine eskisi gibi çalışır. StrongFocus: tekerlek artık odak vermez.
+class _WheelGuard(QObject):
+  """Odakta olmayan spin/combo widget'larında fare tekerleğini etkisizleştirir."""
+
+  def eventFilter(self, obj, event):  # noqa: N802 (Qt API)
+    if event is not None and event.type() == QEvent.Type.Wheel:
+      if isinstance(obj, QWidget) and not obj.hasFocus():
+        event.ignore()   # kabul etme → olay üst widget'a (scroll area) gider
+        return True    # widget'a teslim etme → değer değişmez
+    return super().eventFilter(obj, event)
+
+
+_WHEEL_GUARD: _WheelGuard | None = None
+
+
+def guard_wheel(*widgets):
+  """Verilen spin/combo widget'larına tekerlek korumasını uygular.
+
+  Tekrarı önlemek için tek noktadan uygulanır; ilk widget'ı geri döndürür ki
+  `self._x = guard_wheel(QSpinBox())` şeklinde satır içi kullanılabilsin.
+  """
+  global _WHEEL_GUARD
+  if _WHEEL_GUARD is None:
+    _WHEEL_GUARD = _WheelGuard()
+  for w in widgets:
+    if w is None:
+      continue
+    w.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    w.installEventFilter(_WHEEL_GUARD)
+  return widgets[0] if widgets else None
+
+
+# ── Koordinat Girişi Yardımcısı ───────────────────────────────────────────────
+# NEDEN: Enlem/Boylam alanları çok dardı; 10 haneli koordinat girildiğinde
+# yalnız son 3 hane görünüyordu (değer doğruydu ama operatör GÖZLE kontrol
+# edemiyordu). Makul minimum genişlik + tooltip'te tam değer.
+_COORD_MIN_W = 120  # px — "39.9250140" tamamen sığar
+
+
+def wire_coord_edit(edit, hint: str) -> None:
+  """Koordinat QLineEdit'ine minimum genişlik ve 'tam değer' tooltip'i verir."""
+  edit.setMinimumWidth(_COORD_MIN_W)
+  edit.setToolTip(hint)
+
+  def _upd(text: str, e=edit, h=hint):
+    e.setToolTip(f"{h}\nGirilen tam değer: {text}" if text else h)
+
+  edit.textChanged.connect(_upd)
 
 # ── Harita Widget ─────────────────────────────────────────────────────────────
 class MissionMapWidget(QWidget):
@@ -262,12 +396,28 @@ class MissionMapWidget(QWidget):
   def clear_wps(self):
     self._js("clearWPs()")
 
-  def draw_polygon(self, pts: list[tuple[float, float]], color: str = "#bb86fc"):
+  def draw_polygon(self, pts: list[tuple[float, float]], color: str = _MAP_AREA_COLOR):
     js_pts = json.dumps([{"lat": p[0], "lon": p[1]} for p in pts])
     self._js(f"drawPoly({js_pts},'{color}')")
 
-  def draw_circle(self, lat: float, lon: float, r: float, color: str = "#bb86fc"):
+  def draw_circle(self, lat: float, lon: float, r: float, color: str = _MAP_AREA_COLOR):
     self._js(f"drawCirc({lat},{lon},{r},'{color}')")
+
+  def draw_route(self, pts: list[tuple[float, float]],
+                 color: str = _MAP_ROUTE_COLOR, fit: bool = False):
+    """
+    Tahmini uçuş rotasını haritaya çizer (bağımsız önizleme katmanı).
+
+    pts: [(lat, lon), ...] — uçuşta gidilecek noktaların AYNISI olmalı.
+    fit: True ise harita rotayı kadraja sığdırır. Yalnızca operatör açıkça
+         "önizle" dediğinde True verin — her düzenlemede haritayı kaydırmak,
+         kullanıcı elle yakınlaştırdığında sinir bozucu olur.
+    """
+    js_pts = json.dumps([{"lat": p[0], "lon": p[1]} for p in pts])
+    self._js(f"drawRoute({js_pts},'{color}',{'true' if fit else 'false'})")
+
+  def clear_route(self):
+    self._js("clearRoute()")
 
   def set_home(self, lat: float, lon: float):
     self._js(f"setHome({lat},{lon})")
@@ -287,6 +437,13 @@ class _BaseMissionTab(QWidget):
   mission_ready_to_send = pyqtSignal(dict, list)
   send_command     = pyqtSignal(int, list)
 
+  # NEDEN: Sol panel her zaman "Haritaya tıklayarak nokta ekleyin." yazıyordu,
+  # ama harita tıklaması yalnızca "Harita Seçim Modu" AÇIKKEN çalışıyor
+  # (_toggle_select → map.set_select_mode). Operatör yanlış yönlendirilip
+  # panelin bozuk olduğunu sanıyordu. Metin artık moda göre değişiyor.
+  _HINT_SEL_OFF = "⚠ Önce 'Harita Seçim Modu'nu açın, sonra haritaya tıklayın."
+  _HINT_SEL_ON  = "✓ Haritaya tıklayarak nokta ekleyin."
+
   def __init__(self, parent=None):
     super().__init__(parent)
     self._wps: list[dict] = []
@@ -301,31 +458,31 @@ class _BaseMissionTab(QWidget):
 
     # --- SOL HUD PANELI ---
     self._hud_widget = QWidget()
-    self._hud_widget.setMinimumWidth(240)
-    self._hud_widget.setMaximumWidth(320)
+    self._hud_widget.setFixedWidth(300)
     self._hud_lay = QVBoxLayout(self._hud_widget)
-    self._hud_lay.setContentsMargins(5, 5, 5, 5)
-    
+    self._hud_lay.setContentsMargins(6, 6, 6, 6)
+    self._hud_lay.setSpacing(6)
+
     lbl_hud_title = QLabel("<b>GÖREV ÖZETİ</b>")
+    lbl_hud_title.setObjectName("sectionTitle")
     self._hud_lay.addWidget(lbl_hud_title)
-    
-    self._hud_summary = QLabel("Haritaya tıklayarak nokta ekleyin.")
+
+    # Panel açılışta seçim modu KAPALI → doğru yönerge "önce modu aç" olmalı
+    self._hud_summary = QLabel(self._HINT_SEL_OFF)
     self._hud_summary.setWordWrap(True)
-    self._hud_summary.setStyleSheet("font-size: 13px; color: #bb86fc; padding: 5px; background: #222; border-radius: 4px;")
+    self._hud_summary.setObjectName("hintLabel")
     self._hud_lay.addWidget(self._hud_summary)
-    
+
     lbl_wp_dists = QLabel("<b>WP Mesafeleri:</b>")
-    lbl_wp_dists.setStyleSheet("margin-top: 10px;")
     self._hud_lay.addWidget(lbl_wp_dists)
-    
+
     self._hud_list = QListWidget()
-    self._hud_list.setStyleSheet("font-size: 12px; background: #121212; color: #fff; border: 1px solid #333;")
     self._hud_lay.addWidget(self._hud_list)
     
     left_pane = QWidget()
     left_lay = QHBoxLayout(left_pane)
     left_lay.setContentsMargins(0, 0, 0, 0)
-    left_lay.setSpacing(0)
+    left_lay.setSpacing(8)
     left_lay.addWidget(self._hud_widget)
     left_lay.addWidget(self._map, 1)
 
@@ -334,13 +491,25 @@ class _BaseMissionTab(QWidget):
 
     right = QScrollArea()
     right.setWidgetResizable(True)
+    # Yatay scrollbar KAPALI: form içeriği sağdan kırpılmak yerine
+    # WrapLongRows ile alta sarar (yki_design_spec §4 — Görev sayfaları).
+    right.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    # NEDEN (410/520 → 470/620): 1366 px pencerede en sağdaki girdiler (kamera
+    # combo'su, "Varsayılan" butonlu hız satırları) panelin dışında kalıyordu.
+    # Harita alanı fazlasıyla genişti; form paneline yer aktarıldı.
+    right.setMinimumWidth(470)  # uzun etiket + 190px combo + dikey scrollbar sığsın
+    right.setMaximumWidth(620)  # form paneli sonsuz genişlemesin
     right_w = QWidget()
     self._right_lay = QVBoxLayout(right_w)
-    self._right_lay.setContentsMargins(6, 6, 6, 6)
+    self._right_lay.setContentsMargins(8, 8, 8, 8)
     self._right_lay.setSpacing(8)
     right.setWidget(right_w)
     splitter.addWidget(right)
-    splitter.setSizes([620, 400])
+    splitter.setStretchFactor(0, 1)   # harita baskın
+    splitter.setStretchFactor(1, 0)
+    # Harita küçülür, form genişler — kullanıcı geri bildirimi: harita alanı
+    # zaten yeterliydi, sağdaki kutular görünmüyordu.
+    splitter.setSizes([760, 560])
 
     main_lay = QVBoxLayout(self)
     main_lay.setContentsMargins(0, 0, 0, 0)
@@ -352,15 +521,325 @@ class _BaseMissionTab(QWidget):
     self._build_battery_group()
     self._build_send_button()
     self._right_lay.addStretch(1)
+    # NEDEN: Ortak kontrollerin bir kısmı bazı görev tiplerinde İHA tarafından
+    # okunmuyor. Tüm gruplar kurulduktan SONRA sekmeye özel kısıtları uygula.
+    self._apply_tab_constraints()
+
+    # Profil çubuğu EN SON kurulur (tüm parametre widget'ları var olsun) ama
+    # panelin EN ÜSTÜNE yerleşir — operatör önce profilini seçer.
+    self._build_profile_group()
+    self._load_default_profile()
+
+    # Tema değişince kurulumda yazılan çalışma-anı renkleri (WP tablosu satır
+    # renkleri) bayat kalır — yeniden uygula.
+    theme.notifier().changed.connect(lambda _n: self._apply_theme_colors())
+
+  def _apply_theme_colors(self):
+    """Tema değişiminde inline/çalışma-anı renklerini yeniden yazar.
+
+    WP tablosundaki tür renkleri ve metin rengi QTableWidgetItem üzerinde
+    saklandığı için QSS yenilenmesiyle tazelenmez; tabloyu yeniden kur."""
+    if hasattr(self, "_table"):
+      self._refresh_table()
+
+  def _apply_tab_constraints(self):
+    """Sekmeye özel kısıt/uyarılar (alt sınıflar override eder)."""
+    pass
+
+  # ── Görev Profilleri (kayıtlı parametre ön ayarları) ──────────────────────
+  # Operatör sahada aynı ayarları tekrar tekrar girmesin: mevcut tüm parametre
+  # değerleri isimli bir profil olarak kaydedilir, seçilince tek hamlede geri
+  # yüklenir. "Açılışta uygula" işaretli profil, sekme her açıldığında
+  # otomatik uygulanır. Profiller sekme başına ayrı tutulur (Görev 1'in
+  # parametreleri Görev 2'ye karışmaz) — bkz. core/mission_profiles.py.
+
+  # Profil dışı bırakılan widget'lar: profil çubuğunun kendi kontrolleri.
+  _PROFILE_SKIP_PREFIX = "_profile"
+
+  def _profile_key(self) -> str:
+    """Profil deposundaki bölüm anahtarı — sekme sınıfının adı."""
+    return type(self).__name__
+
+  def _build_profile_group(self):
+    bar = QFrame()
+    bar.setObjectName("toolbarFrame")
+    outer = QVBoxLayout(bar)
+    outer.setContentsMargins(8, 6, 8, 6)
+    outer.setSpacing(6)
+
+    row1 = QHBoxLayout()
+    row1.setSpacing(6)
+    lbl = QLabel("Görev Profili:")
+    lbl.setObjectName("sectionTitle")
+    row1.addWidget(lbl)
+
+    self._profile_combo = QComboBox()
+    self._profile_combo.setToolTip(
+      "Kayıtlı parametre profilleri. Seçince bu sekmedeki tüm ayarlar\n"
+      "(irtifa, hız, kamera, tarama, servo ...) profildeki değerlerle dolar."
+    )
+    self._profile_combo.currentIndexChanged.connect(self._on_profile_selected)
+    row1.addWidget(self._profile_combo, 1)
+    outer.addLayout(row1)
+
+    row2 = QHBoxLayout()
+    row2.setSpacing(6)
+
+    self._profile_btn_save = QPushButton("💾 Kaydet")
+    self._profile_btn_save.setObjectName("primaryButton")
+    self._profile_btn_save.setMinimumHeight(28)
+    self._profile_btn_save.setToolTip(
+      "Seçili profilin üzerine mevcut ayarları yazar.\n"
+      "Profil seçili değilse yeni profil adı sorar."
+    )
+    self._profile_btn_save.clicked.connect(self._on_profile_save)
+    row2.addWidget(self._profile_btn_save)
+
+    self._profile_btn_save_as = QPushButton("Farklı Kaydet")
+    self._profile_btn_save_as.setMinimumHeight(28)
+    self._profile_btn_save_as.setToolTip("Mevcut ayarları YENİ bir profil adıyla kaydeder.")
+    self._profile_btn_save_as.clicked.connect(self._on_profile_save_as)
+    row2.addWidget(self._profile_btn_save_as)
+
+    self._profile_btn_delete = QPushButton("Sil")
+    self._profile_btn_delete.setObjectName("dangerButton")
+    self._profile_btn_delete.setMinimumHeight(28)
+    self._profile_btn_delete.setToolTip("Seçili profili siler.")
+    self._profile_btn_delete.clicked.connect(self._on_profile_delete)
+    row2.addWidget(self._profile_btn_delete)
+
+    row2.addStretch(1)
+
+    self._profile_default_cb = QCheckBox("Açılışta uygula")
+    self._profile_default_cb.setToolTip(
+      "İşaretli profil, bu sekme her açıldığında otomatik yüklenir."
+    )
+    self._profile_default_cb.toggled.connect(self._on_profile_default_toggled)
+    row2.addWidget(self._profile_default_cb)
+    outer.addLayout(row2)
+
+    self._profile_status = QLabel("")
+    self._profile_status.setObjectName("mutedLabel")
+    self._profile_status.setWordWrap(True)
+    outer.addWidget(self._profile_status)
+
+    self._right_lay.insertWidget(0, bar)
+    self._refresh_profile_combo()
+
+  # ── Parametre topla / uygula ──────────────────────────────────────────────
+  def _param_widgets(self) -> dict:
+    """Profile girecek form widget'ları: {attribute_adı: widget}.
+
+    Attribute adı anahtar olarak kullanılır — bu yüzden profil dosyası
+    widget isimlendirmesine bağlıdır; bir attribute yeniden adlandırılırsa
+    eski profillerdeki o değer sessizce atlanır (uygulama çökmez)."""
+    out: dict = {}
+    for name, obj in vars(self).items():
+      if name.startswith(self._PROFILE_SKIP_PREFIX):
+        continue
+      if isinstance(obj, (QDoubleSpinBox, QSpinBox, QCheckBox, QComboBox, QLineEdit)):
+        out[name] = obj
+    return out
+
+  def _snapshot_params(self) -> dict:
+    values: dict = {}
+    for name, w in self._param_widgets().items():
+      if isinstance(w, (QDoubleSpinBox, QSpinBox)):
+        values[name] = w.value()
+      elif isinstance(w, QCheckBox):
+        values[name] = w.isChecked()
+      elif isinstance(w, QComboBox):
+        values[name] = w.currentText()
+      elif isinstance(w, QLineEdit):
+        values[name] = w.text()
+    return values
+
+  def _apply_params(self, values: dict) -> int:
+    """Profildeki değerleri widget'lara yazar; uygulanan sayısını döndürür.
+
+    Sinyaller BLOKLANMAZ: bir değerin değişmesi bağlı mantığı (ör. HFOV
+    kilidini açan onay kutusu, rota önizlemesi) tetiklemeli."""
+    applied = 0
+    widgets = self._param_widgets()
+    for name, value in (values or {}).items():
+      w = widgets.get(name)
+      if w is None:
+        continue   # profil eski sürümden — bilinmeyen alanı sessizce atla
+      try:
+        if isinstance(w, (QDoubleSpinBox, QSpinBox)):
+          w.setValue(type(w.value())(value))
+        elif isinstance(w, QCheckBox):
+          w.setChecked(bool(value))
+        elif isinstance(w, QComboBox):
+          idx = w.findText(str(value))
+          if idx >= 0:
+            w.setCurrentIndex(idx)
+          elif w.isEditable():
+            w.setEditText(str(value))
+          else:
+            continue   # listede olmayan seçenek — atla
+        elif isinstance(w, QLineEdit):
+          w.setText(str(value))
+        applied += 1
+      except (TypeError, ValueError) as exc:
+        logger.warning("Profil değeri uygulanamadı (%s=%r): %s", name, value, exc)
+    return applied
+
+  # ── Profil çubuğu davranışı ───────────────────────────────────────────────
+  def _refresh_profile_combo(self, select: str | None = None):
+    key = self._profile_key()
+    names = mission_profiles.list_profiles(key)
+    default_name = mission_profiles.get_default(key)
+
+    self._profile_combo.blockSignals(True)
+    self._profile_combo.clear()
+    self._profile_combo.addItem("— Profil seçilmedi —", None)
+    for name in names:
+      label = f"{name}  ★" if name == default_name else name
+      self._profile_combo.addItem(label, name)
+    if select:
+      idx = self._profile_combo.findData(select)
+      self._profile_combo.setCurrentIndex(idx if idx >= 0 else 0)
+    self._profile_combo.blockSignals(False)
+
+    self._sync_profile_buttons()
+
+  def _current_profile_name(self) -> str | None:
+    return self._profile_combo.currentData() if hasattr(self, "_profile_combo") else None
+
+  def _sync_profile_buttons(self):
+    name = self._current_profile_name()
+    self._profile_btn_delete.setEnabled(bool(name))
+    self._profile_default_cb.blockSignals(True)
+    self._profile_default_cb.setChecked(
+      bool(name) and mission_profiles.get_default(self._profile_key()) == name
+    )
+    self._profile_default_cb.setEnabled(bool(name))
+    self._profile_default_cb.blockSignals(False)
+
+  def _set_profile_status(self, text: str, token: str = "text_muted"):
+    self._profile_status.setText(text)
+    self._profile_status.setStyleSheet(f"color:{theme.c(token)};")
+
+  def _on_profile_selected(self, _index: int):
+    name = self._current_profile_name()
+    self._sync_profile_buttons()
+    if not name:
+      self._set_profile_status("")
+      return
+    values = mission_profiles.get_profile(self._profile_key(), name)
+    if values is None:
+      self._set_profile_status(f"'{name}' profili bulunamadı.", "danger")
+      return
+    count = self._apply_params(values)
+    self._set_profile_status(f"✓ '{name}' uygulandı ({count} parametre).", "success")
+    logger.info("Görev profili uygulandı: %s / %s (%d parametre)",
+                self._profile_key(), name, count)
+
+  def _on_profile_save(self):
+    name = self._current_profile_name()
+    if not name:
+      self._on_profile_save_as()
+      return
+    reply = QMessageBox.question(
+      self, "Profili Güncelle",
+      f"'{name}' profilinin üzerine mevcut ayarlar yazılsın mı?",
+      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+      QMessageBox.StandardButton.Yes,
+    )
+    if reply != QMessageBox.StandardButton.Yes:
+      return
+    self._save_profile_named(name)
+
+  def _on_profile_save_as(self):
+    name, ok = QInputDialog.getText(
+      self, "Profili Kaydet",
+      "Profil adı (ör. 'Saha — Rüzgarlı', 'Yarışma finali'):",
+    )
+    if not ok:
+      return
+    name = (name or "").strip()
+    if not name:
+      self._set_profile_status("Profil adı boş olamaz.", "warning")
+      return
+    if mission_profiles.get_profile(self._profile_key(), name) is not None:
+      reply = QMessageBox.question(
+        self, "Profil Var",
+        f"'{name}' zaten var. Üzerine yazılsın mı?",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.No,
+      )
+      if reply != QMessageBox.StandardButton.Yes:
+        return
+    self._save_profile_named(name)
+
+  def _save_profile_named(self, name: str):
+    values = self._snapshot_params()
+    if mission_profiles.save_profile(self._profile_key(), name, values):
+      self._refresh_profile_combo(select=name)
+      self._set_profile_status(
+        f"✓ '{name}' kaydedildi ({len(values)} parametre).", "success")
+    else:
+      self._set_profile_status(
+        "Profil kaydedilemedi (dosya yazma hatası — loga bakın).", "danger")
+
+  def _on_profile_delete(self):
+    name = self._current_profile_name()
+    if not name:
+      return
+    reply = QMessageBox.question(
+      self, "Profili Sil", f"'{name}' profili silinsin mi?",
+      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+      QMessageBox.StandardButton.No,
+    )
+    if reply != QMessageBox.StandardButton.Yes:
+      return
+    if mission_profiles.delete_profile(self._profile_key(), name):
+      self._refresh_profile_combo()
+      self._set_profile_status(f"'{name}' silindi.", "text_muted")
+    else:
+      self._set_profile_status("Profil silinemedi.", "danger")
+
+  def _on_profile_default_toggled(self, checked: bool):
+    name = self._current_profile_name()
+    if not name:
+      return
+    mission_profiles.set_default(self._profile_key(), name if checked else None)
+    # ★ işareti listede güncellensin
+    self._refresh_profile_combo(select=name)
+    self._set_profile_status(
+      f"'{name}' artık açılışta otomatik uygulanacak." if checked
+      else f"'{name}' açılışta otomatik uygulanmayacak.",
+      "success" if checked else "text_muted",
+    )
+
+  def _load_default_profile(self):
+    """Sekme kurulurken varsayılan profili uygular (varsa)."""
+    name = mission_profiles.get_default(self._profile_key())
+    if not name:
+      return
+    idx = self._profile_combo.findData(name)
+    if idx < 0:
+      return
+    # setCurrentIndex → _on_profile_selected profili uygular ve durumu yazar.
+    self._profile_combo.setCurrentIndex(idx)
 
   # ── WP Yönetim Grubu ─────────────────────────────────────────────────────
   def _build_wp_group(self):
     grp = QGroupBox("Tarama Alanı / Waypoint Yönetimi")
+    self._wp_grp = grp     # alt sınıflar/testler grubu bulabilsin
     lay = QVBoxLayout(grp)
 
     btn_row = QHBoxLayout()
-    self._sel_btn = QPushButton("Harita Seçim Modu")
+    self._sel_btn = QPushButton("🖱 Harita Seçim Modu (KAPALI)")
     self._sel_btn.setCheckable(True)
+    # NEDEN: Bu buton açılmadan harita tıklaması çalışmıyor; en kritik kontrol
+    # olmasına rağmen diğer butonlardan ayırt edilemiyordu. Belirgin hale getir.
+    self._sel_btn.setMinimumHeight(34)
+    self._sel_btn.setToolTip(
+      "Haritaya tıklayarak nokta ekleyebilmek için bu modu AÇIN.\n"
+      "Kapalıyken harita tıklamaları yok sayılır."
+    )
     self._sel_btn.toggled.connect(self._toggle_select)
 
     btn_del = QPushButton("↩ Son WP Sil")
@@ -369,10 +848,17 @@ class _BaseMissionTab(QWidget):
     btn_clr = QPushButton("Tümünü Temizle")
     btn_clr.clicked.connect(self._clear_all)
 
+    # Seçim modu butonu KENDİ satırında: uzun metni ("🎯 Seçim Modu AÇIK —
+    # Haritaya Tıkla") dar panelde diğer iki butonla aynı satıra sığmıyor ve
+    # üçü birden kırpılıyordu. Sil/Temizle ikinci satırda sağa yaslı.
     btn_row.addWidget(self._sel_btn)
-    btn_row.addWidget(btn_del)
-    btn_row.addWidget(btn_clr)
     lay.addLayout(btn_row)
+
+    btn_row_b = QHBoxLayout()
+    btn_row_b.addStretch(1)
+    btn_row_b.addWidget(btn_del)
+    btn_row_b.addWidget(btn_clr)
+    lay.addLayout(btn_row_b)
 
     opt_row = QHBoxLayout()
     self._rth_cb = QCheckBox("🏠 Kalkış Noktasına Dön (RTH)")
@@ -384,12 +870,21 @@ class _BaseMissionTab(QWidget):
     self._alt_spin.setValue(30)
     self._alt_spin.setSuffix("m")
     self._alt_spin.setFixedWidth(85)
+    guard_wheel(self._alt_spin)  # kaydırırken irtifa sessizce değişmesin
 
+    # NEDEN İKİ SATIR: RTH kutusunun metni Görev 2'de uzuyor ("Kalkış Noktasına
+    # Dön (Görev 2'de kullanılmıyor)"); "Eşit İrtifa" + spin ile aynı satırda
+    # 525 px istiyordu ve TÜM sağ paneli minimum genişliğinin üstüne itip
+    # kırpılmaya yol açıyordu (yatay scrollbar kapalı). Ölçüldü: 565 → 368 px.
     opt_row.addWidget(self._rth_cb)
-    opt_row.addStretch()
-    opt_row.addWidget(self._uni_cb)
-    opt_row.addWidget(self._alt_spin)
+    opt_row.addStretch(1)
     lay.addLayout(opt_row)
+
+    alt_row = QHBoxLayout()
+    alt_row.addStretch(1)
+    alt_row.addWidget(self._uni_cb)
+    alt_row.addWidget(self._alt_spin)
+    lay.addLayout(alt_row)
 
     # WP Tablosu
     self._table = QTableWidget()
@@ -398,6 +893,7 @@ class _BaseMissionTab(QWidget):
     _hh = self._table.horizontalHeader()  # guard: None dönebilir (Pylance)
     if _hh is not None:
         _hh.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        _hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
     self._table.setMinimumHeight(140)
     self._table.setMaximumHeight(200)
     self._table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
@@ -406,10 +902,6 @@ class _BaseMissionTab(QWidget):
     lay.addWidget(self._table)
 
     # ── Manuel Koordinat Girişi ───────────────────────────────────────
-    _input_style = (
-      "border:1px solid #0f3460;"
-      "padding:4px;border-radius:3px;font-size:12px;"
-    )
     man_frame = QFrame()
     man_lay = QVBoxLayout(man_frame)
     man_lay.setContentsMargins(6, 6, 6, 6)
@@ -421,20 +913,39 @@ class _BaseMissionTab(QWidget):
     hdr_row.addStretch()
     man_lay.addLayout(hdr_row)
 
-    coord_row = QHBoxLayout()
-    coord_row.setSpacing(4)
+    # NEDEN: Enlem/Boylam + İrtifa + Tür tek satıra sıkışıyordu; koordinat
+    # alanlarında 10 haneli değerin yalnız son 3 hanesi görünüyordu. Artık
+    # koordinatlar kendi satırında ve en az 120 px genişlikte (wire_coord_edit).
+    # ÇİFT SÜTUN YOK: enlem ve boylam ALT ALTA. Dar sağ panelde (470 px) iki
+    # koordinat girdisi yan yana sığmıyor ve sağdaki kırpılıyordu.
+    coord_row = QGridLayout()
+    coord_row.setHorizontalSpacing(4)
+    coord_row.setVerticalSpacing(4)
 
     lbl_lat = QLabel("Enlem:")
-    lbl_lat.setFixedWidth(42)
+    lbl_lat.setFixedWidth(48)
     self._man_lat = QLineEdit()
     self._man_lat.setPlaceholderText("ör. 39.925014")
-    self._man_lat.setToolTip("Ondalıklı derece (ör: 39.925014)")
+    self._man_lat.setMaximumWidth(220)
+    wire_coord_edit(self._man_lat, "Ondalıklı derece (ör: 39.925014)")
 
     lbl_lon = QLabel("Boylam:")
     lbl_lon.setFixedWidth(48)
     self._man_lon = QLineEdit()
     self._man_lon.setPlaceholderText("ör. 32.866200")
-    self._man_lon.setToolTip("Ondalıklı derece (ör: 32.866200)")
+    self._man_lon.setMaximumWidth(220)
+    wire_coord_edit(self._man_lon, "Ondalıklı derece (ör: 32.866200)")
+
+    coord_row.addWidget(lbl_lat, 0, 0)
+    coord_row.addWidget(self._man_lat, 0, 1)
+    coord_row.addWidget(lbl_lon, 1, 0)
+    coord_row.addWidget(self._man_lon, 1, 1)
+    coord_row.setColumnStretch(1, 1)
+    man_lay.addLayout(coord_row)
+
+    # İrtifa + tür ikinci satırda — koordinat alanlarını daraltmasın
+    meta_row = QHBoxLayout()
+    meta_row.setSpacing(4)
 
     lbl_alt_m = QLabel("İrt:")
     lbl_alt_m.setFixedWidth(24)
@@ -448,17 +959,18 @@ class _BaseMissionTab(QWidget):
     lbl_type_m.setFixedWidth(28)
     self._man_type = QComboBox()
     self._man_type.addItems(["WAYPOINT", "TAKEOFF", "LAND"])
-    self._man_type.setFixedWidth(90)
+    self._man_type.setMinimumWidth(104)
+    self._man_type.setMaximumWidth(160)
 
-    coord_row.addWidget(lbl_lat)
-    coord_row.addWidget(self._man_lat, 2)
-    coord_row.addWidget(lbl_lon)
-    coord_row.addWidget(self._man_lon, 2)
-    coord_row.addWidget(lbl_alt_m)
-    coord_row.addWidget(self._man_alt)
-    coord_row.addWidget(lbl_type_m)
-    coord_row.addWidget(self._man_type)
-    man_lay.addLayout(coord_row)
+    # tekerlek koruması: kaydırma sırasında irtifa/tür sessizce değişmesin
+    guard_wheel(self._man_alt, self._man_type)
+
+    meta_row.addWidget(lbl_alt_m)
+    meta_row.addWidget(self._man_alt)
+    meta_row.addWidget(lbl_type_m)
+    meta_row.addWidget(self._man_type)
+    meta_row.addStretch(1)
+    man_lay.addLayout(meta_row)
 
     btn_row2 = QHBoxLayout()
     btn_row2.setSpacing(4)
@@ -479,7 +991,10 @@ class _BaseMissionTab(QWidget):
     man_lay.addLayout(btn_row2)
 
     lay.addWidget(man_frame)
-    self._right_lay.addWidget(grp)
+    # Açılır bölüm: görev tipini belirleyen panel dışındaki her şey KAPALI
+    # başlar; böylece sağ panel açılışta tek ekrana sığar.
+    self._wp_sec = wrap_group(grp, expanded=False)
+    self._right_lay.addWidget(self._wp_sec)
 
   def _build_specific_controls(self):
     """Subclass'lar buraya özel kontroller ekler."""
@@ -488,14 +1003,18 @@ class _BaseMissionTab(QWidget):
   # ── Hız Kontrolü ─────────────────────────────────────────────────────────
   def _build_speed_group(self):
     grp = QGroupBox("Hız Kontrolü")
+    self._speed_grp = grp     # alt sınıflar devre dışı bırakabilsin
     form = QFormLayout(grp)
     form.setSpacing(6)
+    form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
 
     def _spn(val: float, mn: float, mx: float) -> QDoubleSpinBox:
       s = QDoubleSpinBox()
       s.setRange(mn, mx)
       s.setValue(val)
       s.setSuffix("m/s")
+      s.setMaximumWidth(140)  # sayısal girdi — uçsuz uzamasın (spec §3)
+      guard_wheel(s)   # kaydırırken hız değeri sessizce değişmesin
       return s
 
     self._sp_tkf = _spn(3.0, 0.5, 10.0)
@@ -517,25 +1036,44 @@ class _BaseMissionTab(QWidget):
     form.addRow(_lbl_tkf, _row(self._sp_tkf, 3.0))
     form.addRow(_lbl_crz, _row(self._sp_crz, 8.0))
     form.addRow(_lbl_lnd, _row(self._sp_lnd, 1.5))
-    self._right_lay.addWidget(grp)
+
+    # NEDEN: Bazı görev tiplerinde (ör. TEKNOFEST Görev 2) İHA bu alanları
+    # OKUMUYOR. Kullanıcı ayarlayıp etkisi olduğunu sanmasın diye sekmeye özel
+    # uyarı satırı; varsayılan olarak gizli (bkz. _apply_tab_constraints).
+    self._speed_note = QLabel("")
+    self._speed_note.setWordWrap(True)
+    self._speed_note.setObjectName("warningText")
+    self._speed_note.setVisible(False)
+    form.addRow(self._speed_note)
+    # Bölüm nesnesi SAKLANIR: başlık artık kutuda değil bölüm başlığında, ve
+    # setVisible/setEnabled çağrıları sarmalayıcıya gitmelidir.
+    self._speed_sec = wrap_group(grp, expanded=False)
+    self._right_lay.addWidget(self._speed_sec)
 
   # ── Batarya Tahmini ───────────────────────────────────────────────────────
   def _build_battery_group(self):
     grp = QGroupBox("Batarya Tahmini")
+    self._bat_grp = grp
     form = QFormLayout(grp)
     form.setSpacing(6)
+    form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
 
     self._bat_cap = QDoubleSpinBox()
     self._bat_cap.setRange(0, 50000)
     self._bat_cap.setValue(5000)
     self._bat_cap.setSuffix("mAh")
+    self._bat_cap.setMaximumWidth(140)
     self._bat_cap.valueChanged.connect(self._update_battery)
 
     self._bat_cur = QDoubleSpinBox()
     self._bat_cur.setRange(1, 200)
     self._bat_cur.setValue(25)
     self._bat_cur.setSuffix("A ort.")
+    self._bat_cur.setMaximumWidth(140)
     self._bat_cur.valueChanged.connect(self._update_battery)
+
+    # tekerlek koruması: batarya değerleri kaydırma sırasında bozulmasın
+    guard_wheel(self._bat_cap, self._bat_cur)
 
     _lbl_cap = QLabel("Batarya Kapasitesi:"); _lbl_cap.setStyleSheet(_SL)
     _lbl_cur = QLabel("Ort. Akım Tüketimi:"); _lbl_cur.setStyleSheet(_SL)
@@ -545,12 +1083,14 @@ class _BaseMissionTab(QWidget):
     self._bat_lbl = QLabel("— Rota hesaplanmadı —")
     self._bat_lbl.setWordWrap(True)
     form.addRow(self._bat_lbl)
-    self._right_lay.addWidget(grp)
+    self._bat_sec = wrap_group(grp, expanded=False)
+    self._right_lay.addWidget(self._bat_sec)
 
   # ── Gönder Butonu ─────────────────────────────────────────────────────────
   def _build_send_button(self):
     self._send_btn = QPushButton(" Görevi Gönder → Drone")
-    self._send_btn.setMinimumHeight(44)
+    self._send_btn.setObjectName("primaryButton")
+    self._send_btn.setMinimumHeight(34)  # spec §3: birincil eylem ≤34px
     self._send_btn.clicked.connect(self._on_send)
     self._right_lay.addWidget(self._send_btn)
 
@@ -673,10 +1213,12 @@ class _BaseMissionTab(QWidget):
     self._table.blockSignals(True)
     self._table.setRowCount(len(self._wps))
     for i, wp in enumerate(self._wps):
+      # Tür rengi TEMA tokenından (kalkış=success, iniş=danger, ara=warning);
+      # tema değişince _apply_theme_colors bu metodu yeniden çağırır.
       clr = (
-        "#4ade80" if wp["type"] == "TAKEOFF"
-        else "#ff4444" if wp["type"] == "LAND"
-        else "#f0a500"
+        theme.c("success") if wp["type"] == "TAKEOFF"
+        else theme.c("danger") if wp["type"] == "LAND"
+        else theme.c("warning")
       )
       cells = [
         str(i),
@@ -687,7 +1229,7 @@ class _BaseMissionTab(QWidget):
       ]
       for col, txt in enumerate(cells):
         it = QTableWidgetItem(txt)
-        it.setForeground(QColor(clr if col == 1 else "#ddd"))
+        it.setForeground(QColor(clr if col == 1 else theme.c("text")))
         if col != 4:
           it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self._table.setItem(i, col, it)
@@ -697,7 +1239,9 @@ class _BaseMissionTab(QWidget):
   def _refresh_hud(self):
     self._hud_list.clear()
     if not self._wps:
-        self._hud_summary.setText("Haritaya tıklayarak nokta ekleyin.")
+        # NEDEN: Yönerge, harita seçim modunun GERÇEK durumunu yansıtmalı.
+        _on = getattr(self, "_sel_btn", None) is not None and self._sel_btn.isChecked()
+        self._hud_summary.setText(self._HINT_SEL_ON if _on else self._HINT_SEL_OFF)
         return
         
     total_dist = 0.0
@@ -735,8 +1279,20 @@ class _BaseMissionTab(QWidget):
   def _toggle_select(self, on: bool):
     self._map.set_select_mode(on)
     self._sel_btn.setText(
-      " Seçim Modu AKTİF — Haritaya Tıkla" if on else " Harita Seçim Modu"
+      "🎯 Seçim Modu AÇIK — Haritaya Tıkla" if on else "🖱 Harita Seçim Modu (KAPALI)"
     )
+    # NEDEN: Modun açık/kapalı olduğu bir bakışta anlaşılmıyordu. Açıkken tema
+    # vurgu rengiyle (teal #2dd4bf → QPushButton#primaryButton) boyanır.
+    # objectName değişince QSS yeniden uygulanmalı → unpolish/polish şart.
+    self._sel_btn.setObjectName("primaryButton" if on else "")
+    _st = self._sel_btn.style()
+    if _st is not None:
+      _st.unpolish(self._sel_btn)
+      _st.polish(self._sel_btn)
+    self._sel_btn.update()
+    # Sol paneldeki yönerge metnini modun gerçek durumuna göre düzelt
+    if not self._wps:
+      self._hud_summary.setText(self._HINT_SEL_ON if on else self._HINT_SEL_OFF)
 
   def _update_battery(self):
     if not self._wps:
@@ -777,15 +1333,18 @@ class _BaseMissionTab(QWidget):
       self._map.set_drone_pos(float(lat), float(lon), float(hdg))
 
   def _on_send(self):
-    if len(self._wps) < 2:
-      QMessageBox.warning(
-        self, "Görev Gönder",
-        "En az 2 waypoint gereklidir (Kalkış + Hedef)."
-      )
-      return
-    params = self.get_mission_params()
-    params["mission_type"] = "WAYPOINT"
-    self.mission_ready_to_send.emit(params, [])
+    """Görev gönderimi — her somut sekme kendi mission_type'ı ile override eder.
+
+    NEDEN (ölü kontrol): Buradaki eski gövde mission_type="WAYPOINT" gönderiyordu;
+    İHA/companion böyle bir görev tipi TANIMIYOR. Her iki somut sekme de override
+    ettiği için şu an ulaşılamıyor, ancak ileride override etmeyen bir sekme
+    eklenirse sessizce geçersiz görev gönderilirdi. Artık sessiz kalmak yerine
+    geliştirme zamanında patlıyor.
+    """
+    raise NotImplementedError(
+      f"{type(self).__name__}._on_send() override edilmeli — "
+      "geçerli bir mission_type ile mission_ready_to_send yayılmalıdır."
+    )
 
   def get_mission_params(self) -> dict:
     """Subclass'lar ek parametreleri döndürür."""
@@ -832,17 +1391,23 @@ class TargetDropMissionTab(_BaseMissionTab):
     self._pole1: dict | None = None
     self._pole2: dict | None = None
 
+    # NEDEN: Bu sekmedeki TÜM spin kutuları uçuş parametresi taşıyor; fabrika
+    # fonksiyonlarına tek noktadan tekerlek koruması eklenir (canlı testte
+    # "Bırakma Yarıçapı" kaydırma sırasında 4.0 → 1.0 düşmüştü).
     def _dsb(lo, hi, val, step, suffix, dec=2):
       w = QDoubleSpinBox(); w.setRange(lo, hi); w.setValue(val)
       w.setSingleStep(step); w.setDecimals(dec); w.setSuffix(suffix)
-      return w
+      w.setMaximumWidth(140)  # sayısal girdi — uçsuz uzamasın (spec §3)
+      return guard_wheel(w)
 
     def _isb(lo, hi, val, suffix=""):
       w = QSpinBox(); w.setRange(lo, hi); w.setValue(val)
       if suffix: w.setSuffix(suffix)
-      return w
+      w.setMaximumWidth(140)  # sayısal girdi — uçsuz uzamasın (spec §3)
+      return guard_wheel(w)
 
     grp = QGroupBox("Hedef Tespit + Yük Bırakma (TÜBİTAK Görev 2/3)")
+    self._task2_grp = grp
     lay = QVBoxLayout(grp); lay.setSpacing(6)
 
     # ── Görev akışı: harita seçim hedefi + Direk 1/2 ──────────────────────
@@ -850,36 +1415,122 @@ class TargetDropMissionTab(_BaseMissionTab):
     sel_row.addWidget(QLabel("Harita tıklaması:"))
     self._sel_target = QComboBox()
     self._sel_target.addItems([self._SEL_AREA, self._SEL_POLE1, self._SEL_POLE2])
+    guard_wheel(self._sel_target)  # kaydırma tıklama hedefini değiştirmesin
     sel_row.addWidget(self._sel_target, 1)
     lay.addLayout(sel_row)
 
     self._pole_lbl = QLabel("Direk 1: —    Direk 2: —")
-    self._pole_lbl.setStyleSheet("font-size:11px; color:#8b949e; padding:2px;")
+    self._pole_lbl.setObjectName("mutedLabel")
     lay.addWidget(self._pole_lbl)
 
     # ── İrtifa ────────────────────────────────────────────────────────────
     alt_grp = QGroupBox("İrtifa"); alt_f = QFormLayout(alt_grp); alt_f.setSpacing(5)
-    self._scan_alt    = _dsb(2, 120, 30.0, 1.0, " m", 0)
-    self._drop_alt    = _dsb(1, 15, 2.0, 0.5, " m", 1)
-    self._tof_grab_alt = _dsb(0.1, 1.5, 0.3, 0.05, " m", 2)
+    alt_f.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+    # NEDEN (30.0 → 16.0): Bu panelin gönderdiği "scan_altitude_m",
+    # IHA/missions/task2/tuning.py içindeki Task2Tuning.scan_alt varsayılanını
+    # from_params() ile EZER. Orada değer bilinçli olarak 30 → 16 m indirildi
+    # (tuning.py:29-39, tespit bütçesi analizi): 320×240 lores + 63° HFOV ile
+    # 30 m'de 1 m kenarlı KIRMIZI ÜÇGEN ~26 px² eder ve video_streamer'ın
+    # MIN_AREA_PX=60 eşiğinde SESSİZCE elenir; sahada yalnızca mavi altıgen
+    # bulunur. YKİ 30 gönderdiği sürece İHA'nın düzeltmesi hiç devreye girmiyordu
+    # (canlı Gazebo uçuşunda "Kalkış tamam (30m)" logu bunun kanıtıdır).
+    # Aralık da İHA'nın güvenlik clamp'i ile hizalandı: TeknofestTask2Mission.
+    # PARAM_LIMITS["scan_alt"] = (5, 60) — dışına çıkan değer zaten kısılıyor ve
+    # operatöre uyarı basılıyordu (teknofest_task2.py:105).
+    self._scan_alt    = _dsb(5, 60, 16.0, 1.0, " m", 0)
+    self._scan_alt.setToolTip(
+      "Tarama irtifası. 16 m saha kalibrasyonlu varsayılandır: daha yükseğe "
+      "çıkıldığında kırmızı üçgen (1 m kenar) kamera çözünürlüğünde minimum "
+      "alan eşiğinin altına düşüp tespit edilemez. İHA 5-60 m dışını reddeder."
+    )
+    # NEDEN (aralık 1-15 → 1.5-10): PARAM_LIMITS["drop_alt"] = (1.5, 10.0).
+    # Varsayılan 2.0, Task2Tuning.drop_alt ile zaten aynı.
+    self._drop_alt    = _dsb(1.5, 10, 2.0, 0.5, " m", 1)
+    # NOT: "Yük Alma İrtifası (G3)" alanı KALDIRILDI. O alan TOF ile ölçülen
+    # bir hedef irtifaydı; TOF sensörleri araçtan söküldü. Yük alma artık
+    # kamerayla hizalanıp motor akımı + irtifa durmasıyla temas tespit ederek
+    # yapılıyor — ilgili ayarlar aşağıdaki "Görev 3" grubunda.
     alt_f.addRow("Tarama (maks) İrtifası:", self._scan_alt)
     alt_f.addRow("Bırakma İrtifası:", self._drop_alt)
-    alt_f.addRow("Yük Alma İrtifası (G3):", self._tof_grab_alt)
-    lay.addWidget(alt_grp)
+    # İç kategoriler de açılır bölüm — hepsi KAPALI başlar, operatör
+    # ilgilendiği kategoriyi tıklayarak açar (panel tek ekrana sığsın).
+    self._alt_sec = wrap_group(alt_grp, expanded=False)
+    lay.addWidget(self._alt_sec)
 
     # ── Kamera / Gimbal ───────────────────────────────────────────────────
     cam_grp = QGroupBox("Kamera / Gimbal"); cam_f = QFormLayout(cam_grp); cam_f.setSpacing(5)
+    cam_f.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
     self._scan_tilt = _isb(30, 90, 50, "°")
-    self._cam_hfov  = _dsb(30, 120, 63.0, 1.0, "°", 0)
-    self._cam_offset = _dsb(0, 50, 15.0, 1.0, " cm", 0)
+
+    # ── KALİBRASYON EZME — VARSAYILAN OLARAK KAPALI ────────────────────────
+    # NEDEN: bu alan İHA'nın ÖLÇÜLEN kalibrasyonunu (config.camera.calibration)
+    # from_params ile EZER. Panel varsayılanı 63.0° idi; gerçek kalibrasyon
+    # 65.9°. Yani YKİ'den görev göndermek, doğru kalibrasyonu eski yanlış
+    # değerle değiştiriyordu. Bu hata bir kez yaşandı ve ÖLÇÜLDÜ: bırakma
+    # isabeti 0.26 m yerine 4-5 m oldu, yani puan yarıçapının DIŞINA taştı.
+    #
+    # Artık kutu işaretlenmedikçe alan GÖNDERİLMEZ ve İHA kendi kalibrasyonunu
+    # kullanır. İşaretlenirse alan etkinleşir — bilerek ezmek isteyen operatör
+    # için kapı açık, ama yanlışlıkla ezmek imkânsız.
+    self._cam_hfov_override = QCheckBox("Kamera kalibrasyonunu EZ (dikkat)")
+    self._cam_hfov_override.setToolTip(
+      "İşaretli DEĞİLSE İHA kendi ölçülen kalibrasyonunu kullanır (doğrusu bu).\n"
+      "İşaretlenirse aşağıdaki HFOV değeri kalibrasyonu ezer. Yanlış değer\n"
+      "bırakma isabetini metrelerce bozar — ölçüldü: 0.26 m → 4-5 m.")
+    self._cam_hfov  = _dsb(30, 120, 65.9, 0.1, "°", 2)
+    self._cam_hfov.setEnabled(False)
+    self._cam_hfov_override.toggled.connect(self._cam_hfov.setEnabled)
+
+    # ── PANELDEKİ GEOMETRİ HESAPLARI HANGİ KAMERAYI VARSAYSIN ────────────
+    # DÜZELTİLEN HATA: hizalama tabanı ve yaw kademesi etiketleri _cam_hfov'un
+    # DEĞERİNİ okuyordu. O alan "kalibrasyonu EZ" kutusu işaretli değilken
+    # DEVRE DIŞIdır ve varsayılanı 65.9° (artık araçta olmayan IMX519 profili).
+    # Araçta aktif olan IMX296 ise 45.4°. Etiketler böylece hizalama tabanını
+    # ~%47 ALÇAK gösteriyordu — operatör panele bakıp "mavi altıgen 4.4 m'de
+    # hizalanır" diye plan yaparken İHA 8 m'de hizalıyordu.
+    # Çözüm: önizleme geometrisini override kutusundan AYIR. Kutu işaretliyse
+    # İHA gerçekten o değeri kullanacağı için o okunur; değilse burada seçilen
+    # profil kullanılır ve etiket hangi varsayımla hesapladığını YAZAR.
+    # Profil listesi IHA/config.json::camera.profiles ile aynı tutulmalıdır.
+    self._geo_cam = QComboBox()
+    self._geo_cam.setMaximumWidth(190)  # kamera combo — spec §3 genişlik sınırı (uzun etiketle aynı satırda taşmasın)
+    self._geo_cam.addItems([
+        "IMX296 GS 6 mm — 45.4° (araçta AKTİF)",
+        "IMX519 AF — 65.9°",
+    ])
+    self._geo_cam.setToolTip(
+      "Panelin hizalama tabanı / yaw kademesi hesaplarında VARSAYDIĞI kamera.\n"
+      "Uçuşu ETKİLEMEZ — yalnızca bu paneldeki önizleme sayılarını belirler.\n"
+      "'Kalibrasyonu EZ' işaretliyse bu seçim yok sayılır ve İHA'ya gerçekten\n"
+      "gönderilecek HFOV değeri kullanılır.")
+    guard_wheel(self._geo_cam)
+
+    # Kamera aracın MERKEZİNDE (ofset 0). Eski değer 15 cm idi; kamera
+    # merkeze alındığında güncellenmedi ve panel her görevde 15 cm gönderiyordu.
+    self._cam_offset = _dsb(0, 50, 0.0, 0.5, " cm", 1)
+    self._cam_offset.setToolTip(
+      "Kameranın gövde merkezinden İLERİ ofseti. Mevcut araçta kamera tam\n"
+      "merkezde olduğu için 0. Sıfırdan farklı değer, hedefin yer izdüşümünü\n"
+      "o kadar kaydırır.")
+
     cam_f.addRow("İleri-Bakış Açısı (tilt):", self._scan_tilt)
+    # Tek arg → satır iki sütuna yayılır; "" etiketli form satırı checkbox
+    # metnini sağ sütuna sıkıştırıp kırpıyordu.
+    cam_f.addRow(self._cam_hfov_override)
     cam_f.addRow("Kamera Görüş Açısı (HFOV):", self._cam_hfov)
+    cam_f.addRow("Önizleme Kamerası (uçuşu etkilemez):", self._geo_cam)
     cam_f.addRow("Kamera İleri Ofseti:", self._cam_offset)
-    lay.addWidget(cam_grp)
+    self._cam_sec = wrap_group(cam_grp, expanded=False)
+    lay.addWidget(self._cam_sec)
 
     # ── Tarama Davranışı ──────────────────────────────────────────────────
     sc_grp = QGroupBox("Tarama Davranışı"); sc_f = QFormLayout(sc_grp); sc_f.setSpacing(5)
-    self._scan_speed    = _dsb(1, 20, 6.0, 0.5, " m/s", 1)
+    sc_f.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+    # NEDEN (aralık 1-20 → 1-12): PARAM_LIMITS["scan_speed"] = (1.0, 12.0)
+    # (teknofest_task2.py:107). 12 m/s üstü değer İHA'da sessizce değil ama
+    # UÇUŞ SIRASINDA kısılıyordu; panelde hiç girilememesi daha doğru.
+    # Varsayılan 6.0, Task2Tuning.scan_speed ile aynı.
+    self._scan_speed    = _dsb(1, 12, 6.0, 0.5, " m/s", 1)
     self._drop_radius   = _dsb(1, 15, 4.0, 0.5, " m", 1)
     self._scan_wp_radius = _dsb(1, 10, 3.0, 0.5, " m", 1)
     self._scan_timeout  = _isb(30, 600, 180, " s")
@@ -887,19 +1538,56 @@ class TargetDropMissionTab(_BaseMissionTab):
     sc_f.addRow("Bırakma Yarıçapı:", self._drop_radius)
     sc_f.addRow("WP Kabul Yarıçapı:", self._scan_wp_radius)
     sc_f.addRow("Tarama Zaman Aşımı:", self._scan_timeout)
-    lay.addWidget(sc_grp)
+    self._scan_sec = wrap_group(sc_grp, expanded=False)
+    lay.addWidget(self._scan_sec)
 
     # ── Hedef Tanımı (alan-bazlı sınıflandırma) ───────────────────────────
     tg_grp = QGroupBox("Hedef Tanımı (gerçek alan)"); tg_f = QFormLayout(tg_grp); tg_f.setSpacing(5)
+    tg_f.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
     self._red_area  = _dsb(0.05, 5.0, 0.43, 0.01, " m²", 2)
     self._blue_area = _dsb(1.0, 30.0, 10.39, 0.1, " m²", 2)
     tg_f.addRow("Kırmızı Üçgen Alanı:", self._red_area)
     tg_f.addRow("Mavi Altıgen Alanı:", self._blue_area)
-    lay.addWidget(tg_grp)
+    self._target_sec = wrap_group(tg_grp, expanded=False)
+    lay.addWidget(self._target_sec)
+
+    # ── Hassas Hizalama / Alçalma Profili ─────────────────────────────────
+    # NEDEN: Task2Tuning'e alçalma hız profili eklendi (align_descend_vz,
+    # align_descend_max_vz, align_coarse_factor) ve from_params ile override
+    # edilebiliyor (tuning.py:117-119). Bu üç değer canlı Gazebo uçuşunda
+    # ölçülen soruna karşı ayarlandı: sabit 0.4 m/s alçalma ile hedef başına
+    # 116-125 s harcanıyor ve align_timeout_s (120 s) doluyordu
+    # (alignment.py:313-335). Sahada yeniden ayarlanabilmesi için panele
+    # açıldı; VARSAYILANLAR İHA'nınkiyle BİREBİR aynı tutulmalıdır — aksi
+    # halde bu panel, İHA'nın kalibre edilmiş değerini yine sessizce ezer.
+    al_grp = QGroupBox("Hassas Hizalama (alçalma profili)")
+    al_f = QFormLayout(al_grp); al_f.setSpacing(5)
+    al_f.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+    self._align_vz     = _dsb(0.1, 2.0, 0.4, 0.05, " m/s", 2)   # tuning.align_descend_vz
+    self._align_max_vz = _dsb(0.2, 4.0, 1.5, 0.1, " m/s", 1)    # tuning.align_descend_max_vz
+    self._align_coarse = _dsb(1.0, 8.0, 3.0, 0.5, "×", 1)       # tuning.align_coarse_factor
+    self._align_vz.setToolTip(
+      "Alçalma TABAN hızı. Bırakma irtifasının son metrelerinde ve tam "
+      "ortalanmış durumda kullanılan hız."
+    )
+    self._align_max_vz.setToolTip(
+      "Alçalma hız TAVANI. Yüksekteyken hız, irtifa payının %25'i kadar "
+      "ölçeklenir ve bu değerle sınırlanır (30 m'de ~1.5 m/s)."
+    )
+    self._align_coarse.setToolTip(
+      "Kaba hizalama katsayısı: hedef, merkez toleransının bu katı içindeyse "
+      "alçalma durmaz, yarı hızda sürer. Küçültmek daha hassas ama daha yavaş."
+    )
+    al_f.addRow("Alçalma Hızı (taban):", self._align_vz)
+    al_f.addRow("Alçalma Hızı (tavan):", self._align_max_vz)
+    al_f.addRow("Kaba Hizalama Katsayısı:", self._align_coarse)
+    self._align_sec = wrap_group(al_grp, expanded=False)
+    lay.addWidget(self._align_sec)
 
     # ── Donanım / Servo Kanalları ─────────────────────────────────────────
     pin_grp = QGroupBox("Donanım / Servo Kanalları")
     pin_form = QFormLayout(pin_grp); pin_form.setSpacing(4)
+    pin_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
     # Varsayılanlar config.json "servos" ile hizalı (gerçek kablolama):
     # gimbal=1, red_drop=2, blue_drop=3, grabber_left=4, grabber_right=5
     self._pin_drop1 = _isb(1, 16, 2)
@@ -912,7 +1600,8 @@ class TargetDropMissionTab(_BaseMissionTab):
     pin_form.addRow("Sol Kapak (grab_L):", self._pin_grabL)
     pin_form.addRow("Sağ Kapak (grab_R):", self._pin_grabR)
     pin_form.addRow("Gimbal (pitch):", self._pin_gimbal)
-    lay.addWidget(pin_grp)
+    self._pin_sec = wrap_group(pin_grp, expanded=False)
+    lay.addWidget(self._pin_sec)
 
     # ── Mod ───────────────────────────────────────────────────────────────
     self._auto_cb = QCheckBox("Otonom Bırakma (Tespit → Anında Bırak)")
@@ -921,7 +1610,434 @@ class TargetDropMissionTab(_BaseMissionTab):
     self._bonus_cb = QCheckBox("Bonus Görev 3: Yükü yerden al → ikinci hedefe taşı")
     lay.addWidget(self._bonus_cb)
 
-    self._right_lay.insertWidget(0, grp)
+    # ── GÖREV 3 — KAMERAYLA YÜK ALMA ──────────────────────────────────────
+    # TOF sensörleri araçtan söküldü. Bu fazın TAMAMI artık kamerayla
+    # yapılıyor: alçalma sırasında görüntüyle sürekli düzeltme, kavrayıcı
+    # kapanma eksenine yaw hizalaması, ve motor akımı + irtifa durmasıyla
+    # yere temas tespiti. Değerler benzetimle süpürüldü ve Gazebo'da
+    # doğrulandı; buradan saha koşuluna göre değiştirilebilir.
+    g3_grp = QGroupBox("Görev 3 — Kamerayla Yük Alma")
+    g3_v = QVBoxLayout(g3_grp); g3_v.setSpacing(4)
+
+    g3_f = QFormLayout(); g3_f.setSpacing(5)
+    g3_f.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+    self._grab_gimbal = _dsb(60, 90, 90.0, 1.0, "°", 0)
+    self._grab_gimbal.setToolTip(
+      "Yük alma sırasındaki gimbal açısı. 90° = tam aşağı (nadir).\n"
+      "Nadirden sapma, İRTİFADAN BAĞIMSIZ sabit bir piksel kayması üretir:\n"
+      "kamera öne bakınca araç yükün tam üstündeyken bile yük karede\n"
+      "merkezde görünmez. ÖLÇÜLDÜ: 85°'de normalize hataya sabit +0.18\n"
+      "eklendi (kapı 0.35) ve araç yükün 17 cm yanındayken bile tırmandı.")
+
+    self._grab_vz_max = _dsb(0.1, 1.5, 0.60, 0.05, " m/s", 2)
+    self._grab_vz_max.setToolTip("Tam hizalıyken azami alçalma hızı.")
+
+    self._grab_u_gate = _dsb(0.10, 0.60, 0.35, 0.01, "", 2)
+    self._grab_u_gate.setToolTip(
+      "Alçalma kapısı: hedefin kare yarı-boyutuna göre normalize hatası.\n"
+      "0 = merkez, 1 = kare kenarı. Bu değerin üstünde alçalma DURUR,\n"
+      "aşılırsa araç TIRMANIR — böylece hedefin kadrajdan çıkması\n"
+      "yapısal olarak engellenir. Küçültmek isabeti artırır ama süreyi uzatır.")
+
+    self._grab_commit_alt = _dsb(0.05, 0.50, 0.12, 0.01, " m", 2)
+    self._grab_commit_alt.setToolTip(
+      "Taahhüt irtifası: altında düzeltme KESİLİR ve düz inilir.\n"
+      "Nedeni fiziksel — kameranın asgari odak mesafesi ve kavrayıcıların\n"
+      "kadraj merkezini gölgelemesi. Taahhüde YALNIZCA hata yeterince\n"
+      "küçükken girilir; değilse tırmanılıp yeniden hizalanır.")
+
+    self._grab_commit_vz = _dsb(0.2, 1.2, 0.80, 0.05, " m/s", 2)
+    self._grab_commit_vz.setToolTip(
+      "Kör (taahhüt) fazındaki iniş hızı. SEZGİYE AYKIRI: burada HIZLI\n"
+      "inmek daha isabetli. Kör fazda düzeltme zaten yok; tek değişken\n"
+      "bozucuya maruz kalma SÜRESİ. 480 benzetim uçuşunda 0.50→0.60→0.80\n"
+      "m/s gittikçe isabet monoton arttı (415→445→464 / 480).")
+    g3_f.addRow("Gimbal Açısı:", self._grab_gimbal)
+    g3_f.addRow("Alçalma Hızı (tavan):", self._grab_vz_max)
+    g3_f.addRow("Alçalma Kapısı (u):", self._grab_u_gate)
+    g3_f.addRow("Taahhüt İrtifası:", self._grab_commit_alt)
+    g3_f.addRow("Taahhüt İniş Hızı:", self._grab_commit_vz)
+    g3_v.addLayout(g3_f)
+
+    # ── Yaw hizalama ──────────────────────────────────────────────────────
+    yaw_lbl = QLabel("Yaw Hizalama (kavrayıcı kapanma ekseni)")
+    yaw_lbl.setObjectName("sectionTitle")
+    g3_v.addWidget(yaw_lbl)
+    yaw_uyari = QLabel(
+      "⚠ Eksen açısı ve işaret MONTAJA bağlıdır, ÖLÇÜLMELİDİR. Yanlışsa yaw "
+      "çevrimi kapanmaz ve araç inmeyi reddeder.")
+    yaw_uyari.setWordWrap(True)
+    yaw_uyari.setObjectName("warningText")
+    g3_v.addWidget(yaw_uyari)
+
+    yaw_f = QFormLayout(); yaw_f.setSpacing(5)
+    yaw_f.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+    self._grab_axis = _dsb(-180, 180, 0.0, 1.0, "°", 1)
+    self._grab_axis.setToolTip(
+      "Kavrayıcıların kapanma ekseninin GÖRÜNTÜDEKİ açısı.\n"
+      "Tezgâhta ölçülür: yükü kavrayıcılar arasına koyup kameradan bakın,\n"
+      "yükün görüntüdeki açısı ile kapanma ekseni arasındaki fark budur.")
+    self._grab_yaw_sign = QComboBox()
+    self._grab_yaw_sign.setMaximumWidth(160)  # kısa metin combo
+    self._grab_yaw_sign.addItems(["+1 (düz)", "-1 (ters)"])
+    # NEDEN "+1" ÖNCE (varsayılan): panel varsayılanı İHA'ya HER GÖREVDE
+    # gönderilir, yani firmware'deki değeri EZER. Liste "-1" ile başlıyordu
+    # ve tuning.py'de ölçümle +1.0'a çekilen değeri sessizce geri -1'e
+    # döndürüyordu — düzeltme uçuşa hiç ulaşmazdı. Sıra, tuning.py'deki
+    # ölçülmüş varsayılanla AYNI olmalıdır (bkz. grab_yaw_sign NOT'u:
+    # Gazebo kaydında -1 ile hata 10.8°→39°'ye ıraksadı).
+    self._grab_yaw_sign.setToolTip(
+      "Aracı +yaw döndürmek hedefin görüntüdeki açısını ARTIRIYOR mu,\n"
+      "AZALTIYOR mu? Tezgâhta 30 saniyede ölçülür: aracı elde tutup yaw'ı\n"
+      "azıcık döndürün ve görüntüdeki açının hangi yöne gittiğine bakın.\n"
+      "Yanlış seçim düzeltmeyi TERS yöne sürer, hata hiç kapanmaz.\n"
+      "Simde ÖLÇÜLDÜ: +1 doğru. Gerçek araçta montaj farklıysa yeniden ölçün.")
+    self._grab_yaw_gate = _dsb(5, 45, 15.0, 1.0, "°", 0)
+    self._grab_yaw_gate.setToolTip(
+      "Yaw kapısı: bu değerin üstünde alçalma durur. Yaw ve konum AYNI\n"
+      "yakalama zarfını paylaşır — 11 cm zarfta 8 cm yükün dönmüş\n"
+      "sınırlayıcı kutusu ~33°'de zarfı doldurur, o noktada konum payı sıfırdır.")
+    self._grab_yaw_sym = QComboBox()
+    # NEDEN "90° (kare)" ÖNCE (varsayılan): ASHİNA yükü 8x8 cm KAREDİR.
+    # Liste "180°" ile başlıyordu ve panel bunu her görevde İHA'ya
+    # gönderip tuning.py'deki doğru 90.0 değerini eziyordu. Ölçüldü:
+    # 180° ile 26 koşunun 26'sı yaw kapısında takıldı (medyan hata 82.2°);
+    # 90° ile aynı ham açılar 7.8° medyana düşüyor ve 25'i geçiyor.
+    self._grab_yaw_sym.setMaximumWidth(160)  # kısa metin combo
+    self._grab_yaw_sym.addItems(["90° (kare)", "180° (dikdörtgen)", "360° (asimetrik)"])
+    self._grab_yaw_sym.setToolTip(
+      "Yükün dönme simetrisi. Kavrayıcılar karşılıklı kapandığı için yükü\n"
+      "θ ya da θ+180°'de kavramak aynıdır; simetriyi hesaba katmamak aracı\n"
+      "gereksiz yere 180° döndürür ve dönüş sırasında yanal hatayı büyütür.")
+    yaw_f.addRow("Kapanma Ekseni Açısı:", self._grab_axis)
+    yaw_f.addRow("Yaw Komut İşareti:", self._grab_yaw_sign)
+    yaw_f.addRow("Yaw Kapısı:", self._grab_yaw_gate)
+    yaw_f.addRow("Yük Simetrisi:", self._grab_yaw_sym)
+    g3_v.addLayout(yaw_f)
+
+    # ── Yere temas ────────────────────────────────────────────────────────
+    td_lbl = QLabel("Yere Temas Tespiti")
+    td_lbl.setObjectName("sectionTitle")
+    g3_v.addWidget(td_lbl)
+    td_f = QFormLayout(); td_f.setSpacing(5)
+    td_f.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+    self._td_ratio = _dsb(0.20, 0.90, 0.55, 0.05, "", 2)
+    self._td_ratio.setToolTip(
+      "Temas eşiği, ASKI AKIMININ ORANI olarak. Sabit amper DEĞİL:\n"
+      "askı akımı batarya gerilimiyle, yükle ve hava yoğunluğuyla kayar.\n"
+      "Orana bağlamak, akım sensörünün ÖLÇEK hatasına da bağışıklık verir\n"
+      "— yanlış kalibre bir sensörle bile pay ve payda sadeleşir.")
+    self._td_arm = _dsb(0.2, 3.0, 1.0, 0.1, " m", 1)
+    self._td_arm.setToolTip(
+      "İrtifa tanığı, alçalmanın başından bu kadar inilmeden SİLAHLANMAZ.\n"
+      "ÖLÇÜLDÜ: bu kapı yokken tanık alçalma komutu verilir verilmez\n"
+      "tetiklendi (araç henüz hızlanmamıştı) ve 5.56 m'de 'TEMAS' dedi —\n"
+      "kavrayıcı havada kapandı, görev boş kavrayıcıyla 'başarılı' raporladı.")
+    td_f.addRow("Akım Düşüş Oranı:", self._td_ratio)
+    td_f.addRow("Silahlanma Mesafesi:", self._td_arm)
+    g3_v.addLayout(td_f)
+
+    # ── Yük görüsü + iki kademeli yaw ─────────────────────────────────────
+    pv_lbl = QLabel("Yük Görüsü ve Yaw Kademeleri")
+    pv_lbl.setObjectName("sectionTitle")
+    g3_v.addWidget(pv_lbl)
+    pv_note = QLabel(
+      "Yük tanıma, aracın yükü BIRAKTIĞI irtifada açılır — o irtifada yükün "
+      "görülebilirliği aynı uçuşta ölçülmüştür. Erken açmak kesik tespit "
+      "üretir ve görev 'yük yok' diyerek iptal olur.")
+    pv_note.setWordWrap(True)
+    pv_note.setObjectName("mutedLabel")
+    g3_v.addWidget(pv_note)
+
+    pv_f = QFormLayout(); pv_f.setSpacing(5)
+    pv_f.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+    self._grab_vis_alt = _dsb(0.0, 10.0, 0.0, 0.5, " m", 1)
+    self._grab_vis_alt.setToolTip(
+      "Yük tanımanın açılacağı irtifa. 0 = Bırakma İrtifasını kullan (önerilen).\n"
+      "Elle bir değer vermek, yükü bırakıldığından farklı bir ölçekte aramak\n"
+      "demektir — tespit eşiğe yaklaşır ve kesik kesik gelir.")
+    self._grab_vis_settle = _dsb(1.0, 15.0, 3.0, 0.5, " s", 1)
+    self._grab_vis_settle.setToolTip(
+      "Görü açıldıktan sonra tespitin oturması için tanınan süre.\n"
+      "Bu süre içinde yeterli ardışık onay gelmezse faz güvenle atlanır.\n"
+      "Tek kareye bakmak, dedektörün kendi zamansal filtresi (2 kare)\n"
+      "yüzünden yük ORADAYKEN bile 'yok' kararı üretebiliyordu.")
+    self._grab_vis_conf = _dsb(1, 10, 3, 1, " kare", 0)
+    self._grab_vis_conf.setToolTip("Görüyü 'oturmuş' saymak için ardışık onay sayısı.")
+
+    self._yaw_coarse = _dsb(0.02, 0.60, 0.12, 0.01, "", 2)
+    self._yaw_fine = _dsb(0.05, 0.90, 0.40, 0.01, "", 2)
+    self._yaw_fine_kp = _dsb(0.05, 1.00, 0.40, 0.05, "×", 2)
+    self._yaw_fine_kp.setToolTip(
+      "İnce kademede yaw kazancının çarpanı. Bu pencerede taahhüt\n"
+      "irtifasına çok az kaldığı için büyük yaw komutu aracı yatırır\n"
+      "ve yükü kaydırır — kazanç kısılır, düzeltme ince ayara döner.")
+    # Kaplama oranının irtifa karşılığı kameraya bağlı; operatör oranı
+    # ayarlarken hangi irtifada devreye gireceğini görmeli — yoksa %40 gibi
+    # makul görünen bir sayı, pratikte hiç ulaşılamayan bir irtifaya denk gelir.
+    self._yaw_stage_lbl = QLabel("")
+    self._yaw_stage_lbl.setWordWrap(True)
+    self._yaw_stage_lbl.setObjectName("mutedLabel")
+    # DÜZELTİLEN HATA: etiket yalnızca iki eşiğe bağlıydı. Ama içindeki
+    # "İNCE kademe taahhüt irtifasının ALTINDA kalıyor" uyarısı _grab_commit_alt
+    # ve HFOV'a bakarak üretiliyor — o iki değer değiştiğinde etiket yeniden
+    # hesaplanmadığı için uyarı, korumak istediği parametre değiştirildiğinde
+    # tam da hiç çıkmıyordu (bayat metin ekranda kalıyordu).
+    for _w in (self._yaw_coarse, self._yaw_fine, self._grab_commit_alt,
+               self._cam_hfov):
+      _w.valueChanged.connect(lambda *_: self._update_yaw_stage_lbl())
+    for _w in (self._cam_hfov_override, ):
+      _w.toggled.connect(lambda *_: (self._update_yaw_stage_lbl(),
+                                     self._update_floor_lbl()))
+    self._geo_cam.currentIndexChanged.connect(
+      lambda *_: (self._update_yaw_stage_lbl(), self._update_floor_lbl()))
+
+    pv_f.addRow("Görü Başlangıç İrtifası:", self._grab_vis_alt)
+    pv_f.addRow("Görü Oturma Süresi:", self._grab_vis_settle)
+    pv_f.addRow("Görü Onay Sayısı:", self._grab_vis_conf)
+    pv_f.addRow("KABA Yaw Eşiği (kaplama):", self._yaw_coarse)
+    pv_f.addRow("İNCE Yaw Eşiği (kaplama):", self._yaw_fine)
+    pv_f.addRow("İnce Kademe Kazanç Çarpanı:", self._yaw_fine_kp)
+    g3_v.addLayout(pv_f)
+    g3_v.addWidget(self._yaw_stage_lbl)
+
+    self._g3_sec = wrap_group(g3_grp, expanded=False)
+    lay.addWidget(self._g3_sec)
+
+    # ── YAKLAŞMA EĞRİSİ (Görev 2 ve 3 ortak) ──────────────────────────────
+    ap_grp = QGroupBox("Hedefe Yaklaşma — İrtifa Eğrisi ve Gimbal İzleme")
+    ap_v = QVBoxLayout(ap_grp); ap_v.setSpacing(4)
+    ap_note = QLabel(
+      "Hedefe giderken irtifa ve gimbal açısı kalan mesafenin fonksiyonudur: "
+      "araç hedefe VARDIĞINDA zaten hizalama tabanındadır ve kamera nadire "
+      "dönmüştür. Hizalama tabanı hedefin kadraja sığdığı en alçak irtifadır; "
+      "altına inmek isabeti artırmaz, taşan kenar ağırlık merkezini kaydırır.")
+    ap_note.setWordWrap(True)
+    ap_note.setObjectName("mutedLabel")
+    ap_v.addWidget(ap_note)
+
+    ap_f = QFormLayout(); ap_f.setSpacing(5)
+    ap_f.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+    self._ap_enable = QCheckBox("Eğriyle yaklaşma etkin (kapalı = eski iki adım)")
+    self._ap_enable.setChecked(True)
+    ap_v.addWidget(self._ap_enable)
+
+    self._ap_k = _dsb(0.3, 3.0, 1.0, 0.1, "", 2)
+    self._ap_k.setToolTip(
+      "Eğri üsteli. YÖN: büyük değer DAHA ALÇAK verir.\n"
+      "  k > 1 → ERKEN iniş (yolun başında hızlı alçalır)\n"
+      "  k = 1 → doğrusal (kalan mesafeyle orantılı)\n"
+      "  k < 1 → GEÇ iniş (irtifayı korur, son metrelerde iner)")
+    self._ap_fill = _dsb(0.4, 1.0, 0.8, 0.05, "", 2)
+    self._ap_fill.setToolTip(
+      "Hizalama tabanında hedefin kadrajı kaplama oranı.\n"
+      "1.0 = hedef kadrajı tam doldurur (en alçak geçerli irtifa).\n"
+      "0.8 = %25 kenar payı — rüzgâr/yalpa ile hedef kenara kaysa da kırpılmaz.")
+    self._ap_gimbal_cb = QCheckBox("Gimbal hedefi kademeli izlesin")
+    self._ap_gimbal_cb.setChecked(True)
+    self._ap_gimbal_cb.setToolTip(
+      "Kapalıysa gimbal eskisi gibi tek adımda hizalama açısına atlar.\n"
+      "Bu sıçrama hedefi bir karede kadrajın bir ucundan öbürüne taşır ve\n"
+      "dedektörün ardışıklık filtresi bunu tespit kaybı sayar.")
+
+    self._ap_floor_red = _dsb(0.0, 20.0, 0.0, 0.5, " m", 1)
+    self._ap_floor_blue = _dsb(0.0, 20.0, 0.0, 0.5, " m", 1)
+    _floor_tip = ("0 = OTOMATİK: hedef alanı + aktif kamera FOV'undan türetilir.\n"
+                  "Kamera profili değişince kendiliğinden güncellenir — sabit\n"
+                  "yazılan bir değer, profil değişince sessizce yanlışlanır.")
+    self._ap_floor_red.setToolTip(_floor_tip)
+    self._ap_floor_blue.setToolTip(_floor_tip)
+
+    ap_f.addRow("Eğri Üsteli (k):", self._ap_k)
+    ap_f.addRow("Kadraj Doluluk Oranı:", self._ap_fill)
+    ap_f.addRow("Kırmızı Hizalama Tabanı:", self._ap_floor_red)
+    ap_f.addRow("Mavi Hizalama Tabanı:", self._ap_floor_blue)
+    ap_v.addLayout(ap_f)
+    ap_v.addWidget(self._ap_gimbal_cb)
+
+    self._ap_floor_lbl = QLabel("")
+    self._ap_floor_lbl.setWordWrap(True)
+    self._ap_floor_lbl.setObjectName("mutedLabel")
+    ap_v.addWidget(self._ap_floor_lbl)
+    for _w in (self._ap_fill, self._ap_floor_red, self._ap_floor_blue,
+               self._cam_hfov, self._red_area, self._blue_area, self._drop_alt):
+      _w.valueChanged.connect(lambda *_: self._update_floor_lbl())
+
+    # ── HEDEF KUYRUĞU ─────────────────────────────────────────────────────
+    self._queue_cb = QCheckBox("Yolda görülen diğer hedefi hafızaya al")
+    self._queue_cb.setChecked(True)
+    self._queue_cb.setToolTip(
+      "Bir hedefe giderken kadraja giren DİĞER hedefin koordinatı kaydedilir\n"
+      "ve sırası gelince tarama YAPILMADAN oraya gidilir.\n"
+      "Kapalıysa ikinci hedef için baştan tam tarama turu atılır (60–100 s).")
+    ap_v.addWidget(self._queue_cb)
+    q_f = QFormLayout(); q_f.setSpacing(5)
+    q_f.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+    self._queue_conf = _dsb(1, 10, 3, 1, " kare", 0)
+    self._queue_conf.setToolTip(
+      "Kuyruğa yazmadan önce gereken ardışık onay sayısı.\n"
+      "Tek kare yeterli değil: yanlış-pozitif bir izdüşüm, alanın dışında\n"
+      "bir koordinatı kuyruğa sokar ve o hedef 'denendi' sayılıp kaybedilir.")
+    self._queue_spread = _dsb(1.0, 30.0, 6.0, 0.5, " m", 1)
+    self._queue_spread.setToolTip(
+      "Ardışık onaylar bu mesafeden fazla oynarsa örneklem sıfırlanır —\n"
+      "kararsız bir tespitin ortalaması 'üç kez onaylandı' diye güven verir\n"
+      "ama koordinatı uydurur.")
+    q_f.addRow("Kuyruk Onay Sayısı:", self._queue_conf)
+    q_f.addRow("Kuyruk Yayılım Sınırı:", self._queue_spread)
+    ap_v.addLayout(q_f)
+
+    self._approach_sec = wrap_group(ap_grp, expanded=False)
+    lay.addWidget(self._approach_sec)
+    self._update_floor_lbl()
+    self._update_yaw_stage_lbl()
+    # Görev 3 ayarları yalnız bonus seçiliyken anlamlı.
+    # DİKKAT: artık SARMALAYICI bölüm devre dışı bırakılır — yalnız kutuyu
+    # kapatmak, başlığı tıklanabilir bırakıp devre dışı bölümü açtırırdı.
+    self._g3_sec.setEnabled(self._bonus_cb.isChecked())
+    self._bonus_cb.toggled.connect(self._g3_sec.setEnabled)
+
+    # Görev tipini belirleyen ÜST DÜZEY bölüm açık başlar (diğerleri kapalı).
+    self._task2_sec = wrap_group(grp, expanded=True)
+    self._right_lay.insertWidget(0, self._task2_sec)
+
+  # ── Panelde canlı geometri: operatör sayının ne demek olduğunu görsün ────
+  # NEDEN bu iki etiket var: hem "kadraj doluluk oranı" hem "yaw kaplama
+  # eşiği" BOYUTSUZ oranlardır ve karşılıkları KAMERAYA bağlıdır. %40 gibi
+  # makul görünen bir sayı, dar lensle ulaşılamayacak bir irtifaya denk
+  # gelebilir. Karşılığı panelde yazmazsa operatör bunu ancak uçuşta anlar.
+  # Formüller İHA tarafındakiyle aynı (missions/task2/geometry.py):
+  #   çevrel çap  2R = 2·√(2A / (n·sin(2π/n)))
+  #   taban        h = extent / (2·fill·tan(fov/2)),  yatay ve dikeyin BÜYÜĞÜ
+  # VFOV oranı da İHA ile aynı: vfov = hfov · 0.75.
+  @staticmethod
+  def _poly_extent_m(area_m2: float, n: int) -> float:
+    if area_m2 <= 0 or n < 3:
+      return 0.0
+    return 2.0 * math.sqrt(2.0 * area_m2 / (n * math.sin(2.0 * math.pi / n)))
+
+  def _geo_hfov(self) -> tuple[float, str]:
+    """
+    Panel geometri hesaplarının kullanacağı HFOV → (derece, kaynak_metni).
+
+    Öncelik: "kalibrasyonu EZ" işaretliyse İHA'ya GERÇEKTEN gönderilecek değer;
+    değilse önizleme kamerası seçimi. İkisini karıştırmak, devre dışı bir
+    alanın varsayılanıyla hesap yapmak demekti (bkz. _geo_cam yorumu).
+    """
+    if self._cam_hfov_override.isChecked():
+      return self._cam_hfov.value(), "panelden EZİLEN değer"
+    if self._geo_cam.currentIndex() == 0:
+      return 45.4, "IMX296 GS (araçta aktif)"
+    return 65.9, "IMX519 AF"
+
+  @staticmethod
+  def _fit_alt_m(extent_m: float, hfov_deg: float, fill: float) -> float:
+    if extent_m <= 0 or hfov_deg <= 0:
+      return 0.0
+    vfov = hfov_deg * 0.75
+    f = max(0.05, min(1.0, fill))
+    hw = extent_m / (2.0 * f * math.tan(math.radians(hfov_deg) / 2.0))
+    hh = extent_m / (2.0 * f * math.tan(math.radians(vfov) / 2.0))
+    return max(hw, hh)
+
+  def _update_floor_lbl(self):
+    """Hizalama tabanlarının o anki kamerayla ne olacağını yazar."""
+    if not hasattr(self, "_ap_floor_lbl"):
+      return
+    hfov, kaynak = self._geo_hfov()
+    fill = self._ap_fill.value()
+    drop = self._drop_alt.value()
+    parts = []
+    for ad, area_w, manual_w, n in (
+        ("kırmızı üçgen", self._red_area, self._ap_floor_red, 3),
+        ("mavi altıgen", self._blue_area, self._ap_floor_blue, 6)):
+      ext = self._poly_extent_m(area_w.value(), n)
+      auto = self._fit_alt_m(ext, hfov, fill)
+      man = manual_w.value()
+      if man > 0:
+        parts.append(f"{ad}: {max(drop, man):.2f} m (elle; otomatik olsa "
+                     f"{max(drop, auto):.2f} m)")
+      else:
+        parts.append(f"{ad}: {max(drop, auto):.2f} m (otomatik, çap {ext:.2f} m)")
+    self._ap_floor_lbl.setText(
+      f"HFOV {hfov:.1f}° [{kaynak}] · doluluk {fill:.2f} → hizalama tabanı — "
+      + ";  ".join(parts)
+      + f".  (Alt sınır Bırakma İrtifası {drop:.1f} m'dir; bırakma hizalama "
+        "kurulduktan sonra bu irtifaya inilerek yapılır.)")
+
+  def _update_yaw_stage_lbl(self):
+    """Yaw kaplama eşiklerinin irtifa karşılığını yazar."""
+    if not hasattr(self, "_yaw_stage_lbl"):
+      return
+    hfov, kaynak = self._geo_hfov()
+    vfov = hfov * 0.75
+    size = 0.08                     # yükün kenarı (m) — tuning.payload_size_m
+    # Kaplama oranı DOĞRUSAL: frac = yük_boyu / kare_dar_kenarı.
+    # Kare dar kenarı irtifa h'de: 2·h·tan(vfov/2)  (dikey daima daha dar).
+    tan_v = math.tan(math.radians(vfov) / 2.0)
+
+    def _alt(frac):
+      if frac <= 0 or tan_v <= 0:
+        return 0.0
+      return size / (2.0 * frac * tan_v)
+
+    kaba, ince = self._yaw_coarse.value(), self._yaw_fine.value()
+    uyari = ""
+    if ince <= kaba:
+      uyari = "  ⚠ İNCE eşik KABA eşikten büyük olmalı."
+    elif _alt(ince) < self._grab_commit_alt.value():
+      uyari = ("  ⚠ İNCE eşik, taahhüt irtifasının ALTINA denk geliyor — "
+               "o kademe hiç açılmayacak.")
+    self._yaw_stage_lbl.setText(
+      f"8 cm yük, HFOV {hfov:.1f}° [{kaynak}]: KABA kademe %{kaba * 100:.0f} → "
+      f"~{_alt(kaba):.2f} m irtifada,  İNCE kademe %{ince * 100:.0f} → "
+      f"~{_alt(ince):.2f} m irtifada açılır. "
+      f"Taahhüt irtifası {self._grab_commit_alt.value():.2f} m." + uyari)
+
+  def _apply_tab_constraints(self):
+    """Görev 2'de İHA tarafından OKUNMAYAN alanları devre dışı bırak.
+
+    NEDEN (ölü kontrol): Bu sekme speeds{takeoff,cruise,land} ve return_to_home
+    alanlarını gönderiyor, ancak İHA Görev 2 akışında bunları okumuyor; hız
+    "Tarama Hızı", irtifa ise "Tarama/Bırakma İrtifası" alanlarından geliyor.
+    Kullanıcı bu alanları ayarlayıp uçuşu etkilediğini sanıyordu.
+    """
+    _tip = ("Bu görev tipinde kullanılmıyor — Görev 2'de hız 'Tarama Hızı' "
+        "alanından alınır.")
+    for _w in (self._sp_tkf, self._sp_crz, self._sp_lnd):
+      _w.setEnabled(False)
+      _w.setToolTip(_tip)
+    # Başlık artık kutunun değil AÇILIR BÖLÜMÜN üstünde (wrap_group grubun
+    # başlığını boşaltır) — uyarıyı bölüm başlığına yaz, yoksa "kullanılmıyor"
+    # notu hiç görünmeyen bir QGroupBox başlığında kalırdı.
+    self._speed_sec.set_title("Hız Kontrolü (Görev 2'de kullanılmıyor)")
+    self._speed_grp.setToolTip(_tip)
+    self._speed_sec.header_button().setToolTip(_tip)
+    self._speed_note.setText(
+      "⚠ Bu görev tipinde kullanılmıyor: İHA, Görev 2'de kalkış/tur/iniş "
+      "hızlarını okumaz. Geçerli hız → 'Tarama Davranışı ▸ Tarama Hızı'. "
+      "Tur hızı, batarya tahmini doğru kalsın diye tarama hızından otomatik "
+      "kopyalanır."
+    )
+    self._speed_note.setVisible(True)
+
+    # NEDEN: Tur hızı kilitlendiği için batarya tahmini sabit 8 m/s ile
+    # hesaplanıp yanıltıcı olurdu; gerçekte uçulan hız "Tarama Hızı".
+    self._scan_speed.valueChanged.connect(self._sync_cruise_from_scan)
+    self._sync_cruise_from_scan(self._scan_speed.value())
+
+    self._rth_cb.setEnabled(False)
+    self._rth_cb.setToolTip(
+      "Bu görev tipinde kullanılmıyor — Görev 2'de dönüş davranışını İHA "
+      "kendi görev akışına göre yönetir."
+    )
+    self._rth_cb.setText("🏠 Kalkış Noktasına Dön (Görev 2'de kullanılmıyor)")
+
+  def _sync_cruise_from_scan(self, val: float):
+    """Batarya tahmini için tur hızını tarama hızıyla eşitler (Görev 2)."""
+    lo, hi = self._sp_crz.minimum(), self._sp_crz.maximum()
+    self._sp_crz.setValue(max(lo, min(hi, float(val))))
+    self._update_battery()
 
   def _update_pole_lbl(self):
     p1 = f"{self._pole1['lat']:.5f},{self._pole1['lon']:.5f}" if self._pole1 else "—"
@@ -934,11 +2050,11 @@ class TargetDropMissionTab(_BaseMissionTab):
     t = self._sel_target.currentText()
     if t == self._SEL_POLE1:
       self._pole1 = {"lat": lat, "lon": lon}
-      self._map.draw_circle(lat, lon, 3, "#ffd700")
+      self._map.draw_circle(lat, lon, 3, _MAP_POLE1_COLOR)
       self._update_pole_lbl()
     elif t == self._SEL_POLE2:
       self._pole2 = {"lat": lat, "lon": lon}
-      self._map.draw_circle(lat, lon, 3, "#ff8c00")
+      self._map.draw_circle(lat, lon, 3, _MAP_POLE2_COLOR)
       self._update_pole_lbl()
     else:
       super()._add_wp(lat, lon)
@@ -969,8 +2085,13 @@ class TargetDropMissionTab(_BaseMissionTab):
       "lat": self._home_lat, "lon": self._home_lon,
       "alt": self._scan_alt.value(), "type": "TAKEOFF", "idx": 0,
     }
+    # NEDEN (sabit 30.0 → tarama irtifası): İHA Görev 2'de poligon köşelerinin
+    # "alt" alanını OKUMAZ (geometry.compute_scanline/generate_coverage_path
+    # yalnızca lat/lon kullanır, teknofest_task2.py:213-222); uçulan irtifa
+    # scan_altitude_m'dir. Yine de burada sabit 30 durması YKİ tarafında
+    # tutarsız bir ikinci "tarama irtifası" kaynağı yaratıyordu.
     area_wps = [
-      {"lat": w["lat"], "lon": w["lon"], "alt": w.get("alt", 30.0),
+      {"lat": w["lat"], "lon": w["lon"], "alt": w.get("alt", self._scan_alt.value()),
        "type": "WAYPOINT", "idx": i + 1}
       for i, w in enumerate(self._wps)
     ]
@@ -981,10 +2102,8 @@ class TargetDropMissionTab(_BaseMissionTab):
       # İrtifa
       "scan_altitude_m":     self._scan_alt.value(),
       "drop_altitude_m":     self._drop_alt.value(),
-      "tof_grab_alt_m":      self._tof_grab_alt.value(),
       # Kamera / gimbal
       "scan_tilt_deg":       self._scan_tilt.value(),
-      "camera_hfov_deg":     self._cam_hfov.value(),
       "cam_offset_cm":       self._cam_offset.value(),
       # Tarama davranışı
       "scan_speed_ms":       self._scan_speed.value(),
@@ -994,6 +2113,45 @@ class TargetDropMissionTab(_BaseMissionTab):
       # Hedef tanımı
       "red_target_area_m2":  self._red_area.value(),
       "blue_target_area_m2": self._blue_area.value(),
+      # Hassas hizalama alçalma profili (tuning.py from_params eşlemesi)
+      "align_descend_vz":     self._align_vz.value(),
+      "align_descend_max_vz": self._align_max_vz.value(),
+      "align_coarse_factor":  self._align_coarse.value(),
+      # ── Görev 3 — kamerayla yük alma ────────────────────────────────
+      "grab_gimbal_deg":     self._grab_gimbal.value(),
+      "grab_vz_max":         self._grab_vz_max.value(),
+      "grab_u_gate":         self._grab_u_gate.value(),
+      "grab_commit_alt":     self._grab_commit_alt.value(),
+      "grab_commit_vz":      self._grab_commit_vz.value(),
+      # Yaw hizalama — eksen açısı ve işaret MONTAJA bağlı, ölçülmeli
+      "grab_grabber_axis_deg": self._grab_axis.value(),
+      # Liste sırası: 0="+1 (düz)", 1="-1 (ters)" — bkz. _grab_yaw_sign NOT'u
+      "grab_yaw_sign":       (1.0 if self._grab_yaw_sign.currentIndex() == 0 else -1.0),
+      "grab_yaw_gate_deg":   self._grab_yaw_gate.value(),
+      # Liste sırası: 0=90°(kare) 1=180°(dikdörtgen) 2=360° — bkz. NOT
+      "grab_yaw_symmetry_deg": (90.0, 180.0, 360.0)[self._grab_yaw_sym.currentIndex()],
+      # Yük görüsü — erken açmak kesik tespit ve yanlış "yük yok" üretiyordu
+      "grab_vision_start_alt":  self._grab_vis_alt.value(),
+      "grab_vision_settle_s":   self._grab_vis_settle.value(),
+      "grab_vision_confirm_n":  self._grab_vis_conf.value(),
+      # İki kademeli yaw kapısı (yükün kadraj kaplama oranına göre)
+      "grab_yaw_coarse_frac":   self._yaw_coarse.value(),
+      "grab_yaw_fine_frac":     self._yaw_fine.value(),
+      "grab_yaw_fine_kp_scale": self._yaw_fine_kp.value(),
+      # ── Hedefe yaklaşma eğrisi + gimbal izleme (Görev 2 ve 3 ortak) ──
+      "approach_curve_enable":  (1.0 if self._ap_enable.isChecked() else 0.0),
+      "approach_curve_k":       self._ap_k.value(),
+      "approach_gimbal_track":  (1.0 if self._ap_gimbal_cb.isChecked() else 0.0),
+      "approach_fill":          self._ap_fill.value(),
+      "approach_floor_red_m":   self._ap_floor_red.value(),
+      "approach_floor_blue_m":  self._ap_floor_blue.value(),
+      # Hedef kuyruğu
+      "target_queue_enable":    (1.0 if self._queue_cb.isChecked() else 0.0),
+      "target_queue_confirm_n": self._queue_conf.value(),
+      "target_queue_spread_m":  self._queue_spread.value(),
+      # Yere temas
+      "touchdown_current_ratio": self._td_ratio.value(),
+      "touchdown_arm_descent_m": self._td_arm.value(),
       # Mod
       "autonomous_drop":     self._auto_cb.isChecked(),
       "bonus_mission":       self._bonus_cb.isChecked(),
@@ -1006,6 +2164,15 @@ class TargetDropMissionTab(_BaseMissionTab):
           "gimbal": self._pin_gimbal.value(),
       },
     })
+    # ── KAMERA KALİBRASYONU: yalnız operatör AÇIKÇA isterse gönderilir ──
+    # NEDEN: bu alan İHA'nın ölçülen kalibrasyonunu EZER. Panel her görevde
+    # koşulsuz gönderdiği sürece, İHA'nın kendi kalibrasyonu hiç kullanılmaz.
+    # Bir kez yaşandı ve ÖLÇÜLDÜ: panel 63.0° gönderirken gerçek değer 65.9°
+    # idi; bırakma isabeti 0.26 m yerine 4-5 m oldu — puan yarıçapının dışı.
+    # Anahtar SÖZLÜKTE HİÇ BULUNMAZSA from_params o alana dokunmaz.
+    if self._cam_hfov_override.isChecked():
+        params["camera_hfov_deg"] = self._cam_hfov.value()
+
     # Direkler (GATE_RUN) — seçildiyse gönder
     if self._pole1:
       params["pole1"] = self._pole1
@@ -1046,7 +2213,11 @@ class InfinityMissionTab(_BaseMissionTab):
 
   def _build_specific_controls(self):
     grp = QGroupBox("Sonsuz Uçuş Görevi (TÜBİTAK Görev 1)")
+    self._inf_grp = grp
     lay = QVBoxLayout(grp)
+    # Koordinatlar alt alta sarınca satır sayısı arttı; bölüm tek ekranda
+    # kalsın diye satır arası kompaktlaştırıldı (spec §2: dense 4-6 px).
+    lay.setSpacing(4)
 
     # Harita tıklama hedefi
     sel_row = QHBoxLayout()
@@ -1056,23 +2227,34 @@ class InfinityMissionTab(_BaseMissionTab):
     self._sel_target.addItems([
       self._SEL_TAKEOFF, self._SEL_POLE1, self._SEL_POLE2, self._SEL_WP
     ])
+    guard_wheel(self._sel_target)  # kaydırma tıklama hedefini değiştirmesin
     sel_row.addWidget(self._sel_target, 1)
     lay.addLayout(sel_row)
 
-    _is = ("border:1px solid #0f3460;"
-        "padding:4px;border-radius:3px;font-size:12px;")
-
     def _mk_coord_row(icon_label: str):
-      row = QHBoxLayout()
+      # NEDEN ÇİFT SÜTUN YOK: etiket + iki koordinat girdisi yan yana
+      # (70 + 160 + 160 + boşluklar ≈ 400 px) dar sağ panele sığmıyor ve
+      # 1366 px pencerede Boylam alanı kırpılıyordu. Enlem/Boylam artık ALT
+      # ALTA; etiket iki satır boyunca solda dikey ortalı durur.
+      row = QGridLayout()
+      row.setHorizontalSpacing(6)
+      row.setVerticalSpacing(4)
       lbl = QLabel(icon_label)
       lbl.setFixedWidth(70)
       lat_e = QLineEdit()
       lat_e.setPlaceholderText("Enlem (ör. 39.9250)")
+      lat_e.setMaximumWidth(220)
       lon_e = QLineEdit()
       lon_e.setPlaceholderText("Boylam (ör. 32.8662)")
-      row.addWidget(lbl)
-      row.addWidget(lat_e, 1)
-      row.addWidget(lon_e, 1)
+      lon_e.setMaximumWidth(220)
+      # NEDEN: 7 ondalıklı koordinat (39.9250140) dar alanda kırpılıyordu;
+      # min. genişlik + tooltip'te tam değer ile operatör gözle doğrulayabilir.
+      wire_coord_edit(lat_e, f"{icon_label} enlem — ondalıklı derece")
+      wire_coord_edit(lon_e, f"{icon_label} boylam — ondalıklı derece")
+      row.addWidget(lbl, 0, 0, 2, 1, Qt.AlignmentFlag.AlignVCenter)
+      row.addWidget(lat_e, 0, 1)
+      row.addWidget(lon_e, 1, 1)
+      row.setColumnStretch(1, 1)
       return row, lat_e, lon_e
 
     r0, self._tkf_lat, self._tkf_lon = _mk_coord_row("Kalkış:")
@@ -1085,6 +2267,7 @@ class InfinityMissionTab(_BaseMissionTab):
     # Uçuş parametreleri
     form = QFormLayout()
     form.setSpacing(6)
+    form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
 
     self._inf_algo = QComboBox()
     # Yuvarlak Sekiz varsayılan (ilk sıra): sabit yarıçaplı iki döngü — dönüş
@@ -1101,12 +2284,14 @@ class InfinityMissionTab(_BaseMissionTab):
     self._inf_alt.setRange(5, 500)
     self._inf_alt.setValue(30)
     self._inf_alt.setSuffix("m")
+    self._inf_alt.setMaximumWidth(140)
     _lbl_alt = QLabel("Uçuş İrtifası:"); _lbl_alt.setStyleSheet(_SL)
     form.addRow(_lbl_alt, self._inf_alt)
 
     self._inf_laps = QSpinBox()
     self._inf_laps.setRange(1, 5)
     self._inf_laps.setValue(2)
+    self._inf_laps.setMaximumWidth(140)
     _lbl_laps = QLabel("Tur Sayısı:"); _lbl_laps.setStyleSheet(_SL)
     form.addRow(_lbl_laps, self._inf_laps)
 
@@ -1114,20 +2299,146 @@ class InfinityMissionTab(_BaseMissionTab):
     self._inf_accel.setRange(50, 500)
     self._inf_accel.setValue(250)
     self._inf_accel.setSuffix(" cm/s²")
+    self._inf_accel.setMaximumWidth(140)
     _lbl_accel = QLabel("İvmelenme (WPNAV_ACCEL):"); _lbl_accel.setStyleSheet(_SL)
     form.addRow(_lbl_accel, self._inf_accel)
 
+    # tekerlek koruması: paneli kaydırırken algoritma/irtifa/tur/ivme bozulmasın
+    guard_wheel(self._inf_algo, self._inf_alt, self._inf_laps, self._inf_accel)
+
     lay.addLayout(form)
+
+    # ── ROTA ÖNİZLEME ───────────────────────────────────────────────────
+    # NEDEN: rota bugüne kadar YALNIZCA dosyaya yazılıyordu (_on_download_wp)
+    # ve operatör aracın nereden geçeceğini ancak Mission Planner'da açınca
+    # görüyordu. Direk koordinatları haritadan tıklanarak seçildiği için,
+    # yanlış tıklanmış bir direk ilk uçuşa kadar fark edilmiyordu.
+    # Önizleme, indirilen dosyayla AYNI fonksiyondan (build_infinity_route)
+    # üretilir — ayrı bir "yaklaşık çizim" değildir, uçuşta gidilecek
+    # noktaların kendisidir.
+    self._inf_prev_lbl = QLabel("Rota: direk koordinatları bekleniyor.")
+    self._inf_prev_lbl.setStyleSheet(_SL)
+    self._inf_prev_lbl.setWordWrap(True)
+    lay.addWidget(self._inf_prev_lbl)
+
+    self._btn_prev = QPushButton("🗺 Rotayı Haritada Göster")
+    self._btn_prev.clicked.connect(lambda: self._refresh_inf_preview(fit=True))
+    lay.addWidget(self._btn_prev)
 
     # WP'leri bilgisayara indir (Mission Planner'da test için)
     self._btn_dl = QPushButton("📥 WP'leri İndir (.waypoints — Mission Planner)")
-    self._btn_dl.setStyleSheet(
-      "QPushButton{background:#0f3460;color:#e6edf3;padding:7px;border-radius:4px;"
-      "font-weight:bold;} QPushButton:hover{background:#16508f;}")
+    # ghostButton: sayfada EN FAZLA 1 primaryButton olur (spec §1) — ana eylem
+    # "Görevi Gönder"; indirme ikincil vurgulu eylemdir.
+    self._btn_dl.setObjectName("ghostButton")
     self._btn_dl.clicked.connect(self._on_download_wp)
     lay.addWidget(self._btn_dl)
 
-    self._right_lay.insertWidget(0, grp)
+    # Görev tipini belirleyen ÜST DÜZEY bölüm açık başlar (diğerleri kapalı).
+    self._inf_sec = wrap_group(grp, expanded=True)
+    self._right_lay.insertWidget(0, self._inf_sec)
+
+  def _apply_tab_constraints(self):
+    """
+    Önizleme sinyallerini BURADA bağlar — _build_specific_controls'te DEĞİL.
+
+    NEDEN: taban sınıf sırayla _build_specific_controls → _build_speed_group
+    → ... → _apply_tab_constraints çağırıyor. Hız grubundaki _sp_crz ve
+    _rth_cb, bu sekmeye özel kontroller kurulurken HENÜZ YOK; orada bağlamak
+    AttributeError veriyordu. _apply_tab_constraints, adı üstünde, her şey
+    kurulduktan sonra çalışan kancadır.
+
+    fit=False: harita kaydırılmaz — operatör elle yakınlaştırmışken her tuş
+    vuruşunda kadrajın sıçraması düzeltmeyi imkânsız kılardı. Kadraja sığdırma
+    yalnızca "Rotayı Haritada Göster" düğmesiyle olur.
+    """
+    super()._apply_tab_constraints()
+    for _e in (self._tkf_lat, self._tkf_lon, self._p1_lat, self._p1_lon,
+               self._p2_lat, self._p2_lon):
+      _e.textChanged.connect(lambda *_: self._refresh_inf_preview())
+    self._inf_algo.currentIndexChanged.connect(lambda *_: self._refresh_inf_preview())
+    for _s in (self._inf_alt, self._inf_laps, self._sp_crz):
+      _s.valueChanged.connect(lambda *_: self._refresh_inf_preview())
+    self._rth_cb.toggled.connect(lambda *_: self._refresh_inf_preview())
+    self._refresh_inf_preview()
+
+  # ── Görev 1 rota önizlemesi ──────────────────────────────────────────────
+  def _inf_route_pts(self):
+    """
+    Uçulacak noktaların TAM listesi → ([(lat,lon)...], bilgi_sözlüğü).
+
+    İndirilen .waypoints ile aynı kaynaktan üretilir; ayrıştıkları gün
+    önizleme yalan söylemeye başlar. Koordinat eksik/bozuksa (None, mesaj).
+    """
+    try:
+      p1 = {"lat": float(self._p1_lat.text()), "lon": float(self._p1_lon.text())}
+      p2 = {"lat": float(self._p2_lat.text()), "lon": float(self._p2_lon.text())}
+    except ValueError:
+      return None, "Rota: Direk 1 ve Direk 2 koordinatlarını girin."
+
+    dist = _haversine(p1["lat"], p1["lon"], p2["lat"], p2["lon"])
+    if dist < 5.0:
+      return None, f"Rota: direkler çok yakın ({dist:.1f} m) — en az 5 m olmalı."
+
+    # Kalkış noktası: girilmediyse direklerin ortası (indirme yolu ile aynı kural)
+    try:
+      tkf = (float(self._tkf_lat.text()), float(self._tkf_lon.text()))
+    except ValueError:
+      tkf = ((p1["lat"] + p2["lat"]) / 2.0, (p1["lon"] + p2["lon"]) / 2.0)
+
+    algo = "LEMNISCATE" if "Lemniscate" in self._inf_algo.currentText() else "DUBINS"
+    try:
+      route, loop_v, cross_v, radius = build_infinity_route(
+        p1, p2, float(self._sp_crz.value()), int(self._inf_laps.value()), algo)
+    except Exception as exc:
+      return None, f"Rota üretilemedi: {exc}"
+
+    pts = [(it["lat"], it["lon"]) for it in route if it.get("cmd") == 82]
+    if len(pts) < 2:
+      return None, "Rota: geçerli nokta üretilemedi."
+
+    # Gerçek uçuş yolu kalkıştan başlar ve RTH açıksa oraya döner —
+    # önizlemenin bunu göstermesi gerekir, yoksa operatör kalkış ile ∞
+    # arasındaki geçiş bacağını hiç görmez.
+    full = [tkf] + pts
+    if self._rth_cb.isChecked():
+      full.append(tkf)
+
+    # Yol uzunluğu ve kaba süre (döngü hızıyla; DUBINS'te düz geçiş daha hızlı
+    # olduğu için bu tahmin ÜST sınırdır, uçuş biraz daha kısa sürer).
+    length = sum(_haversine(full[i][0], full[i][1], full[i + 1][0], full[i + 1][1])
+                 for i in range(len(full) - 1))
+    return full, {
+      "n": len(pts), "length_m": length, "radius": radius,
+      "loop_v": loop_v, "cross_v": cross_v, "dist": dist, "algo": algo,
+      "eta_s": length / max(0.5, loop_v),
+    }
+
+  def _refresh_inf_preview(self, fit: bool = False):
+    """Rota önizlemesini haritaya çizer ve özet etiketini günceller."""
+    if not hasattr(self, "_inf_prev_lbl"):
+      return
+    pts, info = self._inf_route_pts()
+    if pts is None:
+      self._inf_prev_lbl.setText(str(info))
+      try:
+        self._map.clear_route()
+      except Exception:
+        pass
+      return
+    try:
+      self._map.draw_route(pts, _MAP_ROUTE_COLOR, fit=fit)
+    except Exception:
+      pass
+    _eta = info["eta_s"]
+    self._inf_prev_lbl.setText(
+      f"Rota: {info['n']} nokta, {info['length_m']:.0f} m yol, "
+      f"~{int(_eta // 60)} dk {int(_eta % 60)} s (üst sınır).  "
+      f"Direk arası {info['dist']:.0f} m → dönüş yarıçapı {info['radius']:.1f} m "
+      f"(D/R={info['dist'] / max(0.1, info['radius']):.2f}).  "
+      f"Döngü hızı {info['loop_v']:.1f} m/s"
+      + (f", düz geçiş {info['cross_v']:.1f} m/s" if info["algo"] == "DUBINS"
+         and info["cross_v"] > info["loop_v"] + 0.05 else "")
+      + f".  İrtifa {self._inf_alt.value():.0f} m.")
 
   # ── WP'leri QGC .waypoints olarak indir ───────────────────────────────────
   def _on_download_wp(self):
@@ -1285,15 +2596,19 @@ class MissionPanelView(QWidget):
 
   mission_ready_to_send = pyqtSignal(dict, list)
   send_command     = pyqtSignal(int, list)
+  # NEDEN (ölü kontrol): TargetDropMissionTab.target_detected emit ediliyordu
+  # ama sekme dışına çıkmıyordu → hiçbir dinleyicisi yoktu. Dış kapsayıcıdan
+  # yeniden yayınlanıyor ki main_window bağlayabilsin (bkz. rapor).
+  target_detected  = pyqtSignal(dict)
 
   def __init__(self, parent=None):
     super().__init__(parent)
     lay = QVBoxLayout(self)
-    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setContentsMargins(8, 8, 8, 8)
+    lay.setSpacing(8)
 
     self._tabs = QTabWidget()
     self._tabs.setFont(QFont("Segoe UI", 11))
-    self._tabs
 
     self._target_drop_tab = TargetDropMissionTab()
     self._infinity_tab  = InfinityMissionTab()
@@ -1308,6 +2623,9 @@ class MissionPanelView(QWidget):
     for tab in _all_tabs:
       tab.mission_ready_to_send.connect(self.mission_ready_to_send)
       tab.send_command.connect(self.send_command)
+
+    # Hedef tespit bildirimini dışarı taşı (Görev 2 sekmesi → panel → uygulama)
+    self._target_drop_tab.target_detected.connect(self.target_detected)
 
   @pyqtSlot(dict)
   def update_telemetry(self, data: dict):

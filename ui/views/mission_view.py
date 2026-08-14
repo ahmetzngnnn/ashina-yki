@@ -20,9 +20,19 @@ try:
 except ImportError:
     _WE = False
 
+# NEDEN: Fare tekerleği koruması (odakta olmayan spin/combo değerini sessizce
+# değiştirmesin). Yardımcı tek yerde tanımlı — mission_panel_view.py; burada
+# yeniden yazmak yerine paylaşılıyor (döngüsel import yok: o modül bunu
+# import etmiyor).
+from ui.views.mission_panel_view import guard_wheel
+
 logger = logging.getLogger(__name__)
 
 # ── Görev haritasi HTML ────────────────────────────────────────────────────────
+# NOT: Asagidaki Leaflet/CSS renkleri HARITA SEMANTIGIDIR (rota sarisi, WP
+# rozeti, kirmizi drone ok isareti) — uydu görüntüsü zemininde okunur kalmasi
+# gerekir, bu yüzden YKI temasindan BAGIMSIZ sabit tutulur. Tema tokenlarina
+# çevrilmez.
 _MISSION_MAP_HTML = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
@@ -236,46 +246,49 @@ class MissionPlanView(QWidget):
         self._poll_timer.start()
 
     def _build_ui(self) -> None:
-        self.setStyleSheet("color:#e0e0e0;")
         root = QVBoxLayout(self)
-        root.setContentsMargins(4, 4, 4, 4)
-        root.setSpacing(4)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
 
         # Üst araç çubugu
         toolbar = QHBoxLayout()
         toolbar.setSpacing(6)
 
         lbl = QLabel("Haritaya tikla → Waypoint ekle  |  Noktayi sürükle → Konum güncelle")
-        lbl.setStyleSheet("color:#888;font-size:11px;")
+        lbl.setObjectName("mutedLabel")
         toolbar.addWidget(lbl, stretch=1)
 
         self._alt_spin = QDoubleSpinBox()
         self._alt_spin.setRange(1, 500)
         self._alt_spin.setValue(_DEFAULT_ALT)
         self._alt_spin.setSuffix(" m")
-        self._alt_spin.setFixedWidth(90)
-        self._alt_spin.setStyleSheet(
-            "border:1px solid #0f3460;color:#e0e0e0;padding:4px;"
+        self._alt_spin.setMinimumWidth(90)
+        self._alt_spin.setMaximumWidth(110)   # şartname §3: sayı girdisi içerikle sınırlı
+        self._alt_spin.setToolTip(
+            "Yeni waypoint'ler için varsayılan irtifa.\n"
+            "Değiştirmek için alana tıklayın (tekerlek yalnızca odaktayken çalışır)."
         )
+        # NEDEN: Araç çubuğu/harita üzerinde tekerlek kullanılırken varsayılan
+        # irtifa sessizce değişebiliyordu — uçuş parametresi fark edilmeden bozulur.
+        guard_wheel(self._alt_spin)
         toolbar.addWidget(QLabel("Varsayilan Alt:"))
         toolbar.addWidget(self._alt_spin)
 
-        def btn(text, color, tip=""):
+        def btn(text, obj_name="", tip=""):
             b = QPushButton(text)
-            b.setStyleSheet(
-                f"background:{color};color:white;padding:6px 10px;"
-                f"border-radius:4px;font-weight:bold;font-size:11px;"
-            )
+            if obj_name:
+                b.setObjectName(obj_name)
+            b.setMinimumHeight(28)
             if tip:
                 b.setToolTip(tip)
             return b
 
-        b_clear  = btn("Temizle",  "#444", "Tüm waypointleri sil")
-        b_undo   = btn("Geri Al",  "#333", "Son waypointti sil")
-        b_save   = btn("Kaydet", "#0f3460", "Görevi dosyaya kaydet (.waypoints / .json)")
-        b_load   = btn("Yükle",  "#0f3460", "Dosyadan görev yükle (.waypoints / .json)")
-        b_read   = btn("Drone Oku",   "#2a6496", "Drone bellegindeki görevi al")
-        b_write  = btn("Drone Yaz",   "#e94560", "Görevi drone bellegi'ne yaz")
+        b_clear  = btn("Temizle",  "", "Tüm waypointleri sil")
+        b_undo   = btn("Geri Al",  "", "Son waypointti sil")
+        b_save   = btn("Kaydet", "", "Görevi dosyaya kaydet (.waypoints / .json)")
+        b_load   = btn("Yükle",  "", "Dosyadan görev yükle (.waypoints / .json)")
+        b_read   = btn("Drone Oku",   "primaryButton", "Drone bellegindeki görevi al")
+        b_write  = btn("Drone Yaz",   "dangerButton", "Görevi drone bellegi'ne yaz")
 
         b_clear.clicked.connect(self._clear_all)
         b_undo.clicked.connect(self._undo_last)
@@ -296,30 +309,32 @@ class MissionPlanView(QWidget):
         top_pane = QWidget()
         top_lay = QHBoxLayout(top_pane)
         top_lay.setContentsMargins(0, 0, 0, 0)
-        top_lay.setSpacing(0)
+        top_lay.setSpacing(8)
 
         # --- SOL HUD PANELI ---
         from PyQt6.QtWidgets import QListWidget
         self._hud_widget = QWidget()
-        self._hud_widget.setMinimumWidth(240)
-        self._hud_widget.setMaximumWidth(320)
+        self._hud_widget.setFixedWidth(300)
         self._hud_lay = QVBoxLayout(self._hud_widget)
-        self._hud_lay.setContentsMargins(5, 5, 5, 5)
-        
-        lbl_hud_title = QLabel("<b>GÖREV ÖZETİ</b>")
+        self._hud_lay.setContentsMargins(6, 6, 6, 6)
+        self._hud_lay.setSpacing(6)
+
+        # Kalinlik/renk QSS'ten (sectionTitle) gelir — <b> markup'i gereksiz
+        lbl_hud_title = QLabel("GÖREV ÖZETİ")
+        lbl_hud_title.setObjectName("sectionTitle")
         self._hud_lay.addWidget(lbl_hud_title)
-        
+
         self._hud_summary = QLabel("Haritaya tıklayarak nokta ekleyin.")
         self._hud_summary.setWordWrap(True)
-        self._hud_summary.setStyleSheet("font-size: 13px; color: #bb86fc; padding: 5px; background: #222; border-radius: 4px;")
+        self._hud_summary.setObjectName("hintLabel")
         self._hud_lay.addWidget(self._hud_summary)
-        
-        lbl_wp_dists = QLabel("<b>WP Mesafeleri:</b>")
-        lbl_wp_dists.setStyleSheet("margin-top: 10px;")
+
+        # Liste basligi: statik metin → QSS class'i (mutedLabel), markup yok
+        lbl_wp_dists = QLabel("WP MESAFELERİ")
+        lbl_wp_dists.setObjectName("mutedLabel")
         self._hud_lay.addWidget(lbl_wp_dists)
-        
+
         self._hud_list = QListWidget()
-        self._hud_list.setStyleSheet("font-size: 12px; background: #121212; color: #fff; border: 1px solid #333;")
         self._hud_lay.addWidget(self._hud_list)
         
         top_lay.addWidget(self._hud_widget)
@@ -339,36 +354,31 @@ class MissionPlanView(QWidget):
         else:
             lbl2 = QLabel("Harita: PyQt6-WebEngine kurulu degil")
             lbl2.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl2.setStyleSheet("color:#888;font-size:13px;")
+            lbl2.setObjectName("mutedLabel")
             top_lay.addWidget(lbl2, stretch=1)
             
         splitter.addWidget(top_pane)
 
         # Waypoint tablosu
         tbl_widget = QWidget()
-        tbl_widget.setStyleSheet("")
         tbl_layout = QVBoxLayout(tbl_widget)
         tbl_layout.setContentsMargins(0, 0, 0, 0)
         tbl_layout.setSpacing(0)
 
         header_lbl = QLabel("  Waypoint Listesi")
-        header_lbl.setStyleSheet(
-            "color:#aaa;font-weight:bold;font-size:11px;padding:4px;"
-        )
+        header_lbl.setObjectName("sectionTitle")
         tbl_layout.addWidget(header_lbl)
 
         self._table = QTableWidget(0, 7)
         self._table.setHorizontalHeaderLabels(
             ["#", "Komut", "Enlem", "Boylam", "Irtifa (m)", "Gecikme (s)", "Silme"]
         )
-        self._table.setStyleSheet(
-            "QTableWidget{color:#e0e0e0;gridline-color:#1a1a3e;"
-            "font-size:12px;border:none;}"
-            "QHeaderView::section{color:#aaa;padding:4px;border:none;}"
-        )
         _hh = self._table.horizontalHeader()  # guard: None dönebilir (Pylance)
         if _hh is not None:
+            # Komut/Enlem/Boylam/İrtifa/Gecikme esner; # ve Silme dar kalır
             _hh.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+            _hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            _hh.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         _vh = self._table.verticalHeader()
         if _vh is not None:
             _vh.setVisible(False)
@@ -379,6 +389,7 @@ class MissionPlanView(QWidget):
         splitter.addWidget(tbl_widget)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
+        splitter.setSizes([600, 200])  # harita baskın başlangıç oranı (3:1)
 
         root.addWidget(splitter, stretch=1)
 
@@ -458,9 +469,6 @@ class MissionPlanView(QWidget):
             self._table.setItem(row, 0, QTableWidgetItem(str(wp["idx"])))
 
             cmd_combo = QComboBox()
-            cmd_combo.setStyleSheet(
-                "color:#e0e0e0;border:1px solid #0f3460;"
-            )
             for name, cid in _CMD_TYPES:
                 cmd_combo.addItem(name, cid)
             cur = next(
@@ -468,6 +476,10 @@ class MissionPlanView(QWidget):
                 0,
             )
             cmd_combo.setCurrentIndex(cur)
+            # NEDEN: Waypoint tablosu tekerlekle kaydırılırken imlecin altındaki
+            # komut kutusu (WAYPOINT → TAKEOFF/LAND ...) sessizce değişiyordu.
+            # Koruma sonrası tekerlek tabloyu kaydırır; komut değişmez.
+            guard_wheel(cmd_combo)
             cmd_combo.currentIndexChanged.connect(
                 lambda _, r=row, w=wp: self._on_cmd_changed(r, w, _)
             )
@@ -487,10 +499,8 @@ class MissionPlanView(QWidget):
             self._table.setItem(row, 5, delay_item)
 
             del_btn = QPushButton("X")
-            del_btn.setStyleSheet(
-                "color:white;padding:2px 6px;"
-                "font-weight:bold;border-radius:3px;"
-            )
+            del_btn.setObjectName("dangerButton")
+            del_btn.setToolTip("Bu waypoint'i sil")
             idx_capture = wp["idx"]
             del_btn.clicked.connect(lambda _, i=idx_capture: self._delete_wp(i))
             self._table.setCellWidget(row, 6, del_btn)

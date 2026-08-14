@@ -7,7 +7,7 @@ import math
 import time
 import collections
 from PyQt6.QtCore import pyqtSignal, pyqtSlot, Qt, QTimer, QPointF, QObject
-from PyQt6.QtGui import QFont, QPainter, QPen, QColor
+from PyQt6.QtGui import QFont, QFontMetrics, QPainter, QPen, QColor
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QTabWidget, QPushButton, QTableWidget, QTableWidgetItem,
@@ -16,25 +16,43 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QSplitter,
 )
 from ui.auth_manager import hash_password
-from core import local_storage
+from core import local_storage, theme
+from core.global_state import state
 
 logger = logging.getLogger(__name__)
 
+# NEDEN (C4 — KRİTİK): "Kullanıcı Yönetimi [Yalnızca ADMIN]" başlığı bir söz
+# veriyordu ama kod hiçbir yerde rol kontrolü yapmıyordu. Sekme yanlışlıkla
+# açık kalırsa (ya da ileride başka bir yerden çağrılırsa) VIEWER/OPERATOR
+# kendine ADMIN hesabı açıp tüm yetkileri ele geçirebiliyordu. Rol kontrolü
+# artık işlemin KENDİSİNDE — sekme görünürlüğüne güvenilmez (defense in depth).
+ROLE_ADMIN = 3
+
 # ── Basit gerçek zamanlı grafik widget ───────────────────────────────────────
 class _MiniChart(QWidget):
-    """Son N örneğin çizgi grafiğini çizen hafif widget."""
-    def __init__(self, label: str, color: str = "#4ade80",
+    """Son N örneğin çizgi grafiğini çizen hafif widget.
+
+    `color` parametresi artık HAM HEX DEĞİL bir TEMA TOKEN ADI'dır
+    (ör. "danger", "info", "accent"). Renk paint sırasında theme.c(...) ile
+    okunur — __init__'te cachelenmez — böylece tema değişince grafik de
+    doğru renklerle yeniden çizilir.
+    """
+    def __init__(self, label: str, color: str = "accent",
                  y_min: float = -180, y_max: float = 180,
                  samples: int = 300, parent=None):
         super().__init__(parent)
         self._label  = label
-        self._color  = QColor(color)
+        self._color  = color          # tema token adı
         self._y_min  = y_min
         self._y_max  = y_max
         self._data: collections.deque = collections.deque(maxlen=samples)
         self.setMinimumHeight(90)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setStyleSheet("border-radius:4px;")
+        theme.notifier().changed.connect(lambda _n: self._apply_theme_colors())
+
+    def _apply_theme_colors(self) -> None:
+        """Tema değişimi: renkler paint anında okunduğu için yeniden çizmek yeter."""
+        self.update()
 
     def push(self, value: float) -> None:
         self._data.append(value)
@@ -44,17 +62,19 @@ class _MiniChart(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
+        # Renkler paint ANINDA okunur (tema değişimine duyarlı)
+        series_col = QColor(theme.c(self._color))
         # Arka plan
-        p.fillRect(0, 0, w, h, QColor("#0a0a18"))
-        # Grid
-        p.setPen(QPen(QColor("#1a1a3e"), 1, Qt.PenStyle.DotLine))
+        p.fillRect(0, 0, w, h, QColor(theme.c("chart_bg")))
+        # Izgara
+        p.setPen(QPen(QColor(theme.c("grid")), 1, Qt.PenStyle.DotLine))
         for yi in range(4):
             y = int(h * yi / 3)
             p.drawLine(0, y, w, y)
         # Sıfır çizgisi (eğer aralıkta)
         if self._y_min < 0 < self._y_max:
             y0 = int(h - h * (0 - self._y_min) / (self._y_max - self._y_min))
-            p.setPen(QPen(QColor("#333"), 1))
+            p.setPen(QPen(QColor(theme.c("border_strong")), 1))
             p.drawLine(0, y0, w, y0)
         # Veri çizgisi
         if len(self._data) >= 2:
@@ -64,18 +84,22 @@ class _MiniChart(QWidget):
                 y_norm = (v - self._y_min) / max(self._y_max - self._y_min, 1e-6)
                 y_px = h - y_norm * h
                 pts.append(QPointF(x, max(0, min(h, y_px))))
-            p.setPen(QPen(self._color, 1.5))
+            p.setPen(QPen(series_col, 1.5))
             for i in range(len(pts) - 1):
                 p.drawLine(pts[i], pts[i + 1])
-        # Min/Max/Now gösterimi
-        p.setPen(QColor("#888"))
-        p.setFont(QFont("Courier New", 7))
-        p.drawText(2, 10, self._label)
+        # Etiket ve son değer
+        p.setPen(QColor(theme.c("chart_fg")))
+        p.setFont(QFont("Courier New", 8))
+        p.drawText(2, 11, self._label)
         if self._data:
             last = self._data[-1]
-            p.setPen(self._color)
-            p.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-            p.drawText(w - 60, 10, f"{last:+.2f}")
+            p.setPen(series_col)
+            val_font = QFont("Courier New", 9, QFont.Weight.Bold)
+            p.setFont(val_font)
+            # Sabit x offset yerine ÖLÇÜLEN genişlik — uzun değer kırpılmaz.
+            txt = f"{last:+.2f}"
+            tw = QFontMetrics(val_font).horizontalAdvance(txt)
+            p.drawText(max(2, w - tw - 4), 11, txt)
         p.end()
 
 
@@ -94,13 +118,34 @@ class SystemLogView(QWidget):
         self._prev_alt: float | None = None
         self._prev_roll: float | None = None
         self._prev_pitch: float | None = None
+        # NEDEN (M9): Olaylar EDGE-TRIGGERED üretilir — durum değiştiğinde BİR
+        # KEZ. Eskiden batarya/roll/pitch eşiği aşıldığı sürece her telemetri
+        # karesinde (~15 Hz) satır ekleniyordu; gerçek olaylar bu tekrarların
+        # arasında kayboluyor ve log sınırsız büyüyordu.
+        self._bat_level: str = ""        # "" | "dusuk" | "kritik"
+        self._roll_exceeded: bool = False
+        self._pitch_exceeded: bool = False
         self._analysis_timer = QTimer(self)
         self._analysis_timer.setInterval(200)
         self._analysis_timer.timeout.connect(self._flush_events)
         self._build_ui()
+        # Tema değişince kurulumda yazılan renkler bayat kalmasın (C kuralı).
+        theme.notifier().changed.connect(lambda _n: self._apply_theme_colors())
+
+    def _apply_theme_colors(self) -> None:
+        """Tema değişiminde çalışma-anı renklerini yeniden uygular.
+
+        NOT: Log kutularındaki GEÇMİŞ satırlar yazıldıkları anın renklerini
+        korur (kayıt niteliğindedir, geriye dönük boyanmaz); yeni satırlar
+        aktif temanın token'larıyla yazılır.
+        """
+        # Kayıt butonu (durum → QSS class'ı) ve grafikler tazelenir.
+        self._set_analysis_btn_state(self._analysis_active)
+        for ch in (self._chart_roll, self._chart_pitch, self._chart_yaw,
+                   self._chart_alt, self._chart_spd, self._chart_bat):
+            ch.update()
 
     def _build_ui(self) -> None:
-        self.setStyleSheet("color: #e0e0e0;")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
 
@@ -124,12 +169,12 @@ class SystemLogView(QWidget):
         left_l = QVBoxLayout(left_w)
         left_l.setContentsMargins(0, 0, 0, 0)
         lbl_yki = QLabel("YKİ Sistem Logları")
-        lbl_yki.setStyleSheet("color:#3daee9; font-weight:bold;")
+        lbl_yki.setObjectName("sectionTitle")
         self._yki_log = QTextEdit()
         self._yki_log.setReadOnly(True)
         # Sınırsız büyümeyi engelle — uzun oturumda bellek/UI şişmesi (en fazla 2000 satır).
         self._yki_log.document().setMaximumBlockCount(2000)
-        self._yki_log.setStyleSheet("color:#e0e0e0; font-family:'Courier New'; font-size:11px; border:1px solid #0f3460;")
+        self._yki_log.setStyleSheet("QTextEdit{font-family:'Courier New'; font-size:11px;}")
         left_l.addWidget(lbl_yki)
         left_l.addWidget(self._yki_log)
 
@@ -138,16 +183,17 @@ class SystemLogView(QWidget):
         right_l = QVBoxLayout(right_w)
         right_l.setContentsMargins(0, 0, 0, 0)
         lbl_drone = QLabel("Drone / Otopilot Logları")
-        lbl_drone.setStyleSheet("color:#4ade80; font-weight:bold;")
+        lbl_drone.setObjectName("sectionTitle")
         self._drone_log = QTextEdit()
         self._drone_log.setReadOnly(True)
         self._drone_log.document().setMaximumBlockCount(2000)
-        self._drone_log.setStyleSheet("color:#e0e0e0; font-family:'Courier New'; font-size:11px; border:1px solid #0f3460;")
+        self._drone_log.setStyleSheet("QTextEdit{font-family:'Courier New'; font-size:11px;}")
         right_l.addWidget(lbl_drone)
         right_l.addWidget(self._drone_log)
 
         splitter.addWidget(left_w)
         splitter.addWidget(right_w)
+        splitter.setSizes([600, 600])
         layout.addWidget(splitter)
 
         # Logging Handler for YKI (C6: THREAD-GÜVENLİ)
@@ -168,9 +214,10 @@ class SystemLogView(QWidget):
             def emit(self, record):
                 try:
                     msg = self.format(record)
-                    color = "#aaa"
-                    if record.levelno >= logging.ERROR: color = "#ff4444"
-                    elif record.levelno >= logging.WARNING: color = "#f0a500"
+                    # Renk aktif temadan okunur (ham hex YOK).
+                    color = theme.c("text_muted")
+                    if record.levelno >= logging.ERROR: color = theme.c("danger")
+                    elif record.levelno >= logging.WARNING: color = theme.c("warning")
                     html = f'<span style="color:{color}">{msg}</span>'
                     self.bridge.message.emit(html)   # → GUI thread'e marshal
                 except Exception:
@@ -207,36 +254,30 @@ class SystemLogView(QWidget):
         layout = QVBoxLayout(w)
 
         lbl = QLabel("Kullanıcı Yönetimi  [Yalnızca ADMIN]")
-        lbl.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        lbl.setStyleSheet("color: #e94560;")
+        lbl.setObjectName("dangerText")
         layout.addWidget(lbl)
 
-        # Kullanıcı listesi
+        # Kullanıcı listesi — dikey stretch tabloda kalır, formda değil.
         self._user_table = QTableWidget(0, 3)
         self._user_table.setHorizontalHeaderLabels(["ID", "Kullanıcı", "Rol"])
         _uh = self._user_table.horizontalHeader()
         if _uh is not None:
             _uh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self._user_table.setStyleSheet("""
-            QTableWidget {  color: #e0e0e0; gridline-color: #0f3460; }
-            QHeaderView::section {  color: #e0e0e0; padding: 4px; }
-        """)
-        layout.addWidget(self._user_table)
+        layout.addWidget(self._user_table, stretch=1)
 
         # Yeni kullanıcı formu
         grp = QGroupBox("Yeni Kullanıcı Ekle")
-        grp.setStyleSheet("QGroupBox { border: 1px solid #0f3460; color: #aaa; font-weight: bold; }")
+        grp.setMaximumWidth(520)
         form = QFormLayout(grp)
+        form.setVerticalSpacing(6)
         self._new_username = QLineEdit()
+        self._new_username.setMaximumWidth(300)
         self._new_password = QLineEdit()
+        self._new_password.setMaximumWidth(300)
         self._new_password.setEchoMode(QLineEdit.EchoMode.Password)
         self._new_role_cb = QComboBox()
+        self._new_role_cb.setMaximumWidth(200)
         self._new_role_cb.addItems(["VIEWER (1)", "OPERATOR (2)", "ADMIN (3)"])
-
-        for w2 in [self._new_username, self._new_password]:
-            w2.setStyleSheet(
-                " border: 1px solid #0f3460; padding: 5px; border-radius: 3px;"
-            )
 
         form.addRow("Kullanıcı adı:", self._new_username)
         form.addRow("Şifre:", self._new_password)
@@ -244,20 +285,23 @@ class SystemLogView(QWidget):
 
         btn_row = QHBoxLayout()
         btn_add = QPushButton("Ekle")
-        btn_add.setStyleSheet(" color: #000; padding: 7px; border-radius: 3px; font-weight: bold;")
+        btn_add.setObjectName("primaryButton")
         btn_add.clicked.connect(self._add_user)
 
         btn_del = QPushButton("Seçili Kullanıcıyı Sil")
-        btn_del.setStyleSheet(" color: white; padding: 7px; border-radius: 3px;")
+        btn_del.setObjectName("dangerButton")
         btn_del.clicked.connect(self._delete_user)
 
         btn_refresh = QPushButton("Yenile")
         btn_refresh.clicked.connect(self._refresh_users)
+        for b in (btn_add, btn_del, btn_refresh):
+            b.setMinimumHeight(28)
         btn_row.addWidget(btn_add)
         btn_row.addWidget(btn_del)
         btn_row.addWidget(btn_refresh)
+        btn_row.addStretch()
 
-        layout.addWidget(grp)
+        layout.addWidget(grp, alignment=Qt.AlignmentFlag.AlignLeft)
         layout.addLayout(btn_row)
         self._refresh_users()
         return w
@@ -271,7 +315,35 @@ class SystemLogView(QWidget):
             self._user_table.setItem(row, 1, QTableWidgetItem(u["username"]))
             self._user_table.setItem(row, 2, QTableWidgetItem(role_names.get(u["role"], str(u["role"]))))
 
+    def _require_admin(self, islem: str) -> bool:
+        """Kullanıcı yönetimi işlemleri için ADMIN rolü zorunlu (C4).
+
+        NEDEN: Rol kontrolü UI görünürlüğünde değil, işlemin kendisinde
+        yapılmalıdır; aksi halde tek bir sekme/RBAC hatası yetki yükseltmeye
+        (privilege escalation) dönüşür.
+        """
+        role = state.get_rbac_role()
+        if role < ROLE_ADMIN:
+            QMessageBox.warning(
+                self, "Yetki Yok",
+                f"{islem} işlemi yalnızca ADMIN yetkisine sahip kullanıcılar "
+                f"tarafından yapılabilir.\n\nMevcut rol seviyeniz: {role}",
+            )
+            logger.warning("Yetkisiz kullanıcı yönetimi denemesi: %s (rol=%s)", islem, role)
+            try:
+                local_storage.write_audit(
+                    self._db_conn, "WARNING",
+                    f"Yetkisiz kullanıcı yönetimi denemesi: {islem} (rol={role})",
+                )
+            except Exception:
+                pass
+            return False
+        return True
+
     def _add_user(self) -> None:
+        # C4: ADMIN değilse hiçbir şey yapma.
+        if not self._require_admin("Kullanıcı ekleme"):
+            return
         username = self._new_username.text().strip()
         password = self._new_password.text()
         role = self._new_role_cb.currentIndex() + 1
@@ -287,6 +359,9 @@ class SystemLogView(QWidget):
             QMessageBox.critical(self, "Hata", str(exc))
 
     def _delete_user(self) -> None:
+        # C4: ADMIN değilse hiçbir şey yapma.
+        if not self._require_admin("Kullanıcı silme"):
+            return
         row = self._user_table.currentRow()
         if row < 0:
             return
@@ -308,7 +383,7 @@ class SystemLogView(QWidget):
         layout = QVBoxLayout(w)
 
         lbl = QLabel("MAVLink FTP Log İndirme")
-        lbl.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        lbl.setObjectName("sectionTitle")
         layout.addWidget(lbl)
 
         self._log_table = QTableWidget(0, 4)
@@ -316,10 +391,6 @@ class SystemLogView(QWidget):
         _lh = self._log_table.horizontalHeader()
         if _lh is not None:
             _lh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self._log_table.setStyleSheet("""
-            QTableWidget {  color: #e0e0e0; gridline-color: #0f3460; }
-            QHeaderView::section {  color: #e0e0e0; padding: 4px; }
-        """)
         layout.addWidget(self._log_table)
 
         self._log_progress = QProgressBar()
@@ -330,16 +401,16 @@ class SystemLogView(QWidget):
         btn_row = QHBoxLayout()
 
         btn_refresh_logs = QPushButton("Log Listesini Yenile")
-        btn_refresh_logs.setStyleSheet(" padding: 8px; border-radius: 3px;")
         btn_refresh_logs.clicked.connect(self._on_refresh_log_list)
-        btn_row.addWidget(btn_refresh_logs)
 
         btn_download = QPushButton("Seçili Logu İndir")
-        btn_download.setStyleSheet(
-            " color: white; padding: 8px; border-radius: 3px; font-weight: bold;"
-        )
+        btn_download.setObjectName("primaryButton")   # stil QSS'ten
         btn_download.clicked.connect(self._on_download_log)
+        for b in (btn_refresh_logs, btn_download):
+            b.setMinimumHeight(28)
+        btn_row.addWidget(btn_refresh_logs)
         btn_row.addWidget(btn_download)
+        btn_row.addStretch()
 
         layout.addLayout(btn_row)
         layout.addStretch()
@@ -387,14 +458,13 @@ class SystemLogView(QWidget):
         # Kontrol çubuğu
         ctrl_row = QHBoxLayout()
         self._analysis_btn = QPushButton("▶ Kaydı Başlat")
-        self._analysis_btn.setStyleSheet(
-            "color:white;padding:6px 16px;border-radius:4px;font-weight:bold;"
-        )
+        self._analysis_btn.setMinimumHeight(28)
+        self._set_analysis_btn_state(False)   # renk QSS class'ından
         self._analysis_btn.clicked.connect(self._toggle_analysis)
         self._analysis_status_lbl = QLabel("Kayıt yok")
-        self._analysis_status_lbl.setStyleSheet("color:#888;font-size:11px;")
+        self._analysis_status_lbl.setObjectName("mutedLabel")
         btn_clear = QPushButton("Temizle")
-        btn_clear.setStyleSheet("color:#aaa;padding:6px 12px;border-radius:4px;")
+        btn_clear.setMinimumHeight(28)
         btn_clear.clicked.connect(self._clear_analysis)
         ctrl_row.addWidget(self._analysis_btn)
         ctrl_row.addWidget(self._analysis_status_lbl)
@@ -411,12 +481,15 @@ class SystemLogView(QWidget):
         chart_lay.setSpacing(4)
         chart_lay.setContentsMargins(0, 0, 0, 0)
 
-        self._chart_roll  = _MiniChart("Roll (°)",    "#e94560", -60,  60)
-        self._chart_pitch = _MiniChart("Pitch (°)",   "#ffb347", -60,  60)
-        self._chart_yaw   = _MiniChart("Yaw (°)",     "#00e5ff", -180, 180)
-        self._chart_alt   = _MiniChart("İrtifa (m)",  "#4ade80",   0,  200)
-        self._chart_spd   = _MiniChart("Hız (m/s)",   "#bb86fc",   0,   30)
-        self._chart_bat   = _MiniChart("Batarya (%)", "#ffff00",   0,  100)
+        # Seri renkleri TOKEN adıyla verilir; her grafik ayrı widget olduğu için
+        # aynı token'ın tekrarı bir soruna yol açmaz, önemli olan her serinin
+        # iki temada da okunur bir renkle çizilmesi.
+        self._chart_roll  = _MiniChart("Roll (°)",    "danger",     -60,  60)
+        self._chart_pitch = _MiniChart("Pitch (°)",   "warning",    -60,  60)
+        self._chart_yaw   = _MiniChart("Yaw (°)",     "info",       -180, 180)
+        self._chart_alt   = _MiniChart("İrtifa (m)",  "success",      0,  200)
+        self._chart_spd   = _MiniChart("Hız (m/s)",   "accent",       0,   30)
+        self._chart_bat   = _MiniChart("Batarya (%)", "warning_fg",   0,  100)
 
         for c in [self._chart_roll, self._chart_pitch, self._chart_yaw,
                   self._chart_alt, self._chart_spd, self._chart_bat]:
@@ -428,14 +501,16 @@ class SystemLogView(QWidget):
         evt_lay = QVBoxLayout(evt_widget)
         evt_lay.setContentsMargins(0, 0, 0, 0)
         evt_hdr = QLabel("Olaylar / Anormallikler")
-        evt_hdr.setStyleSheet("color:#4ade80;font-weight:bold;font-size:10px;padding:2px;")
+        evt_hdr.setObjectName("sectionTitle")
         evt_lay.addWidget(evt_hdr)
         self._analysis_log = QTextEdit()
         self._analysis_log.setReadOnly(True)
-        self._analysis_log.setStyleSheet(
-            "color:#e0e0e0;font-family:'Courier New';"
-            "font-size:11px;border:1px solid #0f3460;"
-        )
+        # NEDEN (M9): Bu kutuda blok sınırı YOKTU. Telemetri ~15 Hz geldiği için
+        # düşük batarya gibi kalıcı bir durumda saniyede ~15 satır ekleniyor,
+        # uzun uçuşta on binlerce blok birikip bellek ve UI'yi şişiriyordu.
+        # Diğer log kutularıyla aynı sınır (2000 blok) uygulanır.
+        self._analysis_log.document().setMaximumBlockCount(2000)
+        self._analysis_log.setStyleSheet("QTextEdit{font-family:'Courier New'; font-size:11px;}")
         evt_lay.addWidget(self._analysis_log)
         splitter.addWidget(evt_widget)
         splitter.setStretchFactor(0, 3)
@@ -444,12 +519,22 @@ class SystemLogView(QWidget):
 
         # Özet satırı
         self._summary_lbl = QLabel("Özet: —")
-        self._summary_lbl.setStyleSheet(
-            "color:#aaa;padding:4px;font-size:10px;"
-            "border:1px solid #0f3460;border-radius:3px;"
-        )
+        self._summary_lbl.setObjectName("hintLabel")   # soluk metin + kutu QSS'ten
         root.addWidget(self._summary_lbl)
         return w
+
+    def _set_analysis_btn_state(self, recording: bool) -> None:
+        """Kayıt butonunun rengini QSS class'ı ile verir (inline hex YOK).
+
+        Kayıt sürerken 'dangerButton' (durdur), beklerken 'successButton'
+        (başlat) görünümü kullanılır; class değişimi unpolish/polish ile
+        yeniden uygulanır.
+        """
+        self._analysis_btn.setObjectName("dangerButton" if recording else "successButton")
+        st = self._analysis_btn.style()
+        if st is not None:
+            st.unpolish(self._analysis_btn)
+            st.polish(self._analysis_btn)
 
     def _toggle_analysis(self) -> None:
         if not self._analysis_active:
@@ -460,18 +545,18 @@ class SystemLogView(QWidget):
             self._prev_alt = None
             self._prev_roll = None
             self._prev_pitch = None
+            # M9: Yeni kayıtta edge durumları sıfırlanır ki ilk aşım tekrar loglansın.
+            self._bat_level = ""
+            self._roll_exceeded = False
+            self._pitch_exceeded = False
             self._analysis_btn.setText("■ Kaydı Durdur")
-            self._analysis_btn.setStyleSheet(
-                "color:white;padding:6px 16px;border-radius:4px;font-weight:bold;"
-            )
+            self._set_analysis_btn_state(True)
             self._analysis_status_lbl.setText("Kayıt aktif")
             self._analysis_timer.start()
         else:
             self._analysis_active = False
             self._analysis_btn.setText("▶ Kaydı Başlat")
-            self._analysis_btn.setStyleSheet(
-                "color:white;padding:6px 16px;border-radius:4px;font-weight:bold;"
-            )
+            self._set_analysis_btn_state(False)
             elapsed = time.time() - self._analysis_start
             self._analysis_status_lbl.setText(f"Son kayıt: {elapsed:.0f}s")
             self._analysis_timer.stop()
@@ -479,6 +564,11 @@ class SystemLogView(QWidget):
 
     def _clear_analysis(self) -> None:
         self._analysis_log.clear()
+        # M9: Log temizlenince edge durumları da sıfırlanır — aksi halde
+        # devam eden bir anormallik bir daha hiç loglanmazdı.
+        self._bat_level = ""
+        self._roll_exceeded = False
+        self._pitch_exceeded = False
         self._summary_lbl.setText("Özet: —")
         for c in [self._chart_roll, self._chart_pitch, self._chart_yaw,
                   self._chart_alt, self._chart_spd, self._chart_bat]:
@@ -529,10 +619,10 @@ class SystemLogView(QWidget):
         self._chart_spd.push(spd)
         self._chart_bat.push(bat)
 
-        # Anormallik tespiti
-        _WARN  = '<span style="color:#ff8800">'
-        _ERR   = '<span style="color:#e94560">'
-        _INFO  = '<span style="color:#4ade80">'
+        # Anormallik tespiti — satır renkleri aktif temadan (ham hex YOK)
+        _WARN  = f'<span style="color:{theme.c("warning")}">'
+        _ERR   = f'<span style="color:{theme.c("danger")}">'
+        _INFO  = f'<span style="color:{theme.c("success")}">'
         _CLOSE = '</span>'
 
         # Yaw hız değişimi
@@ -555,36 +645,72 @@ class SystemLogView(QWidget):
                 )
         self._prev_alt = alt
 
-        # Aşırı roll/pitch
-        if abs(roll_deg) > 45:
+        # Aşırı roll/pitch — EDGE-TRIGGERED (M9)
+        # NEDEN: Eşik aşıldığı SÜRECE her karede (~15 Hz) satır ekleniyordu.
+        # Artık yalnızca eşiğe GİRİŞTE ve eşikten ÇIKIŞTA birer satır yazılır;
+        # 5° histerezis, tam sınırda titreşen değerin log'u doldurmasını önler.
+        if abs(roll_deg) > 45 and not self._roll_exceeded:
+            self._roll_exceeded = True
             self._analysis_events.append(
                 f"{_ERR}[{t:.1f}s] AŞIRI ROLL: {roll_deg:.1f}°{_CLOSE}"
             )
-        if abs(pitch_deg) > 45:
+        elif abs(roll_deg) < 40 and self._roll_exceeded:
+            self._roll_exceeded = False
+            self._analysis_events.append(
+                f"{_INFO}[{t:.1f}s] Roll normale döndü: {roll_deg:.1f}°{_CLOSE}"
+            )
+
+        if abs(pitch_deg) > 45 and not self._pitch_exceeded:
+            self._pitch_exceeded = True
             self._analysis_events.append(
                 f"{_ERR}[{t:.1f}s] AŞIRI PİTCH: {pitch_deg:.1f}°{_CLOSE}"
             )
+        elif abs(pitch_deg) < 40 and self._pitch_exceeded:
+            self._pitch_exceeded = False
+            self._analysis_events.append(
+                f"{_INFO}[{t:.1f}s] Pitch normale döndü: {pitch_deg:.1f}°{_CLOSE}"
+            )
 
-        # Düşük batarya
-        if 0 < bat <= 20:
-            self._analysis_events.append(
-                f"{_ERR}[{t:.1f}s] KRİTİK BATARYA: %{bat:.0f}{_CLOSE}"
-            )
-        elif 20 < bat <= 30:
-            self._analysis_events.append(
-                f"{_WARN}[{t:.1f}s] Düşük batarya: %{bat:.0f}{_CLOSE}"
-            )
+        # Düşük batarya — EDGE-TRIGGERED (M9)
+        # NEDEN: Asıl kaçak buradaydı — batarya %30'un altına indiğinde uçuşun
+        # KALANI boyunca her telemetri karesinde satır ekleniyordu. Artık seviye
+        # DEĞİŞTİĞİNDE tek satır yazılır.
+        if bat <= 0:
+            new_level = ""          # geçersiz/veri yok
+        elif bat <= 20:
+            new_level = "kritik"
+        elif bat <= 30:
+            new_level = "dusuk"
+        else:
+            new_level = "normal"
+
+        if new_level and new_level != self._bat_level:
+            if new_level == "kritik":
+                self._analysis_events.append(
+                    f"{_ERR}[{t:.1f}s] KRİTİK BATARYA: %{bat:.0f}{_CLOSE}"
+                )
+            elif new_level == "dusuk":
+                self._analysis_events.append(
+                    f"{_WARN}[{t:.1f}s] Düşük batarya: %{bat:.0f}{_CLOSE}"
+                )
+            elif self._bat_level in ("dusuk", "kritik"):
+                self._analysis_events.append(
+                    f"{_INFO}[{t:.1f}s] Batarya normale döndü: %{bat:.0f}{_CLOSE}"
+                )
+            self._bat_level = new_level
 
     # ── Drone STATUSTEXT mesajları ──────────────────────────────────────────────
+    # Değerler HAM HEX DEĞİL tema token adıdır; renk yazma anında theme.c ile
+    # çözülür, böylece iki temada da okunur kalır.
     _SEV_COLORS = {
-        0: "#e94560",  # EMERGENCY
-        1: "#e94560",  # ALERT
-        2: "#e94560",  # CRITICAL
-        3: "#ff8800",  # ERROR
-        4: "#f0a500",  # WARNING
-        5: "#4ade80",  # NOTICE
-        6: "#aaa",     # INFO
-        7: "#888",     # DEBUG
+        0: "danger",        # EMERGENCY
+        1: "danger",        # ALERT
+        2: "danger",        # CRITICAL
+        3: "danger",        # ERROR
+        4: "warning",       # WARNING
+        5: "success",       # NOTICE
+        6: "text_muted",    # INFO
+        7: "text_disabled", # DEBUG
     }
 
     @pyqtSlot(str, int)
@@ -592,7 +718,7 @@ class SystemLogView(QWidget):
         """Drone'dan gelen STATUSTEXT mesajlarını log paneline yazar."""
         import datetime
         ts = datetime.datetime.now().strftime("%H:%M:%S")
-        color = self._SEV_COLORS.get(severity, "#aaa")
+        color = theme.c(self._SEV_COLORS.get(severity, "text_muted"))
         _sev_names = ["EMRG","ALRT","CRIT","ERR","WARN","NOTE","INFO","DBG"]
         sev_name = _sev_names[severity] if 0 <= severity < len(_sev_names) else str(severity)
         msg = f'<span style="color:{color}">[{ts}] [{sev_name}] {text}</span>'

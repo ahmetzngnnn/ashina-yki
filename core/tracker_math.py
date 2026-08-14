@@ -8,6 +8,8 @@ elevasyon (tilt) açılarını hesaplar. Kolay test edilir, donanımdan bağıms
 Koordinat kuralı:
   • azimut (azimuth): kuzeyden saat yönü, 0..360°  (anten PAN ekseni)
   • elevasyon (elevation): yataydan yukarı, -90..+90°  (anten TILT ekseni)
+  • irtifa: TÜM irtifalar AMSL (deniz seviyesi) metre — göreli (relative_alt)
+    irtifa ASLA doğrudan verilmemeli; çağıran taraf AMSL'e çevirmelidir.
 """
 from __future__ import annotations
 import math
@@ -39,24 +41,32 @@ def elevation_deg(ground_dist_m: float, alt_diff_m: float) -> float:
     return math.degrees(math.atan2(alt_diff_m, ground_dist_m))
 
 
-def compute_aim(ant_lat: float, ant_lon: float, ant_alt: float,
-                drone_lat: float, drone_lon: float, drone_alt: float) -> dict:
+def compute_aim(ant_lat: float, ant_lon: float, ant_alt_amsl: float,
+                drone_lat: float, drone_lon: float, drone_alt_amsl: float) -> dict:
     """
     Antenin drona bakması için hedef açıları hesaplar.
 
-    ant_*   : anten konumu (lat, lon, irtifa m)
-    drone_* : drone konumu (lat, lon, irtifa m)  — aynı irtifa referansı kullanılmalı
+    ⚠ İRTİFA REFERANSI — ZORUNLU: her iki irtifa da **AMSL** (deniz seviyesinden
+    metre) olmalıdır. Karışık referans (ör. drone `relative_alt` + anten GPS AMSL)
+    doğrudan yanlış elevasyona yol açar: 850 m rakımda 30 m irtifada uçan bir İHA
+    için 30 - 850 = -820 m fark → elevasyon ≈ -76° → anten YERE bakar, link kopar.
+    Drone tarafında `relative_alt` kullanılacaksa çağırmadan ÖNCE
+    `drone_amsl = home_alt(AMSL) + relative_alt` dönüşümü yapılmalıdır
+    (bkz. core/antenna_tracker_worker.py:update_drone_position).
+
+    ant_*   : anten konumu (lat, lon, irtifa m **AMSL**)
+    drone_* : drone konumu (lat, lon, irtifa m **AMSL**)
 
     Dönüş: {
       "azimuth":   pan açısı (0..360°),
       "elevation": tilt açısı (-90..+90°),
       "ground_distance_m": yatay mesafe,
       "slant_distance_m":  doğrudan (eğik) mesafe,
-      "alt_diff_m": irtifa farkı (drone - anten),
+      "alt_diff_m": irtifa farkı (drone - anten), her ikisi de AMSL,
     }
     """
     ground = haversine_m(ant_lat, ant_lon, drone_lat, drone_lon)
-    alt_diff = drone_alt - ant_alt
+    alt_diff = drone_alt_amsl - ant_alt_amsl   # aynı referans (AMSL) şart
     az = bearing_deg(ant_lat, ant_lon, drone_lat, drone_lon)
     el = elevation_deg(ground, alt_diff)
     slant = math.hypot(ground, alt_diff)

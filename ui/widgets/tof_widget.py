@@ -3,7 +3,17 @@ from PyQt6.QtWidgets import QWidget, QGridLayout, QLabel, QVBoxLayout, QFrame, Q
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QColor
 
+from core import theme
+
 logger = logging.getLogger(__name__)
+
+# Sensör köşe renkleri — SENSÖR SEMANTİĞİ (her köşe kendi rengiyle anılır,
+# sahada kablo/etiket rengiyle eşleşir): temadan bağımsız sabit kalır.
+C_WHITE  = "rgb(255, 255, 255)"
+C_RED    = "rgb(204, 25, 25)"
+C_GREEN  = "rgb(25, 204, 25)"
+C_BLUE   = "rgb(51, 102, 230)"
+C_YELLOW = "rgb(204, 204, 25)"
 
 class TofWidget(QFrame):
     """
@@ -15,12 +25,16 @@ class TofWidget(QFrame):
         super().__init__(parent)
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setFrameShadow(QFrame.Shadow.Raised)
-        self.setStyleSheet("background-color: #111111; color: white; border-radius: 5px;")
-        
+        self.setObjectName("tofWidget")
+
         self.target_expected = 240.0
         self.tolerance = 15.0
+        # Son durum metni/token'ı — tema değişince aynı durum yeniden boyanır.
+        self._status_token = "accent"
 
         self._build_ui()
+        self._apply_theme_colors()
+        theme.notifier().changed.connect(lambda _n: self._apply_theme_colors())
 
     def _build_ui(self):
         main_layout = QVBoxLayout(self)
@@ -29,45 +43,84 @@ class TofWidget(QFrame):
         # Durum Başlığı
         self.lbl_status = QLabel("[ DURUM MAKİNESİ ]\nBEKLENİYOR")
         self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_status.setStyleSheet("color: cyan; font-size: 14px; font-weight: bold;")
         main_layout.addWidget(self.lbl_status)
 
         # 3x3 Grid
         self.grid = QGridLayout()
         self.grid.setSpacing(5)
 
-        # Renkler (CSS rgb format)
-        self.C_WHITE = "rgb(255, 255, 255)"
-        self.C_RED = "rgb(204, 25, 25)"
-        self.C_GREEN = "rgb(25, 204, 25)"
-        self.C_BLUE = "rgb(51, 102, 230)"
-        self.C_YELLOW = "rgb(204, 204, 25)"
-        self.C_BLACK = "rgb(13, 13, 13)"
+        # Sensör renkleri modül düzeyinde (semantik sabit); boş hücre zemini
+        # temadan gelir — koyu temada koyu, açık temada açık olmalı.
+        self.C_WHITE = C_WHITE
+        self.C_RED = C_RED
+        self.C_GREEN = C_GREEN
+        self.C_BLUE = C_BLUE
+        self.C_YELLOW = C_YELLOW
 
         self.labels = {}
+        # Hücrelerin son (metin, renk) durumu — tema değişince yeniden çizilir.
+        self._cell_state: dict = {}
         for row in range(3):
             for col in range(3):
                 lbl = QLabel()
                 lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 lbl.setMinimumSize(60, 60)
                 lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-                lbl.setStyleSheet(f"background-color: {self.C_BLACK}; border: 1px solid #333; font-size: 10px;")
                 self.grid.addWidget(lbl, row, col)
                 self.labels[(row, col)] = lbl
 
         # Sabit Köşe İsimleri
-        self._set_cell(0, 0, "SOL ÜST\n(L5)\nBekleniyor...", self.C_BLACK)
-        self._set_cell(0, 2, "SAĞ ÜST\n(L1)\nBekleniyor...", self.C_BLACK)
-        self._set_cell(2, 0, "SOL ALT\n(L4)\nBekleniyor...", self.C_BLACK)
-        self._set_cell(2, 2, "SAĞ ALT\n(L2)\nBekleniyor...", self.C_BLACK)
+        self._set_cell(0, 0, "SOL ÜST\n(L5)\nBekleniyor...", None)
+        self._set_cell(0, 2, "SAĞ ÜST\n(L1)\nBekleniyor...", None)
+        self._set_cell(2, 0, "SOL ALT\n(L4)\nBekleniyor...", None)
+        self._set_cell(2, 2, "SAĞ ALT\n(L2)\nBekleniyor...", None)
 
         main_layout.addLayout(self.grid)
+
+    @property
+    def C_BLACK(self) -> str:
+        """Boş hücre zemini — 'siyah' değil, aktif temanın kuyu rengi.
+
+        Eski sabit koyu ton açık temada kara delik gibi duruyordu; çağıran
+        kod (`_set_cell(..., self.C_BLACK)`) değişmeden temaya uyar."""
+        return theme.c("well")
 
     def _set_cell(self, row, col, text, bg_color, is_target=False):
         lbl = self.labels[(row, col)]
         lbl.setText(text)
+        # bg_color None → boş/nötr hücre (tema zemini, tema metni)
+        self._cell_state[(row, col)] = (text, bg_color)
+        if bg_color is None or bg_color == self.C_BLACK:
+            lbl.setStyleSheet(
+                f"background-color:{theme.c('well')}; color:{theme.c('text_muted')};"
+                f"font-weight:bold; font-size:10px; border:1px solid {theme.c('border')};"
+            )
+            return
+        # Sensör renkleri doygun ve koyu — üzerinde beyaz metin her iki temada okunur.
         text_color = "black" if bg_color == self.C_WHITE else "white"
-        lbl.setStyleSheet(f"background-color: {bg_color}; color: {text_color}; font-weight: bold; border: 1px solid #555;")
+        lbl.setStyleSheet(
+            f"background-color:{bg_color}; color:{text_color};"
+            f"font-weight:bold; font-size:10px; border:1px solid {theme.c('border_strong')};"
+        )
+
+    def _apply_theme_colors(self) -> None:
+        """Tema değişince: kapsayıcı, durum metni ve tüm hücreler yeniden boyanır."""
+        self.setStyleSheet(
+            f"QFrame#tofWidget {{ background-color:{theme.c('panel')};"
+            f"border:1px solid {theme.c('border')}; border-radius:6px; }}"
+        )
+        self.lbl_status.setStyleSheet(
+            f"color:{theme.c(self._status_token)}; font-size:14px; font-weight:bold;"
+        )
+        for (row, col), (text, bg) in list(self._cell_state.items()):
+            self._set_cell(row, col, text, bg)
+
+    def _set_status(self, text: str, token: str) -> None:
+        self._status_token = token
+        self.lbl_status.setText(text)
+        self.lbl_status.setStyleSheet(
+            f"color:{theme.c(token)}; font-size:14px; font-weight:bold;"
+        )
 
     @pyqtSlot(dict)
     def update_tof_data(self, data: dict):
@@ -87,8 +140,7 @@ class TofWidget(QFrame):
 
         # Hata durumu kontrolü (Tümü -1 ise)
         if d_L1 == -1 and d_L2 == -1 and d_L5 == -1 and d_L4 == -1:
-            self.lbl_status.setText("HATA!\nSENSÖR OKUNAMIYOR")
-            self.lbl_status.setStyleSheet("color: red; font-size: 14px; font-weight: bold;")
+            self._set_status("HATA!\nSENSÖR OKUNAMIYOR", "danger")
             return
 
         h_L1 = abs(d_L1 - self.target_expected) <= self.tolerance
@@ -116,15 +168,15 @@ class TofWidget(QFrame):
 
         # Durum Kararı
         durum_metni = ""
-        durum_renk = "cyan"
+        durum_renk = "accent"
 
         if h_L1 and h_L2 and h_L5 and h_L4:
             durum_metni = "[ KİLİTLENDİ ]\nHedef Tam Merkezde!"
-            durum_renk = "lime"
+            durum_renk = "success"
             self._set_cell(1, 1, "HEDEF\nMERKEZ", self.C_WHITE)
         elif not h_L1 and not h_L2 and not h_L5 and not h_L4:
             durum_metni = "[ ARAMA MODU ]\nHedef Bulunamadı"
-            durum_renk = "gray"
+            durum_renk = "text_muted"
         else:
             yon_y = ""
             yon_x = ""
@@ -137,10 +189,9 @@ class TofWidget(QFrame):
             if yon_y or yon_x:
                 hedef_yon = f"{yon_y} {yon_x}".strip()
                 durum_metni = f"[ DÜZELTME YAPIYOR ]\n--> {hedef_yon} GİT"
-                durum_renk = "yellow"
+                durum_renk = "info"
             else:
                 durum_metni = "[ KARARSIZLIK ]\nHizalama Bekleniyor"
-                durum_renk = "orange"
+                durum_renk = "warning"
 
-        self.lbl_status.setText(durum_metni)
-        self.lbl_status.setStyleSheet(f"color: {durum_renk}; font-size: 14px; font-weight: bold;")
+        self._set_status(durum_metni, durum_renk)

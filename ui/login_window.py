@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QPushButton, QMessageBox,
     QFormLayout, QFrame,
 )
+from core import theme
 from ui.auth_manager import AuthManager
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,9 @@ class LoginWindow(QWidget):
         self.setFixedSize(420, 380)
         # self.setStyleSheet() kaldırıldı; global style.qss kullanılacak
         self._build_ui()
+        # Kurulumda yazılan satır-içi renkler tema değişince BAYAT kalır —
+        # sinyale bağlanıp hepsini aktif paletle yeniden yazıyoruz.
+        theme.notifier().changed.connect(lambda _n: self._apply_theme_colors())
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -32,30 +36,50 @@ class LoginWindow(QWidget):
         layout.setSpacing(20)
 
         # Logo / başlık
-        title = QLabel("ASHİNA YKİ")
-        title.setFont(QFont("Segoe UI", 26, QFont.Weight.Bold))
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet("color: #3daee9; letter-spacing: 2px;")
-        layout.addWidget(title)
+        self._title_lbl = QLabel("ASHİNA YKİ")
+        self._title_lbl.setFont(QFont("Segoe UI", 26, QFont.Weight.Bold))
+        self._title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._title_lbl)
 
-        subtitle = QLabel("Taktiksel Yer Kontrol İstasyonu v2.0")
-        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        subtitle.setStyleSheet("color: #8b949e; font-size: 13px; font-weight: bold;")
-        layout.addWidget(subtitle)
+        self._subtitle_lbl = QLabel("Taktiksel Yer Kontrol İstasyonu v2.0")
+        self._subtitle_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._subtitle_lbl)
 
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("color: #30363d; margin-top: 10px; margin-bottom: 10px;")
-        layout.addWidget(sep)
+        self._sep = QFrame()
+        self._sep.setFrameShape(QFrame.Shape.HLine)
+        layout.addWidget(self._sep)
 
         layout.addWidget(self._local_tab())
 
         layout.addStretch()
 
-        ver = QLabel("v2.0 · Güvenli Bağlantı")
-        ver.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        ver.setStyleSheet("color: #484f58; font-size: 11px;")
-        layout.addWidget(ver)
+        self._ver_lbl = QLabel("v2.0 · Güvenli Bağlantı")
+        self._ver_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._ver_lbl)
+
+        # Satır-içi renkler TEK noktadan yazılır (tema değişiminde de aynı yol)
+        self._apply_theme_colors()
+
+    # ── Tema: satır-içi renkler ───────────────────────────────────────────────
+    def _apply_theme_colors(self) -> None:
+        """Kurulumda yazılan TÜM satır-içi renkleri aktif palete göre (yeniden)
+        yazar. Tema değişince `notifier().changed` üzerinden çağrılır — aksi
+        halde bu ekranın renkleri eski paletle bayat kalırdı."""
+        # 26px + letter-spacing QSS class'larıyla karşılanmıyor (pageTitle 14px),
+        # bu yüzden satır içi kalıyor — renk yalnızca tema token'ından.
+        self._title_lbl.setStyleSheet(
+            f"color: {theme.c('accent')}; letter-spacing: 2px;"
+        )
+        self._subtitle_lbl.setStyleSheet(
+            f"color: {theme.c('text_muted')}; font-size: 13px; font-weight: bold;"
+        )
+        # QFrame HLine çizgi rengini `color` özelliğinden alır
+        self._sep.setStyleSheet(
+            f"color: {theme.c('border')}; margin-top: 10px; margin-bottom: 10px;"
+        )
+        self._ver_lbl.setStyleSheet(
+            f"color: {theme.c('text_disabled')}; font-size: 11px;"
+        )
 
     def _local_tab(self) -> QWidget:
         w = QWidget()
