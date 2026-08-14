@@ -633,12 +633,28 @@ class CalibrationView(QWidget):
         w = QWidget()
         split = QSplitter(Qt.Orientation.Horizontal)
 
-        # Sol: DroneViz
+        # Sol: araç görseli — 3B model varsa o, yoksa mevcut 2B çizim
+        # NEDEN 3B: ivmeölçer kalibrasyonu aracın altı ayrı pozisyona
+        # getirilmesini ister ("sol yanına yatırın"). Metin + 2B çizimle bunu
+        # anlatmak, özellikle deneyimsiz bir operatöre, hataya açık; dönen bir
+        # model hangi yüzün yere bakacağını tartışmasız gösterir.
         left = QWidget()
         ll = QVBoxLayout(left)
         ll.setContentsMargins(6, 6, 6, 6)
+        self._accel_model3d = None
+        try:
+            from ui.widgets.model3d_view import Model3DView
+            self._accel_model3d = Model3DView()
+            self._accel_model3d.setMinimumSize(280, 260)
+            ll.addWidget(self._accel_model3d, 1)
+        except Exception:
+            logger.exception("3B görünüm kurulamadı — 2B çizime düşülüyor")
+        # 2B çizim yedek olarak kalır: WebEngine/WebGL yoksa panel boş kalmasın
         self._accel_drone = Drone3DWidget()
-        ll.addWidget(self._accel_drone)
+        if self._accel_model3d is None:
+            ll.addWidget(self._accel_drone)
+        else:
+            self._accel_drone.setVisible(False)
         split.addWidget(left)
 
         # Sağ: wizard
@@ -693,6 +709,23 @@ class CalibrationView(QWidget):
         "side_nose": (0, -90, 0), "side_tail": (0, 90, 0), "bottom": (180, 0, 0),
     }
 
+    def _model3d_poz(self, adim: int) -> None:
+        """3B modeli verilen kalibrasyon adımının pozisyonuna döndürür.
+
+        NEDEN buradan: pozisyon açıları ZATEN `_ACCEL_ATT` içinde tanımlı ve
+        2B çizim de onu kullanıyor. 3B görünüm kendi tablosunu tutsaydı iki
+        kaynak ayrışabilir, model bir yöne 2B çizim başka yöne bakardı —
+        bu projede aynı hata (YKİ/İHA rota matematiği) zaten yaşandı.
+        """
+        if self._accel_model3d is None or not (0 <= adim < len(_ACCEL_STEPS)):
+            return
+        view, msg = _ACCEL_STEPS[adim]
+        att = self._ACCEL_ATT.get(view)
+        if att is None:
+            return
+        self._accel_model3d.set_attitude(*att)
+        self._accel_model3d.set_info(msg)
+
     def _start_accel(self):
         ml = self._get_mavlink()
         # NEDEN: Komut gerçekten bir alıcıya gitmiyorsa kullanıcıya kalibrasyon
@@ -714,6 +747,7 @@ class CalibrationView(QWidget):
         self._btn_accel_start.setEnabled(False)
         view, msg = _ACCEL_STEPS[0]
         self._accel_drone.set_target_attitude(0, 0, 0)
+        self._model3d_poz(0)   # 3B model ilk pozisyona (düz/yatay)
         self._accel_step_lbl.setText(msg)
         self._accel_step_style("warning")
         self._accel_log.append("[BAŞLAT] İvmeölçer kalibrasyon komutu gönderildi — " + msg)
@@ -740,6 +774,9 @@ class CalibrationView(QWidget):
         self._accel_log.append(f"[GÖNDER] ACCELCAL_VEHICLE_POS pos={pos}")
 
         self._accel_step += 1
+        # 3B model bir SONRAKİ pozisyona döner: operatör şimdi aracı oraya
+        # getirecek. (Gönderilen pos, az önce tamamlanan konumdur.)
+        self._model3d_poz(self._accel_step)
         self._accel_awaiting_fc = True
         # NEDEN: FC yanıtı gelene kadar buton kilitli; ama STATUSTEXT hiç bağlı
         # değilse kullanıcı kilitli kalmasın diye zaman aşımı ile serbest bırakılır.
