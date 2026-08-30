@@ -163,6 +163,15 @@ def update_user_role(conn: sqlite3.Connection, username: str, role: int) -> None
         conn.commit()
 
 
+def update_user_password_hash(conn: sqlite3.Connection, username: str, password_hash: str) -> None:
+    with QMutexLocker(WRITE_MUTEX):
+        conn.execute(
+            "UPDATE users SET password_hash = ? WHERE username = ?",
+            (password_hash, username),
+        )
+        conn.commit()
+
+
 def delete_user(conn: sqlite3.Connection, username: str) -> None:
     with QMutexLocker(WRITE_MUTEX):
         conn.execute("DELETE FROM users WHERE username = ?", (username,))

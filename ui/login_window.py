@@ -111,6 +111,16 @@ class LoginWindow(QWidget):
             return
 
         if self._auth.authenticate_local(username, password):
+            if username == "admin" and password == "admin":
+                # 2026-08-26: varsayılan admin/admin hesabı değişime hiç
+                # zorlanmıyordu, yalnızca log'a "değiştirin" yazılıyordu —
+                # artık her girişte göz ardı edilemez bir uyarı çıkıyor.
+                QMessageBox.warning(
+                    self, "Güvenlik Uyarısı",
+                    "Varsayılan yönetici hesabıyla (admin/admin) giriş yaptınız.\n\n"
+                    "Bu şifreyi HEMEN değiştirin: Sistem Günlüğü → Kullanıcı "
+                    "Yönetimi'nden yeni bir admin hesabı oluşturup bu hesabı "
+                    "silin, ya da şifresini değiştirin.")
             self.login_successful.emit(self._auth.get_role())
             self.close()
         else:
