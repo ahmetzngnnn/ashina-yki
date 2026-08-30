@@ -11,3 +11,6 @@ dist/
 
 # Yerel yedek kopyalar (settings.json zaten hariç)
 settings.json.bak*
+
+# Sanal ortam (1.2 GB) — repoya girmemeli
+.venv/
