@@ -221,6 +221,8 @@ _MAP_AREA_COLOR  = "#bb86fc"   # tarama poligonu / yarıçap çemberi
 _MAP_POLE1_COLOR = "#ffd700"   # Direk 1 çemberi
 _MAP_POLE2_COLOR = "#ff8c00"   # Direk 2 çemberi
 _MAP_FW_AREA_COLOR = "#a78bfa"  # Sabit Kanat pisti köşe çemberi (mor — ana tarama alanından ayırt edilsin)
+_MAP_RED_AREA_COLOR  = "#ef4444"  # Kırmızı hedefin TAHMİNİ bölgesi
+_MAP_BLUE_AREA_COLOR = "#3b82f6"  # Mavi hedefin TAHMİNİ bölgesi
 
 # ── Fare Tekerleği Koruması ───────────────────────────────────────────────────
 # NEDEN: Sağ parametre paneli tekerlekle kaydırılırken imlecin ALTINDAKİ
@@ -1405,6 +1407,10 @@ class TargetDropMissionTab(_BaseMissionTab):
   _SEL_POLE1 = "Direk 1"
   _SEL_POLE2 = "Direk 2"
   _SEL_FW_AREA = "Sabit Kanat Pisti Köşesi"
+  # Operatörün haritada işaretlediği TAHMİNİ hedef bölgeleri (opsiyonel).
+  # Verilmezse görev tam alan taraması yapar — geriye dönük tam uyumlu.
+  _SEL_RED_AREA  = "Kırmızı Hedef Bölgesi (tahmini)"
+  _SEL_BLUE_AREA = "Mavi Hedef Bölgesi (tahmini)"
 
   # Çeldirici yerleşimi modu — bkz. _MODE_MIXED/_MODE_SEPARATE NEDEN
   _MODE_MIXED    = "Karışık (çeldiriciler hedeflerle aynı alanda)"
@@ -1414,6 +1420,9 @@ class TargetDropMissionTab(_BaseMissionTab):
     self._pole1: dict | None = None
     self._pole2: dict | None = None
     self._fw_wps: list = []
+    # Tahmini hedef bölgeleri — renk başına poligon köşeleri.
+    self._red_area_wps: list = []
+    self._blue_area_wps: list = []
 
     # NEDEN: Bu sekmedeki TÜM spin kutuları uçuş parametresi taşıyor; fabrika
     # fonksiyonlarına tek noktadan tekerlek koruması eklenir (canlı testte
@@ -1462,6 +1471,21 @@ class TargetDropMissionTab(_BaseMissionTab):
     mode_row.addWidget(self._decoy_mode, 1)
     lay.addLayout(mode_row)
 
+    self._hedef_bolge_lbl = QLabel(
+        "Tahmini hedef bölgesi: işaretlenmedi (opsiyonel — işaretlenirse arama "
+        "o bölgeye daraltılır, işaretlenmezse tüm alan taranır).")
+    self._hedef_bolge_lbl.setObjectName("mutedLabel")
+    self._hedef_bolge_lbl.setWordWrap(True)
+    self._hedef_bolge_lbl.setToolTip(
+        "Haritada renk başına en az 3 köşe işaretleyin. Bu bir İPUCUDUR, kanıt "
+        "DEĞİLDİR:\n"
+        "• Hedef yine GÖRÜNTÜ İŞLEME ile tespit edilir ve kimlik kapısından geçer.\n"
+        "• Bölge boş çıkarsa araç tam alan taramasına döner ve o bölge negatif "
+        "olarak İŞARETLENMEZ.\n"
+        "• Bölge küçüldükçe İHA daha alçaktan ve daha az geçişle bakar "
+        "(tek bakış → nokta dizisi → mini şerit taraması).")
+    lay.addWidget(self._hedef_bolge_lbl)
+
     self._fw_area_lbl = QLabel("Sabit Kanat pisti: 0 köşe işaretlendi (en az 3 gerekir).")
     self._fw_area_lbl.setObjectName("mutedLabel")
     self._fw_area_lbl.setWordWrap(True)
@@ -1473,6 +1497,7 @@ class TargetDropMissionTab(_BaseMissionTab):
     sel_row.addWidget(QLabel("Harita tıklaması:"))
     self._sel_target = QComboBox()
     self._sel_target.addItems([self._SEL_AREA, self._SEL_POLE1, self._SEL_POLE2,
+                               self._SEL_RED_AREA, self._SEL_BLUE_AREA,
                                 self._SEL_FW_AREA])
     guard_wheel(self._sel_target)  # kaydırma tıklama hedefini değiştirmesin
     sel_row.addWidget(self._sel_target, 1)
@@ -2122,6 +2147,23 @@ class TargetDropMissionTab(_BaseMissionTab):
     self._fw_area_lbl.setVisible(is_separate)
     self._update_fw_area_lbl()
 
+  def _update_hedef_bolge_lbl(self):
+    """Tahmini hedef bölgelerinin köşe sayılarını göster."""
+    parcalar = []
+    for ad, lst in (("Kırmızı", self._red_area_wps), ("Mavi", self._blue_area_wps)):
+      if not lst:
+        continue
+      n = len(lst)
+      parcalar.append(f"{ad}: {n} köşe" + ("" if n >= 3 else " (en az 3 gerekir)"))
+    if not parcalar:
+      self._hedef_bolge_lbl.setText(
+          "Tahmini hedef bölgesi: işaretlenmedi (opsiyonel — işaretlenirse arama "
+          "o bölgeye daraltılır, işaretlenmezse tüm alan taranır).")
+    else:
+      self._hedef_bolge_lbl.setText(
+          "Tahmini hedef bölgesi — " + "  ·  ".join(parcalar)
+          + ".  Bu bir ipucudur: hedef yine görüntü işleme ile doğrulanır.")
+
   def _update_fw_area_lbl(self):
     n = len(self._fw_wps)
     ok = "✓" if n >= 3 else "⚠"
@@ -2144,6 +2186,14 @@ class TargetDropMissionTab(_BaseMissionTab):
       self._fw_wps.append({"lat": lat, "lon": lon})
       self._map.draw_circle(lat, lon, 3, _MAP_FW_AREA_COLOR)
       self._update_fw_area_lbl()
+    elif t == self._SEL_RED_AREA:
+      self._red_area_wps.append({"lat": lat, "lon": lon})
+      self._map.draw_circle(lat, lon, 3, _MAP_RED_AREA_COLOR)
+      self._update_hedef_bolge_lbl()
+    elif t == self._SEL_BLUE_AREA:
+      self._blue_area_wps.append({"lat": lat, "lon": lon})
+      self._map.draw_circle(lat, lon, 3, _MAP_BLUE_AREA_COLOR)
+      self._update_hedef_bolge_lbl()
     else:
       super()._add_wp(lat, lon)
 
@@ -2284,6 +2334,38 @@ class TargetDropMissionTab(_BaseMissionTab):
       # DEĞİL, yalnızca YKİ haritasında ve companion loglarında görünürlük
       # sağlar (bkz. Task2Tuning._SEPARATE_LAYOUT_PRESET NEDEN).
       params["fixed_wing_area"] = list(self._fw_wps)
+
+    # ── TAHMİNİ HEDEF BÖLGELERİ (opsiyonel) ───────────────────────────────
+    # Yalnızca >= 3 köşe işaretlenmiş renkler gönderilir; eksik işaretleme
+    # sessizce YOK SAYILMAZ, operatöre söylenir.
+    #
+    # NE YAPAR / NE YAPMAZ (İHA tarafı: missions/teknofest_task2._region_scan)
+    #   YAPAR : aramanın NEREYE bakacağını daraltır; deseni ve irtifayı bölge
+    #           boyutundan türetir (missions/task2/search_plan.py).
+    #   YAPMAZ: hiçbir kapıyı atlamaz. Tespit yine görüntü işleme ile yapılır,
+    #           geofence + şekil kapısı + bırakma kimlik kapısı aynen uygulanır.
+    #           Bölge boş çıkarsa negatif bölge YAZILMAZ.
+    _bolgeler = {}
+    _eksik = []
+    for _renk, _lst, _ad in (("red", self._red_area_wps, "Kırmızı"),
+                             ("blue", self._blue_area_wps, "Mavi")):
+      if not _lst:
+        continue
+      if len(_lst) < 3:
+        _eksik.append(f"{_ad} ({len(_lst)} köşe)")
+        continue
+      _bolgeler[_renk] = list(_lst)
+    if _eksik:
+      QMessageBox.warning(
+        self, "Tahmini Hedef Bölgesi Eksik",
+        "Şu bölge(ler) için 3'ten az köşe işaretlendi ve GÖNDERİLMEYECEK:\n  "
+        + ", ".join(_eksik) +
+        "\n\nYa en az 3 köşe işaretleyin ya da işaretleri temizleyin. "
+        "Bölge gönderilmezse o renk için TÜM ALAN taranır (görev yine çalışır, "
+        "yalnızca daha uzun sürer)."
+      )
+    if _bolgeler:
+      params["target_areas"] = _bolgeler
 
     self.mission_ready_to_send.emit(params, [])
     # BUG FIX: _poll_timer bu sınıfta tanımlı değildi → AttributeError kaldırıldı
