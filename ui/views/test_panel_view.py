@@ -395,6 +395,7 @@ class TestPanelView(QWidget):
         self._log = QTextEdit()
         self._log.setReadOnly(True)
         self._log.setMaximumHeight(140)
+        self._log.document().setMaximumBlockCount(500)   # sınırsız büyümeyi engelle
         self._apply_log_style()
         log_lay.addWidget(self._log)
 

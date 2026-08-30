@@ -215,6 +215,7 @@ class IHATestPanelView(QWidget):
         self._output = QTextEdit()
         self._output.setReadOnly(True)
         self._output.setFont(QFont("Courier New", 10))
+        self._output.document().setMaximumBlockCount(500)   # sınırsız büyümeyi engelle
         right_layout.addWidget(self._output)
 
         # Hızlı butonlar (tek test)

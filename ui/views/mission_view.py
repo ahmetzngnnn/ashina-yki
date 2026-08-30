@@ -153,6 +153,27 @@ _POSITIONAL_CMDS = {16, 17, 18, 19, 20, 21, 22, 82}
 # Varsayilan yükseklik
 _DEFAULT_ALT = 30.0
 
+# Manuel eklemede _alt_spin.setRange(1, 500) ile uygulanan sinir — dosyadan/
+# FC'den gelen waypoint'ler icin de AYNI sinir burada uygulanir (bkz. _clamp_alt).
+_ALT_MIN = 1.0
+_ALT_MAX = 500.0
+
+
+def _clamp_alt(alt: float, context: str = "") -> float:
+    """Waypoint irtifasini 1-500 m araligina kirpar (manuel eklemede _alt_spin
+    ile uygulanan sinirla TUTARLI). Dosyadan/FC'den gelen alt degerleri bu
+    kontrolden gecmeden dogrudan FC'ye yazilmamali. Araliğin disindaysa loglar.
+    """
+    if alt < _ALT_MIN or alt > _ALT_MAX:
+        clamped = max(_ALT_MIN, min(_ALT_MAX, alt))
+        logger.warning(
+            "Waypoint irtifasi %.2f m izin verilen araligin (%.0f-%.0f m) disinda%s; "
+            "%.2f m'ye kirpildi.",
+            alt, _ALT_MIN, _ALT_MAX, f" ({context})" if context else "", clamped,
+        )
+        return clamped
+    return alt
+
 
 # ── Mission Planner / QGC WPL 110 dosya format (.waypoints) ─────────────────
 def _parse_qgc_wpl(text: str) -> tuple[list[dict], int, tuple[float, float] | None]:
@@ -240,7 +261,26 @@ class MissionPlanView(QWidget):
         self._poll_timer.setInterval(400)
         self._poll_timer.timeout.connect(self._poll_js)
         self._build_ui()
-        self._poll_timer.start()
+        # NEDEN isVisible() kontrolü: sekme henüz görünür değilse (main_window
+        # bu sekmeyi ilk sekme olarak açmadıysa) polling'i BAŞLATMA — showEvent
+        # zaten görünür olunca başlatacak (bkz. showEvent/hideEvent altında).
+        if self.isVisible():
+            self._poll_timer.start()
+
+    def showEvent(self, event) -> None:
+        # Sekme (main_window._tabs) tekrar görünür olunca polling'i devam
+        # ettir. NEDEN: main_window._dispatch_telemetry'deki "yalnızca aktif
+        # sekme" ilkesiyle AYNI motivasyon — gizli sekmede 400 ms'de bir
+        # runJavaScript çağırmak gereksiz CPU/JS köprüsü yükü yaratıyordu.
+        super().showEvent(event)
+        if not self._poll_timer.isActive():
+            self._poll_timer.start()
+
+    def hideEvent(self, event) -> None:
+        # Sekme gizlenince polling'i durdur — bkz. showEvent.
+        super().hideEvent(event)
+        if self._poll_timer.isActive():
+            self._poll_timer.stop()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -613,7 +653,10 @@ class MissionPlanView(QWidget):
                 for wp in data:
                     self._add_waypoint(float(wp["lat"]), float(wp["lon"]))
                     if self._waypoints:
-                        self._waypoints[-1]["alt"]    = float(wp.get("alt", _DEFAULT_ALT))
+                        idx = self._waypoints[-1].get("idx")
+                        self._waypoints[-1]["alt"]    = _clamp_alt(
+                            float(wp.get("alt", _DEFAULT_ALT)), f"JSON WP#{idx}"
+                        )
                         self._waypoints[-1]["cmd_id"] = int(wp.get("cmd_id", 16))
                         self._waypoints[-1]["delay"]  = float(wp.get("delay", 0))
                 self._refresh_table()
@@ -630,7 +673,8 @@ class MissionPlanView(QWidget):
                 for wp in waypoints:
                     self._add_waypoint(wp["lat"], wp["lon"])
                     if self._waypoints:
-                        self._waypoints[-1]["alt"]    = wp["alt"]
+                        idx = self._waypoints[-1].get("idx")
+                        self._waypoints[-1]["alt"]    = _clamp_alt(wp["alt"], f"WPL WP#{idx}")
                         self._waypoints[-1]["cmd_id"] = wp["cmd_id"]
                         self._waypoints[-1]["delay"]  = wp["delay"]
                 self._refresh_table()
@@ -646,6 +690,28 @@ class MissionPlanView(QWidget):
     def _write_to_drone(self) -> None:
         if not self._waypoints:
             QMessageBox.information(self, "Bilgi", "Waypoint listesi bos.")
+            return
+        # Son savunma hatti: kaynagi ne olursa olsun (harita/dosya/FC-okuma)
+        # FC'ye yazilmadan hemen once TUM waypoint'lerin irtifasi 1-500 m
+        # araligina kirpilir — manuel eklemede _alt_spin ile uygulanan sinirla
+        # TUTARLI (bkz. _clamp_alt).
+        for wp in self._waypoints:
+            wp["alt"] = _clamp_alt(wp.get("alt", _DEFAULT_ALT), f"WP#{wp.get('idx', '?')}")
+        # NEDEN onay: Görev FC'ye yazilinca arac otonom modda bu noktalari
+        # ucacak; yanlis/eksik/kirpilmis bir görevin sessizce yazilmasi ciddi
+        # sonuç doğurabilir. Aynı desen top_bar.py._on_drop_click /
+        # tuning_view.py._apply_pid.
+        reply = QMessageBox.question(
+            self, "Görevi FC'ye Yaz",
+            f"{len(self._waypoints)} waypoint içeren görev uçuş kontrolcüsüne (FC) "
+            "YAZILACAK.\n\n"
+            "Görev listesini (nokta sayısı, irtifalar, sıralama) gözden geçirdiğinizi "
+            "doğrulayın.\n\n"
+            "Onaylıyor musunuz?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
             return
         self.write_mission.emit({}, self._waypoints)
 
@@ -671,6 +737,9 @@ class MissionPlanView(QWidget):
                 continue
             self._add_waypoint(lat, lon)
             if self._waypoints:
-                self._waypoints[-1]["alt"]    = float(item.get("alt", _DEFAULT_ALT))
+                idx = self._waypoints[-1].get("idx")
+                self._waypoints[-1]["alt"]    = _clamp_alt(
+                    float(item.get("alt", _DEFAULT_ALT)), f"FC WP#{idx}"
+                )
                 self._waypoints[-1]["cmd_id"] = int(item.get("cmd_id", 16))
         self._refresh_table()

@@ -350,6 +350,9 @@ class SystemLogView(QWidget):
         if not username or not password:
             QMessageBox.warning(self, "Uyarı", "Kullanıcı adı ve şifre gerekli.")
             return
+        if len(password) < 8:
+            QMessageBox.warning(self, "Uyarı", "Şifre en az 8 karakter olmalı.")
+            return
         try:
             local_storage.add_user(self._db_conn, username, hash_password(password), role)
             self._new_username.clear()

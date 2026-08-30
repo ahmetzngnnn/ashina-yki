@@ -16,6 +16,14 @@ import logging
 import multiprocessing
 from pathlib import Path
 
+# NVIDIA PRIME render-offload (__NV_PRIME_RENDER_OFFLOAD/__GLX_VENDOR_LIBRARY_NAME,
+# hibrit-grafik makinelerde Gazebo GPU render'ı için ~/.bashrc'ye kalıcı eklenmiş
+# olabilir) QtWebEngine'in ANGLE/EGL başlatmasını bozuyor ("Invalid visual ID
+# requested", çökme) — PyQt6 import edilmeden ÖNCE, ortamdan ne gelirse gelsin
+# temizleniyor.
+os.environ.pop("__NV_PRIME_RENDER_OFFLOAD", None)
+os.environ.pop("__GLX_VENDOR_LIBRARY_NAME", None)
+
 # Yazılabilir uygulama veri klasörü (platforma göre — Win:%APPDATA%, Linux:XDG)
 from core.apppaths import app_data_dir
 _APP_DATA_DIR = app_data_dir()

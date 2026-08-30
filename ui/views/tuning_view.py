@@ -355,7 +355,24 @@ class TuningView(QWidget):
         action_idx = self._fs_action.currentIndex()
         # FS_THR_ENABLE: 1=Land, 2=RTL
         fs_mode = 2 if action_idx == 0 else 1
-        self.set_param.emit("FS_THR_ENABLE", float(fs_mode))
         radius = self._geofence_radius.value()
+
+        # NEDEN onay: Failsafe/GeoFence parametrelerini değiştirmek, bağlantı
+        # koptuğunda veya araç sınırı aştığında aracın NE yapacağını belirler —
+        # yanlış bir değer acil durumda beklenmeyen davranışa yol açabilir.
+        # Aynı desen _write_all_pids'te kullanılıyor.
+        reply = QMessageBox.warning(
+            self, "Failsafe/GeoFence Değişikliği Onayı",
+            "Failsafe ve GeoFence parametrelerini değiştirmek, bağlantı kopması "
+            "veya sınır aşımı gibi acil durumlarda aracın davranışını etkiler.\n\n"
+            f"  • Bağlantı Kopunca: {self._fs_action.currentText()}\n"
+            f"  • GeoFence Yarıçapı: {radius:.0f} m\n\n"
+            "Devam etmek istediğinize emin misiniz?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.set_param.emit("FS_THR_ENABLE", float(fs_mode))
         self.set_param.emit("FENCE_RADIUS", radius)
         logger.info("Failsafe uygulandı: mode=%s, fence=%s", fs_mode, radius)

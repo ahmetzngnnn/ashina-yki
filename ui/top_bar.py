@@ -45,6 +45,24 @@ def _stable_serial_path(device: str) -> str:
         pass
     return device
 
+
+# RFD900(A) telemetri radyoları bu istasyonda Silicon Labs CP2102 USB-UART
+# köprüsü üzerinden bağlanıyor (VID 0x10C4 — üreticiden bağımsız, sürücü/
+# işletim sistemine göre değişmeyen donanımsal kimlik; açıklama METNİ
+# yedek/ikincil işaret olarak da kontrol edilir çünkü bazı sürücüler VID'i
+# raporlamayabilir).
+_RFD_USB_VID = 0x10C4
+
+
+def _looks_like_rfd(p) -> bool:
+    """Port nesnesi (serial.tools.list_ports ComListPortInfo) bir RFD900(A)
+    telemetri radyosuna (CP2102 köprüsü) mi ait görünüyor?"""
+    if getattr(p, "vid", None) == _RFD_USB_VID:
+        return True
+    text = f"{p.description or ''} {getattr(p, 'manufacturer', '') or ''}".lower()
+    return "cp210" in text or "silicon lab" in text
+
+
 HEARTBEAT_TIMEOUT_SECS = 3
 
 
@@ -153,8 +171,12 @@ class TopBar(QWidget):
 
         # Baudrate seçici (yalnızca Serial modunda görünür)
         self._baud_combo = QComboBox()
-        self._baud_combo.addItems(["57600", "115200", "9600", "19200", "38400", "230400"])
-        self._baud_combo.setCurrentText("57600")
+        # 2026-08-26: varsayılan 115200'e çekildi — sahadaki iki RFD900A
+        # telemetri radyosu da bu hızda (kullanıcı onayı). 57600 liste başında
+        # kalmaya devam ediyor (bazı Cube/Pixhawk USB bağlantıları hâlâ bunu
+        # kullanabilir), yalnızca İLK seçili değer değişti.
+        self._baud_combo.addItems(["115200", "57600", "9600", "19200", "38400", "230400"])
+        self._baud_combo.setCurrentText("115200")
         self._baud_combo.setMinimumWidth(90)
         self._baud_combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self._baud_combo.setToolTip("Baudrate")
@@ -189,7 +211,7 @@ class TopBar(QWidget):
         self._rpi_addr = QComboBox()
         self._rpi_addr.setEditable(True)
         self._rpi_addr.addItems([
-            "192.168.1.10:5602",     # Companion (RPi) — kanonik (bkz. gcs_config)
+            "192.168.1.229:5602",    # Companion (RPi) — kanonik (bkz. gcs_config)
             "127.0.0.1:5602",        # Localhost (sim)
         ])
         self._rpi_addr.setMinimumWidth(180)
@@ -696,7 +718,7 @@ class TopBar(QWidget):
         elif typ == "tcp":
             # Otomatik önerilen portlar
             self._conn_addr.addItems([
-                "192.168.1.10:5763",     # RPi MAVLink — kanonik (bkz. gcs_config)
+                "192.168.1.229:5763",    # RPi MAVLink — kanonik (bkz. gcs_config)
                 "127.0.0.1:5763",        # SITL / laptop sim (tcpin:5763)
                 "127.0.0.1:5762",
             ])
@@ -726,9 +748,14 @@ class TopBar(QWidget):
         else:
             ports = []
         if ports:
-            # USB seri adaptörleri (RFD telemetri vb., VID/PID'i olan cihazlar)
-            # dahili UART portlarından (ör. ttyAMA*) önce listelenir.
-            for p in sorted(ports, key=lambda x: (x.vid is None, x.device)):
+            # Sıralama önceliği: (1) RFD900(A) telemetri radyosu — bu istasyonda
+            # ASIL bağlanılacak cihaz OLMASI beklenen, ilk sırada/varsayılan
+            # seçili gelsin diye; (2) diğer USB seri adaptörleri (VID/PID'i
+            # olan cihazlar — F9P, anten Pixhawk'ı vb.); (3) dahili UART
+            # portları (ör. ttyAMA*). QComboBox listedeki İLK öğeyi otomatik
+            # seçili gösterdiğinden, bu sıralama aynı zamanda "varsayılan
+            # bağlantı hedefi RFD olsun" isteğini de karşılar.
+            for p in sorted(ports, key=lambda x: (0 if _looks_like_rfd(x) else (1 if x.vid is not None else 2), x.device)):
                 desc = (p.description or "").strip()
                 # Bazı sürücüler açıklamada zaten cihaz adını içerir
                 if desc and desc.lower() not in ("n/a", p.device.lower()):

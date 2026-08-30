@@ -17,11 +17,41 @@ from PyQt6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame,
     QSizePolicy, QPushButton, QTextEdit, QSpinBox, QDoubleSpinBox,
     QGroupBox, QGridLayout, QDialog, QComboBox, QLineEdit,
-    QDialogButtonBox, QFormLayout, QMenu, QTabWidget, QSlider, QScrollArea, QProgressBar
+    QDialogButtonBox, QFormLayout, QMenu, QTabWidget, QSlider, QScrollArea, QProgressBar,
+    QCheckBox
 )
 
 from core import theme
 from core.gcs_config import config
+
+
+# ── RTK GPS yorumlama tablosu ─────────────────────────────────────────────────
+# NEDEN: HDOP/PDOP/VDOP ham sayı olarak operatöre bir şey ifade etmiyor —
+# GNSS camiasında standart kabul gören eşikler burada (bkz. u-blox/Trimble DOP
+# tabloları). Fix kalitesi + DOP birlikte TEK bir "genel değerlendirme"
+# cümlesine indirgenir. (Eskiden ui/views/antenna_tracker_view.py'deydi —
+# 2026-08-28 anten takip sistemi kaldırılınca buraya taşındı, RTK paneli
+# antenna tracker'dan bağımsız.)
+def _dop_rating(dop: float) -> tuple[str, str]:
+    """DOP değerini (İyi/Orta/...) + tema rengi anahtarına çevirir."""
+    if dop < 1.0:  return "İdeal", "success"
+    if dop < 2.0:  return "Mükemmel", "success"
+    if dop < 5.0:  return "İyi", "accent"
+    if dop < 10.0: return "Orta", "warning"
+    if dop < 20.0: return "Zayıf", "danger"
+    return "Kullanılamaz", "danger"
+
+
+# fix_quality kodu -> (etiket, tema rengi, yaklaşık hassasiyet açıklaması)
+_RTK_FIX_VERDICT: dict[str, tuple[str, str, str]] = {
+    "0": ("Konum yok",      "danger",  "fix alınamıyor — uydu görüşünü kontrol edin"),
+    "1": ("Sıradan GPS",    "warning", "~1-3 m hassasiyet — hassas görev için yetersiz"),
+    "2": ("DGPS",           "accent",  "~1 m hassasiyet"),
+    "3": ("PPS",            "accent",  "askeri/hassas kod"),
+    "4": ("RTK FIXED",      "success", "~1-2 cm hassasiyet — en iyi durum"),
+    "5": ("RTK FLOAT",      "accent",  "~10-50 cm — düzeltme var, henüz sabitlenmedi"),
+    "6": ("Dead Reckoning", "warning", "uydu kaybı — atalet tahmini kullanılıyor"),
+}
 
 try:
     from ui.widgets.tof_widget import TofWidget
@@ -113,11 +143,15 @@ function makeDroneIcon(hdg){
   return L.divIcon({html:svg,iconSize:[44,44],iconAnchor:[22,22],className:'drone-icon'});
 }
 var homeIcon = L.divIcon({html:'<div style="background:#4ade80;color:#000;font-weight:bold;font-size:10px;padding:1px 4px;border-radius:3px;">H</div>',iconSize:[20,16],iconAnchor:[10,8],className:''});
+var stationIcon = L.divIcon({html:'<div style="background:#38bdf8;color:#00232e;font-weight:bold;font-size:10px;padding:1px 5px;border-radius:3px;border:1px solid #0369a1;">📡 RTK</div>',iconSize:[52,18],iconAnchor:[26,9],className:''});
 
 var drone = L.marker([39.925,32.866],{icon:makeDroneIcon(0)}).addTo(map);
 var trail = []; var trailLine = L.polyline([],{color:'#4ade80',weight:2,opacity:0.8}).addTo(map);
 var homeSet = false; var homeMarker = null;
 var isFirstFix = true;
+// İstasyon (RTK GPS) konumu — İHA'dan BAĞIMSIZ, kendi ilk fix'inde bir kez
+// yerleştirilir ve o andan sonra sabit kalır (yer istasyonu hareket etmez).
+var stationMarker = null; var stationSet = false;
 
 function updateDrone(lat,lon,hdg){
   drone.setLatLng([lat,lon]);
@@ -129,6 +163,16 @@ function updateDrone(lat,lon,hdg){
   if(isFirstFix){
     map.setView([lat,lon], 18);
     isFirstFix = false;
+  }
+}
+function updateStation(lat,lon){
+  if(!stationSet){
+    stationMarker=L.marker([lat,lon],{icon:stationIcon}).addTo(map);
+    stationSet=true;
+    // İHA henüz bağlı değilse harita ilk RTK fix'ine ortalansın.
+    if(isFirstFix){ map.setView([lat,lon], 17); }
+  } else {
+    stationMarker.setLatLng([lat,lon]);
   }
 }
 function clearTrail(){
@@ -761,6 +805,7 @@ class MapWidget(QWidget):
         self._has_web = False
         self._map_ready = False
         self._pending: tuple | None = None   # (lat, lon, hdg) — sayfa hazır olunca gönderilir
+        self._pending_station: tuple | None = None   # (lat, lon) — istasyon konumu
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         if WEBENGINE_AVAILABLE:
@@ -779,7 +824,12 @@ class MapWidget(QWidget):
             layout.addWidget(self._web)
             # loadFinished'ı load'dan ÖNCE bağla
             self._web.loadFinished.connect(self._on_load_finished)
-            self._load_map()
+            # NEDEN ertelenmiş: setHtml() ilk kez çağrıldığında WebEngine motoru
+            # (Chromium alt süreci) devreye girer — Pi'de bu ~1-2s sürüyor ve
+            # ana pencere DAHA GÖRÜNMEDEN (MainWindow.__init__ içinde, _build_ui
+            # sırasında) bu maliyeti üstleniyordu. singleShot ile pencere
+            # zaten ekrandayken (event loop döndükten sonra) yüklenir.
+            QTimer.singleShot(200, self._load_map)
             self._has_web = True
         else:
             lbl = QLabel("Harita: PyQt6-WebEngine kurulu degil")
@@ -799,11 +849,20 @@ class MapWidget(QWidget):
             lat, lon, hdg = self._pending
             self._pending = None
             self._run_js(lat, lon, hdg)
+        if ok and self._pending_station is not None:
+            lat, lon = self._pending_station
+            self._pending_station = None
+            self._run_station_js(lat, lon)
 
     def _run_js(self, lat: float, lon: float, hdg: float) -> None:
         page = self._web.page()
         if page is not None:
             page.runJavaScript(f"updateDrone({lat},{lon},{hdg:.1f})")
+
+    def _run_station_js(self, lat: float, lon: float) -> None:
+        page = self._web.page()
+        if page is not None:
+            page.runJavaScript(f"updateStation({lat},{lon})")
 
     def update_position(self, lat: float, lon: float, hdg: float = 0.0) -> None:
         if not self._has_web:
@@ -812,6 +871,15 @@ class MapWidget(QWidget):
             self._pending = (lat, lon, hdg)   # yüklenince gönder
             return
         self._run_js(lat, lon, hdg)
+
+    def update_station(self, lat: float, lon: float) -> None:
+        """Yer istasyonu (RTK GPS) konumu — İHA'dan bağımsız, ayrı işaretçi."""
+        if not self._has_web:
+            return
+        if not self._map_ready:
+            self._pending_station = (lat, lon)
+            return
+        self._run_station_js(lat, lon)
 
 
 # ── Dashboard Görünümü ────────────────────────────────────────────────────────
@@ -970,7 +1038,7 @@ class DashboardView(QWidget):
     ned_velocity_cmd  = pyqtSignal(float, float, float)   # vx, vy, vz m/s
     video_source_changed = pyqtSignal(str)   # → video_worker.set_source
     speak_requested   = pyqtSignal(str)      # sesli otopilot → TTS worker
-    send_servo_action = pyqtSignal(str, str, int) # target, state, angle
+    send_servo_action = pyqtSignal(str, str, int, bool) # target, state, angle, hold_torque
 
     # NEDEN: Tespit kartları sınırsız birikip bellek/layout yükü yaratıyordu.
     _MAX_AI_CARDS = 50   # ekranda tutulacak en yeni tespit kartı sayısı
@@ -984,6 +1052,9 @@ class DashboardView(QWidget):
         self._last_roadmap_statuses = None
         # Fix: gimbal debounce — son gönderilen açı (tekrar komut göndermemek için)
         self._last_gimbal_sent = None
+        # Kırmızı/mavi manuel PWM slider debounce'u — son gönderilen değerler
+        self._last_red_drop_pwm_sent = None
+        self._last_blue_drop_pwm_sent = None
         # Fix: sağlık göstergeleri gerçek veri gelene kadar "—" gösterir
         self._hw_seen = {"ping": False, "rssi": False, "loss": False,
                          "cpu": False, "ram": False, "temp": False}
@@ -1084,6 +1155,30 @@ class DashboardView(QWidget):
         self._quick_data = QuickDataWidget()
         qdl.addWidget(self._quick_data)
         ll.addWidget(qd_grp)
+
+        # RTK GPS (F9P) — kompakt özet, ayrıntılı panel "Anten Takip" sekmesinde.
+        rtk_grp = QGroupBox("RTK GPS")
+        rtk_form = QFormLayout(rtk_grp)
+        rtk_form.setContentsMargins(6, 6, 6, 6)
+        rtk_form.setSpacing(2)
+        self._rtk_lbl_conn2 = QLabel("● bağlı değil")
+        self._rtk_lbl_conn2.setStyleSheet(f"color:{theme.c('text_muted')};")
+        rtk_form.addRow(self._rtk_lbl_conn2)
+        self._rtk_lbl_verdict2 = QLabel("—")
+        self._rtk_lbl_verdict2.setWordWrap(True)
+        _rf = self._rtk_lbl_verdict2.font(); _rf.setBold(True); self._rtk_lbl_verdict2.setFont(_rf)
+        rtk_form.addRow(self._rtk_lbl_verdict2)
+        self._rtk_lbl_pos2 = QLabel("—")
+        self._rtk_lbl_pos2.setObjectName("monoLabel")
+        rtk_form.addRow("Konum:", self._rtk_lbl_pos2)
+        # NTRIP (TUSAGA-Aktif vb.) düzeltme kaynağı durumu — F9P'nin kendi
+        # NMEA fix'inden AYRI: bu, İHA'ya giden RTCM'in NEREDEN geldiğini
+        # gösterir (2026-08-28, kullanıcı talebi — NTRIP entegrasyonuyla
+        # birlikte eklendi, bkz. main_window._on_start_ntrip).
+        self._ntrip_lbl_status = QLabel("NTRIP: ● bağlı değil")
+        self._ntrip_lbl_status.setStyleSheet(f"color:{theme.c('text_muted')};")
+        rtk_form.addRow(self._ntrip_lbl_status)
+        ll.addWidget(rtk_grp)
 
         # Hizli Komutlar (grup + buton stilleri global QSS'ten — şartname §0)
         cmd_grp = QGroupBox("Hızlı Komutlar")
@@ -1266,16 +1361,16 @@ class DashboardView(QWidget):
         # 1. Kırmızı Yük
         lbl_red = QLabel("Kırmızı Yük:")
         lbl_red.setObjectName("mutedLabel")
-        btn_drop_red_open = QPushButton("Aç")
+        btn_drop_red_open = QPushButton("Yük Bırak")
         btn_drop_red_open.setObjectName("dangerButton")
-        btn_drop_red_close = QPushButton("Kapat")   # nötr — global QSS
+        btn_drop_red_close = QPushButton("Yük Al")   # nötr — global QSS
         
         # 2. Mavi Yük
         lbl_blue = QLabel("Mavi Yük:")
         lbl_blue.setObjectName("mutedLabel")
-        btn_drop_blue_open = QPushButton("Aç")
+        btn_drop_blue_open = QPushButton("Yük Bırak")
         btn_drop_blue_open.setObjectName("primaryButton")
-        btn_drop_blue_close = QPushButton("Kapat")   # nötr — global QSS
+        btn_drop_blue_close = QPushButton("Yük Al")   # nötr — global QSS
         
         # 3. Yük Alma Kapakları
         lbl_grab = QLabel("Yük Kapak:")
@@ -1283,26 +1378,84 @@ class DashboardView(QWidget):
         btn_grab_open = QPushButton("Aç")
         btn_grab_open.setObjectName("successButton")
         btn_grab_close = QPushButton("Kapat")   # nötr — global QSS
-        
+
+        # 1b/2b. Manuel PWM slider'ları — yük ELLE takılırken/çıkarılırken
+        # Aç/Yük Al'ın tek seferlik SIÇRAMASI (pwm_open<->pwm_close) yerine
+        # kademeli, gözle takip edilebilir hareket sağlar (kullanıcı talebi,
+        # 2026-08-27: ani sıçrama mekanizmayı/yükü zorluyor/kırıyordu).
+        # NEDEN state tracking'i BOZMAZ: bu yol companion'da _state_*'i
+        # GÜNCELLEMEZ (bkz. ServoController.set_drop_pwm_raw) — yükleme
+        # bittiğinde operatör hâlâ "Yük Al" butonuna basmalı; o buton hem
+        # servoyu TAM pwm_close'a taşır (slider'ın bıraktığı ara PWM'den
+        # değil) hem de sisteme "yük yüklendi" durumunu resmen kaydeder.
+        lbl_red_manual = QLabel("Kırmızı Manuel:")
+        lbl_red_manual.setObjectName("mutedLabel")
+        self.red_drop_slider = QSlider(Qt.Orientation.Horizontal)
+        self.red_drop_slider.setRange(200, 2000)
+        self.red_drop_slider.setValue(1500)
+        self.lbl_red_drop_pwm_val = QLabel("1500 µs")
+        self.lbl_red_drop_pwm_val.setStyleSheet(self._gimbal_val_css())
+
+        lbl_blue_manual = QLabel("Mavi Manuel:")
+        lbl_blue_manual.setObjectName("mutedLabel")
+        self.blue_drop_slider = QSlider(Qt.Orientation.Horizontal)
+        self.blue_drop_slider.setRange(200, 2000)
+        self.blue_drop_slider.setValue(1500)
+        self.lbl_blue_drop_pwm_val = QLabel("1500 µs")
+        self.lbl_blue_drop_pwm_val.setStyleSheet(self._gimbal_val_css())
+
+        # 3b. Minimal tutma torku seçeneği — kavrayıcı sürekli-dönüş servosu
+        # limit switch'e ulaştıktan sonra nötr (pwm_stop) bırakılırsa hiçbir
+        # tutma kuvveti kalmaz; gözlemlenen kullanıcı arızası: kapak açıkken
+        # kendiliğinden yavaşça kapalı konuma sürüklendi. İşaretlenirse hem
+        # açık hem kapalı uçta çok küçük bir PWM sapması (config.json
+        # grabber_switches.hold_torque_pwm_delta) limit switch'e karşı
+        # sürdürülür — varsayılan KAPALI (opt-in, sürekli enerjilenmiş motor
+        # istenmeyen bir durumdur, operatör bilerek açmalı).
+        lbl_hold = QLabel("Tutma Torku:")
+        lbl_hold.setObjectName("mutedLabel")
+        self.chk_grab_hold_torque = QCheckBox("Minimal tutma torku (açık/kapalı)")
+
         # 4. Gimbal
-        lbl_gimbal = QLabel("Gimbal Açısı:")
+        # NEDEN 15-90/varsayılan 90 (2026-08-27, saha testiyle güncellendi):
+        # aralık artık companion hardware/servo_controller.py'deki GERÇEK
+        # nominal sınırlarla (GIMBAL_NOMINAL_MIN=15, GIMBAL_NOMINAL_MAX=90)
+        # birebir eşleşiyor — eski 30-90 aralığı bu servonun (EMAX ES3252)
+        # gerçek fiziksel/yazılımsal limitlerini yansıtmıyordu. 90°=NADİR
+        # (yere dik) — gimbal artık açılışta otomatik bu konuma gidiyor
+        # (bkz. main.py _home_servos_on_startup), slider varsayılanı da
+        # gerçek başlangıç durumuyla eşleşsin diye 90'da başlıyor.
+        lbl_gimbal = QLabel("Gimbal Açısı (90°=Nadir/Yere Dik):")
         lbl_gimbal.setObjectName("mutedLabel")
         self.gimbal_slider = QSlider(Qt.Orientation.Horizontal)
-        self.gimbal_slider.setRange(30, 90)
-        self.gimbal_slider.setValue(60)
+        self.gimbal_slider.setRange(15, 90)
+        self.gimbal_slider.setValue(90)
         # Küçük accent değer — valueLabel (18px) bu ızgara satırına sığmıyor,
         # bu yüzden satır-içi kalıyor ama rengi tema token'ından geliyor.
-        self.lbl_gimbal_val = QLabel("60°")
+        self.lbl_gimbal_val = QLabel("90°")
         self.lbl_gimbal_val.setStyleSheet(self._gimbal_val_css())
         
         # Sinyal bağlantıları
-        btn_drop_red_open.clicked.connect(lambda: self.send_servo_action.emit("red_drop", "open", 0))
-        btn_drop_red_close.clicked.connect(lambda: self.send_servo_action.emit("red_drop", "close", 0))
-        btn_drop_blue_open.clicked.connect(lambda: self.send_servo_action.emit("blue_drop", "open", 0))
-        btn_drop_blue_close.clicked.connect(lambda: self.send_servo_action.emit("blue_drop", "close", 0))
-        
-        btn_grab_open.clicked.connect(lambda: self.send_servo_action.emit("grabber", "open", 0))
-        btn_grab_close.clicked.connect(lambda: self.send_servo_action.emit("grabber", "close", 0))
+        # NEDEN onay ("Aç" butonları): yük bırakma/kapak açma GERİ ALINAMAZ —
+        # yanlış tıklama yükü havada, hedef dışında bırakır. "Kapat" onaysız
+        # kalır (zararsız/geri alınabilir). Aynı desen top_bar.py._on_drop_click.
+        btn_drop_red_open.clicked.connect(
+            lambda: self._confirm_and_emit_servo("red_drop", "open", 0, "Kırmızı Yük")
+        )
+        btn_drop_red_close.clicked.connect(lambda: self.send_servo_action.emit("red_drop", "close", 0, False))
+        btn_drop_blue_open.clicked.connect(
+            lambda: self._confirm_and_emit_servo("blue_drop", "open", 0, "Mavi Yük")
+        )
+        btn_drop_blue_close.clicked.connect(lambda: self.send_servo_action.emit("blue_drop", "close", 0, False))
+
+        btn_grab_open.clicked.connect(
+            lambda: self._confirm_and_emit_servo(
+                "grabber", "open", 0, "Yük Kapak", self.chk_grab_hold_torque.isChecked())
+        )
+        btn_grab_close.clicked.connect(
+            lambda: self.send_servo_action.emit(
+                "grabber", "close", 0, self.chk_grab_hold_torque.isChecked())
+        )
         # Etiket anlık güncellenir (ucuz, yerel)
         self.gimbal_slider.valueChanged.connect(lambda v: self.lbl_gimbal_val.setText(f"{v}°"))
         # NEDEN: valueChanged sürükleme boyunca her adımda tetikleniyordu → 30-90
@@ -1320,7 +1473,27 @@ class DashboardView(QWidget):
         self.gimbal_slider.valueChanged.connect(
             lambda _v: self._gimbal_debounce.start()
         )
-        
+
+        # Kırmızı/mavi manuel PWM slider'ları — gimbal ile AYNI debounce deseni
+        # (sliderReleased anında, klavye/tekerlek 250ms debounce sonrası).
+        self.red_drop_slider.valueChanged.connect(
+            lambda v: self.lbl_red_drop_pwm_val.setText(f"{v} µs"))
+        self.red_drop_slider.sliderReleased.connect(self._send_red_drop_pwm_cmd)
+        self._red_drop_debounce = QTimer(self)
+        self._red_drop_debounce.setSingleShot(True)
+        self._red_drop_debounce.setInterval(250)
+        self._red_drop_debounce.timeout.connect(self._send_red_drop_pwm_cmd)
+        self.red_drop_slider.valueChanged.connect(lambda _v: self._red_drop_debounce.start())
+
+        self.blue_drop_slider.valueChanged.connect(
+            lambda v: self.lbl_blue_drop_pwm_val.setText(f"{v} µs"))
+        self.blue_drop_slider.sliderReleased.connect(self._send_blue_drop_pwm_cmd)
+        self._blue_drop_debounce = QTimer(self)
+        self._blue_drop_debounce.setSingleShot(True)
+        self._blue_drop_debounce.setInterval(250)
+        self._blue_drop_debounce.timeout.connect(self._send_blue_drop_pwm_cmd)
+        self.blue_drop_slider.valueChanged.connect(lambda _v: self._blue_drop_debounce.start())
+
         # Sizing Policies to prevent cramping
         btn_height = 26   # dense grid buton yüksekliği ≥26 (şartname §3)
         for btn in [btn_drop_red_open, btn_drop_red_close, btn_drop_blue_open, btn_drop_blue_close, btn_grab_open, btn_grab_close]:
@@ -1339,11 +1512,22 @@ class DashboardView(QWidget):
         servo_lay.addWidget(lbl_grab, 2, 0)
         servo_lay.addWidget(btn_grab_open, 2, 1)
         servo_lay.addWidget(btn_grab_close, 2, 2)
-        
-        servo_lay.addWidget(lbl_gimbal, 3, 0)
-        servo_lay.addWidget(self.gimbal_slider, 3, 1)
-        servo_lay.addWidget(self.lbl_gimbal_val, 3, 2)
-        
+
+        servo_lay.addWidget(lbl_hold, 3, 0)
+        servo_lay.addWidget(self.chk_grab_hold_torque, 3, 1, 1, 2)
+
+        servo_lay.addWidget(lbl_gimbal, 4, 0)
+        servo_lay.addWidget(self.gimbal_slider, 4, 1)
+        servo_lay.addWidget(self.lbl_gimbal_val, 4, 2)
+
+        servo_lay.addWidget(lbl_red_manual, 5, 0)
+        servo_lay.addWidget(self.red_drop_slider, 5, 1)
+        servo_lay.addWidget(self.lbl_red_drop_pwm_val, 5, 2)
+
+        servo_lay.addWidget(lbl_blue_manual, 6, 0)
+        servo_lay.addWidget(self.blue_drop_slider, 6, 1)
+        servo_lay.addWidget(self.lbl_blue_drop_pwm_val, 6, 2)
+
         servo_lay.setColumnStretch(0, 3)
         servo_lay.setColumnStretch(1, 4)
         servo_lay.setColumnStretch(2, 4)
@@ -1580,6 +1764,25 @@ class DashboardView(QWidget):
             bar.setFormat(fmt)
         bar.setValue(int(value))
 
+    # ── Yük/kapak "Aç" onayı ────────────────────────────────────────────────
+    def _confirm_and_emit_servo(self, channel: str, action: str, value: int, label: str,
+                                 hold_torque: bool = False) -> None:
+        """Yük bırakma / kapak açma servo komutunu onay sonrası gönderir.
+
+        NEDEN: Bkz. top_bar.py._on_drop_click — "Aç" GERİ ALINAMAZ bir eylemdir.
+        """
+        from PyQt6.QtWidgets import QMessageBox
+        reply = QMessageBox.question(
+            self, f"{label}: Aç",
+            f"{label} ŞİMDİ açılacak. Bu işlem GERİ ALINAMAZ.\n\n"
+            "Aracın hedef üzerinde ve doğru irtifada olduğunu doğrulayın.\n\n"
+            "Onaylıyor musunuz?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.send_servo_action.emit(channel, action, value, hold_torque)
+
     # ── Gimbal komutu (debounce'lu) ────────────────────────────────────────
     def _send_gimbal_cmd(self) -> None:
         """Gimbal açısını TEK komut olarak gönderir.
@@ -1594,12 +1797,56 @@ class DashboardView(QWidget):
         if val == self._last_gimbal_sent:
             return   # aynı açı — gereksiz komut yok
         self._last_gimbal_sent = val
-        self.send_servo_action.emit("gimbal", "", val)
+        self.send_servo_action.emit("gimbal", "", val, False)
+
+    # ── Kırmızı/mavi yük bırakma manuel PWM (debounce'lu, gimbal ile aynı desen) ──
+    def _send_red_drop_pwm_cmd(self) -> None:
+        """Kırmızı yük bırakma servosunu slider'daki ARA PWM'e götürür.
+
+        NEDEN state="" gönderilir: ai_socket_worker.send_servo_command bunu
+        target=red_drop + boş state ile ayırt edip 'angle' alanını ham PWM
+        (µs) olarak companion'a iletir (bkz. o dosyadaki docstring) — normal
+        Aç/Yük Al butonlarının state="open"/"close" yolundan TAMAMEN AYRI.
+        """
+        if self.red_drop_slider.isSliderDown():
+            return
+        self._red_drop_debounce.stop()
+        val = int(self.red_drop_slider.value())
+        if val == self._last_red_drop_pwm_sent:
+            return
+        self._last_red_drop_pwm_sent = val
+        self.send_servo_action.emit("red_drop", "", val, False)
+
+    def _send_blue_drop_pwm_cmd(self) -> None:
+        """Mavi yük bırakma servosunu slider'daki ARA PWM'e götürür (bkz. yukarı)."""
+        if self.blue_drop_slider.isSliderDown():
+            return
+        self._blue_drop_debounce.stop()
+        val = int(self.blue_drop_slider.value())
+        if val == self._last_blue_drop_pwm_sent:
+            return
+        self._last_blue_drop_pwm_sent = val
+        self.send_servo_action.emit("blue_drop", "", val, False)
 
     # ── MAVLink komutlari ──────────────────────────────────────────────────
     def _arm(self, arm: bool) -> None:
         if _MV is None:
             return
+        if arm:
+            # NEDEN onay: ARM motorları çalıştırır — yanlış tıklama pervaneleri
+            # beklenmedik şekilde döndürebilir. DISARM (acil/güvenliği artıran)
+            # onaysız kalır; aynı desen top_bar.py._on_drop_click'te kullanılıyor.
+            from PyQt6.QtWidgets import QMessageBox
+            reply = QMessageBox.question(
+                self, "ARM Onayı",
+                "Drone ARM edilecek (motorlar çalışmaya hazır hale gelecek).\n\n"
+                "Çevrede kişi/engel olmadığını doğrulayın.\n\n"
+                "Onaylıyor musunuz?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         self.send_command.emit(
             _MV.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             [1 if arm else 0, 0, 0, 0, 0, 0, 0],
@@ -1607,6 +1854,19 @@ class DashboardView(QWidget):
 
     def _takeoff(self) -> None:
         if _MV is None:
+            return
+        # NEDEN onay: TAKEOFF GERİ ALINAMAZ bir uçuş komutudur — yanlış tıklama
+        # aracı beklenmedik anda havalandırır. Aynı desen top_bar.py._on_drop_click.
+        from PyQt6.QtWidgets import QMessageBox
+        reply = QMessageBox.question(
+            self, "TAKEOFF Onayı",
+            f"Drone {self._alt_spin.value()} m irtifaya kalkacak.\n\n"
+            "Aracın ARM olduğunu ve etrafın uçuşa uygun olduğunu doğrulayın.\n\n"
+            "Onaylıyor musunuz?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
             return
         self.send_command.emit(
             _MV.mavlink.MAV_CMD_NAV_TAKEOFF,
@@ -2136,6 +2396,47 @@ class DashboardView(QWidget):
             f"<span style='color:{c_dim}'>Mavi:</span>{bdr}"
             f"{fc_line}{mav_line}"
         )
+
+    # ── RTK GPS (F9P) — kompakt özet + harita istasyon işaretçisi ──────────────
+    @pyqtSlot(bool)
+    def rtk_connection_changed(self, connected: bool) -> None:
+        if connected:
+            self._rtk_lbl_conn2.setText("● bağlı")
+            self._rtk_lbl_conn2.setStyleSheet(f"color:{theme.c('success')};")
+        else:
+            self._rtk_lbl_conn2.setText("● bağlı değil")
+            self._rtk_lbl_conn2.setStyleSheet(f"color:{theme.c('text_muted')};")
+
+    @pyqtSlot(dict)
+    def rtk_status_updated(self, s: dict) -> None:
+        fix_code = s.get("fix_quality", "0")
+        etiket, renk, aciklama = _RTK_FIX_VERDICT.get(fix_code, ("Bilinmiyor", "text_muted", "—"))
+        hdop = s.get("hdop")
+        if hdop is not None:
+            dop_etk, _ = _dop_rating(hdop)
+            verdict = f"{etiket} ({aciklama})  ·  HDOP {hdop:.2f} {dop_etk.lower()}"
+        else:
+            verdict = f"{etiket} ({aciklama})"
+        self._rtk_lbl_verdict2.setText(verdict)
+        self._rtk_lbl_verdict2.setStyleSheet(f"color:{theme.c(renk)};")
+
+        lat, lon = s.get("lat"), s.get("lon")
+        if lat is not None and lon is not None:
+            self._rtk_lbl_pos2.setText(f"{lat:.6f}, {lon:.6f}")
+            # İstasyon konumu haritaya İHA'dan BAĞIMSIZ ayrı işaretçi olarak
+            # eklenir — İHA bağlanınca kendi drone/home işaretçisi ayrıca oluşur.
+            self._map.update_station(lat, lon)
+        else:
+            self._rtk_lbl_pos2.setText("—")
+
+    @pyqtSlot(bool)
+    def ntrip_connection_changed(self, connected: bool) -> None:
+        if connected:
+            self._ntrip_lbl_status.setText("NTRIP: ● bağlı")
+            self._ntrip_lbl_status.setStyleSheet(f"color:{theme.c('success')};")
+        else:
+            self._ntrip_lbl_status.setText("NTRIP: ● bağlı değil")
+            self._ntrip_lbl_status.setStyleSheet(f"color:{theme.c('text_muted')};")
 
     @pyqtSlot(QImage)
     def update_video(self, q_img: QImage) -> None:

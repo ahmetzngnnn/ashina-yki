@@ -37,6 +37,7 @@ from ui.views.system_log_view import SystemLogView
 from ui.views.flight_analysis_view import FlightAnalysisView
 from ui.views.settings_view import SettingsView
 from ui.views.iha_test_panel_view import IHATestPanelView
+from ui.views.saha_testi_view import SahaTestiView
 from core.telemetry_recorder import TelemetryRecorder
 
 logger = logging.getLogger(__name__)
@@ -85,7 +86,13 @@ class MainWindow(QMainWindow):
         # refresh_rbac (yalın _apply_rbac değil) → _last_rbac_role da damgalanır,
         # böylece ilk watchdog tick'i sahte bir "rol değişti" tespiti yapmaz.
         self.refresh_rbac()
-        self._start_workers()
+        # NEDEN ertelenmiş: _start_workers() gerçek bağlantılar açar (anten
+        # Pixhawk seri bağlantısı, RTK GPS, TTS motoru — ONNX model yükleme)
+        # ve bunlar gerçek zaman alır. Doğrudan çağrılırsa pencere app.exec()
+        # başlayana kadar hiç BOYANMAZ (main.py: showFullScreen() → app.exec()
+        # sırası) — kullanıcı ~18s boyunca hiçbir şey görmez. singleShot(0),
+        # ilk event loop turunda (pencere zaten çizildikten hemen sonra) çalışır.
+        QTimer.singleShot(0, self._start_workers)
 
         # Tema değişince satır içi yazılmış renkler bayat kalır — yeniden yazdır.
         theme.notifier().changed.connect(lambda _n: self._apply_theme_colors())
@@ -103,6 +110,18 @@ class MainWindow(QMainWindow):
     def _toggle_fullscreen(self) -> None:
         if self.isFullScreen():
             self.showNormal()
+            # Açılış splash'ı (splash_loading.py) hiç kendiliğinden kapanmaz
+            # (bkz. o dosyanın kendi notu) — YKİ zaten üstünde durduğu için
+            # normalde görünmez, ama operatör F11 ile masaüstüne inince
+            # ALTTA duran splash görünür olur. Gerçek masaüstünü görebilsin
+            # diye burada kapatılır; YKİ'yi tekrar F11 ile açmak yeterli,
+            # splash'a geri dönmeye gerek yok.
+            import subprocess
+            try:
+                subprocess.run(["pkill", "-f", "splash_loading.py"],
+                               timeout=2, capture_output=True)
+            except Exception:
+                pass
         else:
             self.showFullScreen()
 
@@ -159,10 +178,14 @@ class MainWindow(QMainWindow):
             port=config.companion_mission_port,
             connect_timeout=config.ai_connect_timeout,
             response_timeout=config.ai_response_timeout,
+            auth_token=config.companion_auth_token,
             parent=self,
         )
         # NTRIP: kullanıcı başlatana kadar None — otomatik başlamaz
         self.ntrip_worker: NtripWorker | None = None
+        # Yer istasyonu F9P'sinin son bilinen NMEA konumu — NTRIP VRS mountpoint'i
+        # GGA bootstrap için ister (bkz. _on_rtk_position_update/_on_start_ntrip).
+        self._last_gps_fix: tuple[float, float, float] | None = None
         # İki video kaynağı: ham (görev yokken) ve işlenmiş (görev sırasında).
         # Kamera YALNIZCA Yardımcı Bilgisayar'a bağlanınca açılır (otomatik denemez).
         self._video_url_raw = f"http://{config.companion_host}:{config.companion_video_raw_port}/video"
@@ -184,6 +207,7 @@ class MainWindow(QMainWindow):
             port=config.companion_status_port,
             connect_timeout=config.rpi_connect_timeout,
             read_timeout=config.rpi_read_timeout,
+            auth_token=config.companion_auth_token,
             parent=self,
         )
         self.telemetry_recorder = TelemetryRecorder(self._db_conn, parent=self)
@@ -197,42 +221,18 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             logger.warning("Uçuş kaydı kurtarma başarısız: %s", exc)
 
-        # ── Anten Takip Sistemi (RUTX10 + Pixhawk gimbal) ────────────────────
-        # İHA telemetrisinden anten azimut/elevasyon hesaplayıp anten Pixhawk'ına iletir.
-        from core.antenna_tracker_worker import AntennaTrackerWorker
-        _ah_lat, _ah_lon, _ah_alt = config.antenna_home
-
-        # Step motor direği (NEMA17 + TB6600, RPi4 GPIO). Yalnızca
-        # antenna_drive="stepper" iken kurulur; kurulum başarısız olursa
-        # (kütüphane/pin sorunu) takip Pixhawk moduna düşer — YKİ açılmalıdır.
-        self._antenna_mount = None
-        if config.antenna_drive == "stepper":
-            try:
-                from core.stepper_driver import build_mount
-                self._antenna_mount = build_mount(config.antenna_axes,
-                                                  config.antenna_stepper_backend)
-                self._antenna_mount.start()
-                logger.info("Anten direği (step motor) hazır: %s",
-                            self._antenna_mount.status())
-            except Exception as exc:
-                logger.exception("Step motor direği kurulamadı — Pixhawk moduna dönülüyor")
-                self._antenna_mount = None
-
         # Sesli otopilot: telemetriyi insan diline çeviren anlatıcı
         # (Qt'siz saf mantık — core/flight_narrator.py)
         from core.flight_narrator import FlightNarrator
         self._narrator = FlightNarrator()
 
-        self.antenna_tracker = AntennaTrackerWorker(
-            conn_string=config.antenna_pixhawk_conn,
-            mode=config.antenna_tracker_mode,
-            home_lat=_ah_lat, home_lon=_ah_lon, home_alt=_ah_alt,
-            min_distance_m=config.antenna_min_distance_m,
-            update_hz=config.antenna_update_hz,
-            drive="stepper" if self._antenna_mount is not None else "pixhawk",
-            mount=self._antenna_mount,
-            parent=self,
-        )
+        # RTK GPS izleme paneli (salt-okunur, F9P NMEA)
+        # NOT: sinyal bağlantısı _connect_signals()'ta.
+        self.rtk_gps_worker = None
+        if config.rtk_gps_enabled:
+            from core.rtk_gps_worker import RtkGpsWorker
+            self.rtk_gps_worker = RtkGpsWorker(
+                port=config.rtk_gps_port, baud=config.rtk_gps_baud, parent=self)
 
     def _start_workers(self) -> None:
         self.tts_worker.start_tts_process()
@@ -241,12 +241,16 @@ class MainWindow(QMainWindow):
         self.ai_worker.start()
         self.video_worker.start()
         self.rpi_worker.start()
-        # Anten takip worker thread'i çalışır; takip yalnızca enable() ile aktifleşir
-        self.antenna_tracker.start()
-        if config.antenna_tracker_enabled:
-            self.antenna_tracker.enable()
-        # ntrip_worker: kullanıcı isteyince başlar (None durumda)
-        logger.info("Worker thread'leri başlatıldı (NTRIP + Anten Takip isteğe bağlı)")
+        if self.rtk_gps_worker is not None:
+            self.rtk_gps_worker.start()
+        # ntrip_worker: varsayılan olarak kullanıcı isteyince başlar (None durumda),
+        # AMA config.ntrip_autostart=True + host/mountpoint doluysa YKİ açılışında
+        # otomatik bağlanır (2026-08-28, kullanıcı talebi — TUSAGA-Aktif aboneliği).
+        if config.ntrip_autostart and config.ntrip_host and config.ntrip_mountpoint:
+            self._on_start_ntrip(config.ntrip_host, config.ntrip_port,
+                                 config.ntrip_mountpoint, config.ntrip_username,
+                                 config.ntrip_password)
+        logger.info("Worker thread'leri başlatıldı (NTRIP isteğe bağlı)")
 
     # ── UI ────────────────────────────────────────────────────────────────────
     def _build_ui(self) -> None:
@@ -273,26 +277,25 @@ class MainWindow(QMainWindow):
         self._mission_panel  = MissionPanelView()
         self._test_panel     = TestPanelView(self._db_conn)
         self._iha_test_panel = IHATestPanelView()     # YENİ: İHA Test Paneli
+        self._saha_testi_view = SahaTestiView()       # YENİ: insan-rehberli bench testi
         self._calib_view     = CalibrationView()
         self._tuning_view    = TuningView()
         self._advanced_view  = AdvancedView()
         self._syslog_view    = SystemLogView(self._db_conn)
         self._flight_analysis_view = FlightAnalysisView(self._db_conn)
         self._settings_view  = SettingsView()
-        from ui.views.antenna_tracker_view import AntennaTrackerView
-        self._antenna_view   = AntennaTrackerView()
 
         self._tabs.addTab(self._dashboard,      "Dashboard")
         self._tabs.addTab(self._mission_view,   "Görev Planlama")
         self._tabs.addTab(self._mission_panel,  "Özel Görevler")
         self._tabs.addTab(self._iha_test_panel, "🔧 Devreye Alma")   # YENİ sekme
+        self._tabs.addTab(self._saha_testi_view, "🧪 Saha Testi")    # YENİ sekme
         self._tabs.addTab(self._test_panel,     "Test Paneli")
         self._tabs.addTab(self._calib_view,     "Kalibrasyon")
         self._tabs.addTab(self._tuning_view,    "PID Tuning")
         self._tabs.addTab(self._advanced_view,  "Gelişmiş")
         self._tabs.addTab(self._syslog_view,    "Sistem/Log")
         self._tabs.addTab(self._flight_analysis_view, "Kayıtlar")
-        self._tabs.addTab(self._antenna_view,   "📡 Anten Takip")
         self._tabs.addTab(self._settings_view,  "Ayarlar")
 
         root.addWidget(self._tabs, stretch=1)
@@ -321,22 +324,27 @@ class MainWindow(QMainWindow):
         self.top_bar.connect_requested.connect(self._on_connect_requested)
         self.top_bar.disconnect_requested.connect(self._on_disconnect_requested)
 
-        # Anten Takip Paneli ↔ Worker (antenna_tracker kalıcı)
-        self.antenna_tracker.error_occurred.connect(self._on_error)
-        self.antenna_tracker.tracker_status.connect(self._antenna_view.update_status)
-        self.antenna_tracker.connection_changed.connect(self._antenna_view.set_connection)
-        self._antenna_view.enable_requested.connect(self._on_antenna_enable)
-        self._antenna_view.disable_requested.connect(self._on_antenna_disable)
-        self._antenna_view.set_home_from_drone.connect(self._on_antenna_home_drone)
-        self._antenna_view.set_home_manual.connect(self.antenna_tracker.set_antenna_home)
+        if self.rtk_gps_worker is not None:
+            self.rtk_gps_worker.gps_updated.connect(self._dashboard.rtk_status_updated)
+            self.rtk_gps_worker.connected_changed.connect(self._dashboard.rtk_connection_changed)
+            # Yer istasyonu F9P'sinin NMEA konumu — NTRIP (VRS mountpoint) GGA
+            # bootstrap/tazeleme için kullanılır, bkz. _on_rtk_position_update.
+            self.rtk_gps_worker.gps_updated.connect(self._on_rtk_position_update)
+            # F9P baz istasyonu → RTCM3 → İHA (MAVLink GPS_RTCM_DATA). AYNI hedef
+            # (inject_rtcm), ntrip_worker'ın UZAK kaynak için kullandığı yol —
+            # burada kaynak YEREL F9P (tools/f9p_base_config.py ile survey-in'e
+            # alınmış olmalı, bkz. o dosyanın NEDEN notu).
+            # GEÇİCİ OLARAK DEVRE DIŞI (2026-08-28, kullanıcı talebi): TUSAGA-Aktif
+            # NTRIP kaynağı denenirken F9P'nin RTCM'i AYNI ANDA gönderilmemeli —
+            # ikisi birden aktifse İHA'nın GPS'i iki FARKLI baz konumundan (F9P'nin
+            # kendi surveyed konumu vs. TUSAGA'nın gerçek CORS istasyon konumu)
+            # çakışan düzeltmeler alır, RTK'yı düzeltmez kötüleştirir. F9P'nin NMEA
+            # tabanlı konum izlemesi (NTRIP GGA için, yukarıdaki satır) ETKİLENMEDİ
+            # — yalnızca RTCM aktarımı kesildi. NTRIP denemesi bitince BU SATIRI
+            # GERİ AÇIN (yorumdan çıkarın).
+            # self.rtk_gps_worker.rtcm_ready.connect(self.mavlink_worker.inject_rtcm)
         # Sesli otopilot → TTS (kuyruklu, üst üste binmez)
         self._dashboard.speak_requested.connect(self.tts_worker.speak)
-        # Step motor direği: limit referansı, elle döndürme, redüksiyon, kalibrasyon
-        self._antenna_view.reference_limit.connect(self.antenna_tracker.on_reference_limit)
-        self._antenna_view.jog_axis.connect(self.antenna_tracker.on_jog)
-        self._antenna_view.set_gear_ratio.connect(self.antenna_tracker.on_set_gear_ratio)
-        self._antenna_view.calibrate_span.connect(self.antenna_tracker.on_calibrate_span)
-        self.antenna_tracker.mount_feedback.connect(self._antenna_view.mount_feedback)
 
         # Dashboard → AI worker (servo) — mavlink değil
         self._dashboard.send_servo_action.connect(self.ai_worker.send_servo_command)
@@ -469,11 +477,23 @@ class MainWindow(QMainWindow):
         Performans: 3 web-harita + HUD repaint'leri eskiden gizli sekmelerde de
         20Hz çalışıyordu. Artık yalnızca aktif sekmenin update_telemetry'si çağrılır.
         """
-        # Sürekli gerekli olanlar (gizli sekmede de): durum çubuğu, kayıt, anten takip
+        # Sürekli gerekli olanlar (gizli sekmede de): durum çubuğu, kayıt
         self.top_bar.update_telemetry(data)
         self.telemetry_recorder.on_telemetry(data)
-        self.antenna_tracker.update_drone_position(data)
         self._syslog_view.update_telemetry_for_analysis(data)  # kendi içinde gate'li
+
+        # İHA'nın kendi GPS konumu — NTRIP VRS GGA için TERCİH EDİLEN kaynak
+        # (2026-08-28, sahada bulundu): F9P yer istasyonunda takılı OLMAYABİLİR
+        # (o an yoktu) ama VRS mantığı zaten düzeltmenin uygulandığı ROVER'a
+        # (İHA) yakın bir sanal referans hesaplar — F9P'nin sabit yer istasyonu
+        # konumundan daha DOĞRU kaynak budur, ayrıca İHA hareket ettikçe otomatik
+        # güncellenir. F9P varsa o da AYNI mekanizmayı besler (_on_rtk_position_update)
+        # — hangisi son güncellenirse o kullanılır, ikisi de zararsız.
+        lat, lon = data.get("lat"), data.get("lon")
+        if lat is not None and lon is not None and not (abs(lat) < 1e-6 and abs(lon) < 1e-6):
+            self._last_gps_fix = (lat, lon, data.get("alt") or 0.0)
+            if self.ntrip_worker is not None:
+                self.ntrip_worker.set_position(lat, lon, data.get("alt") or 0.0)
 
         # Sesli otopilot / görev anlatıcısı — gizli sekmede de çalışmalı:
         # operatör başka sekmedeyken de batarya/EKF uyarısını duymalı.
@@ -514,13 +534,13 @@ class MainWindow(QMainWindow):
             (self._mission_view,          2),   # Görev Planlama: OPERATOR+
             (self._mission_panel,         2),   # Özel Görevler: OPERATOR+
             (self._iha_test_panel,        2),   # Devreye Alma: OPERATOR+
+            (self._saha_testi_view,       2),   # Saha Testi (ARM/motor içerir): OPERATOR+
             (self._test_panel,            2),   # Test Paneli: OPERATOR+
             (self._calib_view,            3),   # Kalibrasyon: ADMIN
             (self._tuning_view,           3),   # PID Tuning: ADMIN
             (self._advanced_view,         3),   # Gelişmiş (tam param yazma): ADMIN
             (self._syslog_view,           3),   # Sistem/Log (Kullanıcı Yönetimi): ADMIN
             (self._flight_analysis_view,  1),   # Kayıtlar: VIEWER+
-            (self._antenna_view,          1),   # Anten Takip: VIEWER+
             (self._settings_view,         3),   # Ayarlar: ADMIN
         ]
         for widget, min_role in tab_roles:
@@ -889,7 +909,10 @@ class MainWindow(QMainWindow):
         self.ai_worker._port            = cfg.companion_mission_port
         self.ai_worker._connect_timeout = cfg.ai_connect_timeout
         self.ai_worker._response_timeout = cfg.ai_response_timeout
-        # Durum worker'ını (5602) da yeni adrese yönlendir (bağlıysa)
+        self.ai_worker._auth_token      = cfg.companion_auth_token
+        # Durum worker'ını (5602) da yeni adrese yönlendir (bağlıysa) — auth_token
+        # da reconnect'te yeni bağlantıya gönderilsin diye burada güncellenir.
+        self.rpi_worker._auth_token = cfg.companion_auth_token
         try:
             self.rpi_worker.reconnect(host, cfg.companion_status_port)
         except Exception:
@@ -938,6 +961,19 @@ class MainWindow(QMainWindow):
             self._mission_panel.update_detection_status(data)
             self._dashboard.add_ai_detection(data)
 
+    @pyqtSlot(dict)
+    def _on_rtk_position_update(self, gps: dict) -> None:
+        """F9P'nin NMEA konumu güncellendi — NTRIP VRS mountpoint'inin GGA
+        bootstrap/tazelemesi için sakla ve (NTRIP aktifse) canlı ilet."""
+        lat, lon, alt = gps.get("lat"), gps.get("lon"), gps.get("alt_m")
+        if lat is None or lon is None:
+            return
+        if abs(lat) < 1e-6 and abs(lon) < 1e-6:
+            return
+        self._last_gps_fix = (lat, lon, alt or 0.0)
+        if self.ntrip_worker is not None:
+            self.ntrip_worker.set_position(lat, lon, alt or 0.0)
+
     @pyqtSlot(str, int, str, str, str)
     def _on_start_ntrip(self, host: str, port: int, mountpoint: str, user: str, passwd: str) -> None:
         """Kullanıcı 'NTRIP Başlat' butonuna bastı — worker yarat ve başlat."""
@@ -946,8 +982,14 @@ class MainWindow(QMainWindow):
             self.ntrip_worker.stop()
 
         self.ntrip_worker = NtripWorker(host, port, mountpoint, user, passwd, parent=self)
+        if self._last_gps_fix is not None:
+            self.ntrip_worker.set_position(*self._last_gps_fix)
+        else:
+            logger.warning("NTRIP başlatılıyor ama henüz F9P konumu yok — VRS "
+                           "mountpoint'i GGA alana kadar RTCM göndermeyebilir.")
         self.ntrip_worker.rtcm_ready.connect(self.mavlink_worker.inject_rtcm)
         self.ntrip_worker.connection_changed.connect(self._advanced_view.on_ntrip_connection)
+        self.ntrip_worker.connection_changed.connect(self._dashboard.ntrip_connection_changed)
         self.ntrip_worker.error_occurred.connect(self._on_error)
         self.ntrip_worker.start()
         logger.info("NTRIP başlatıldı: %s:%d/%s", host, port, mountpoint)
@@ -958,6 +1000,10 @@ class MainWindow(QMainWindow):
         if self.ntrip_worker is not None:
             self.ntrip_worker.stop()
             self.ntrip_worker = None
+        # NEDEN elle: worker temiz durdurulduğunda connection_changed(False)
+        # YAYINLAMAZ (yalnızca run() içindeki hata dalında yayınlanır) — dashboard
+        # etiketi worker sinyaline güvenirse "bağlı" göstermeye devam ederdi.
+        self._dashboard.ntrip_connection_changed(False)
         logger.info("NTRIP durduruldu")
 
     @pyqtSlot(int)
@@ -1033,26 +1079,6 @@ class MainWindow(QMainWindow):
         self.video_worker.start()
         self._status_label.setText(f"Video: {source}")
 
-    # ── Anten Takip Paneli handler'ları ──────────────────────────────────────
-    @pyqtSlot()
-    def _on_antenna_enable(self) -> None:
-        self.antenna_tracker.enable()
-        self._antenna_view.set_tracking_active(True)
-        logger.info("Anten takip başlatıldı (kullanıcı)")
-
-    @pyqtSlot()
-    def _on_antenna_disable(self) -> None:
-        self.antenna_tracker.disable()
-        self._antenna_view.set_tracking_active(False)
-        logger.info("Anten takip durduruldu (kullanıcı)")
-
-    @pyqtSlot()
-    def _on_antenna_home_drone(self) -> None:
-        ok = self.antenna_tracker.set_home_from_current_drone()
-        msg = "Anten home = İHA konumu ayarlandı" if ok else "İHA konumu yok — anten home ayarlanamadı"
-        self._status_label.setText(msg)
-        logger.info(msg)
-
     @pyqtSlot(bool)
     def _on_rpi_connection_changed(self, connected: bool) -> None:
         """RPi status port bağlantı değişimi.
@@ -1066,8 +1092,22 @@ class MainWindow(QMainWindow):
         Artık bağlantı kopunca etiket açıkça "bağlantı yok" durumuna geçer.
         """
         if connected:
-            self._apply_rpi_status_style("accent")
-            self._rpi_status_label.setText("Yardımcı Bilgisayar 🟢: bağlandı, durum bekleniyor")
+            from core.gcs_config import config as _cfg
+            if _cfg.companion_auth_token:
+                self._apply_rpi_status_style("accent")
+                self._rpi_status_label.setText("Yardımcı Bilgisayar 🟢: bağlandı, durum bekleniyor")
+            else:
+                # 2026-08-26: auth_token boşken (komut VE durum kanalı
+                # doğrulamasız) bağlantı sessizce "her şey normal" gibi
+                # görünüyordu — artık bağlantı durum etiketinin kendisinde,
+                # göz ardı edilemez şekilde uyarılıyor.
+                logger.warning(
+                    "GÜVENLİK: companion_auth_token BOŞ — komut (5601) ve durum "
+                    "(5602) kanalları kimlik doğrulamasız. Ayarlar'dan bir "
+                    "anahtar girin (companion'daki config.json ile AYNI).")
+                self._apply_rpi_status_style("warning", bold=True)
+                self._rpi_status_label.setText(
+                    "Yardımcı Bilgisayar 🟢: bağlandı ⚠ KİMLİK DOĞRULAMA KAPALI")
             return
 
         logger.warning("Yardımcı Bilgisayar status bağlantısı kesildi — "
@@ -1286,14 +1326,13 @@ class MainWindow(QMainWindow):
             "tts":     self.tts_worker,
         }
         # NTRIP opsiyonel — None ise watchdog'a dahil etme
-        # rpi_worker/antenna_tracker ÖNCEDEN watchdog'a hiç dahil değildi — gerçek
-        # bir thread çökmesi (Python seviyesinde run()'dan kaçan istisna) fark
-        # edilmiyordu. Her ikisi de her zaman oluşturulur (kullanıcı etkinleştirmese
-        # de thread "idle" halde isRunning()=True kalır) — bu yüzden ntrip gibi
-        # None kontrolüne gerek yok, sadece çöküş tespiti (hang değil) yeterli.
+        # rpi_worker ÖNCEDEN watchdog'a hiç dahil değildi — gerçek bir thread
+        # çökmesi (Python seviyesinde run()'dan kaçan istisna) fark edilmiyordu.
+        # Her zaman oluşturulur (kullanıcı etkinleştirmese de thread "idle" halde
+        # isRunning()=True kalır) — bu yüzden ntrip gibi None kontrolüne gerek
+        # yok, sadece çöküş tespiti (hang değil) yeterli.
         optional_workers = {
             "rpi":     self.rpi_worker,
-            "antenna": self.antenna_tracker,
         }
         if self.ntrip_worker is not None:
             optional_workers["ntrip"] = self.ntrip_worker
@@ -1423,10 +1462,12 @@ class MainWindow(QMainWindow):
         workers_to_stop = [
             self.mavlink_worker, self.ai_worker,
             self.video_worker, self.tts_worker, self.rpi_worker,
-            self.antenna_tracker,
+            self._saha_testi_view.video_worker,
         ]
         if self.ntrip_worker is not None:
             workers_to_stop.append(self.ntrip_worker)
+        if self.rtk_gps_worker is not None:
+            workers_to_stop.append(self.rtk_gps_worker)
         for worker in workers_to_stop:
             try:
                 worker.stop()

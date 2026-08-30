@@ -693,6 +693,7 @@ class CalibrationView(QWidget):
 
         self._accel_log = QTextEdit()
         self._accel_log.setReadOnly(True)
+        self._accel_log.document().setMaximumBlockCount(500)   # sınırsız büyümeyi engelle
         self._accel_log.setStyleSheet(self._log_style())
         rl.addWidget(self._accel_log, stretch=1)
         split.addWidget(right)
@@ -945,6 +946,7 @@ class CalibrationView(QWidget):
 
         self._compass_log = QTextEdit()
         self._compass_log.setReadOnly(True)
+        self._compass_log.document().setMaximumBlockCount(500)   # sınırsız büyümeyi engelle
         self._compass_log.setStyleSheet(self._log_style())
         rl.addWidget(self._compass_log)
         split.addWidget(right)
