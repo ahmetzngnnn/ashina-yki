@@ -232,6 +232,7 @@ _MAP_POLE2_COLOR = "#ff8c00"   # Direk 2 çemberi
 _MAP_FW_AREA_COLOR = "#a78bfa"  # Sabit Kanat pisti köşe çemberi (mor — ana tarama alanından ayırt edilsin)
 _MAP_RED_AREA_COLOR  = "#ef4444"  # Kırmızı hedefin TAHMİNİ bölgesi
 _MAP_BLUE_AREA_COLOR = "#3b82f6"  # Mavi hedefin TAHMİNİ bölgesi
+_MAP_FINISH_COLOR    = "#22c55e"  # Pist başlangıç/bitiş çizgisi uçları (Görev 2)
 
 # ── Fare Tekerleği Koruması ───────────────────────────────────────────────────
 # NEDEN: Sağ parametre paneli tekerlekle kaydırılırken imlecin ALTINDAKİ
@@ -891,6 +892,21 @@ class _BaseMissionTab(QWidget):
 
     opt_row = QHBoxLayout()
     self._rth_cb = QCheckBox("🏠 Kalkış Noktasına Dön (RTH)")
+    # NEDEN VARSAYILAN AÇIK (2026-08-30 şartname denetimi): şartname
+    # s.2091-2094 — görevin "tam otonom" sayılması için İNİŞ de otonom
+    # olmalı. Kutu işaretsiz başladığında araç görev sonunda LOITER'da
+    # asılı kalıyor ve iniş MANUEL yapılıyordu → otonomi katsayısı c
+    # 1.0 yerine 0.7 uygulanır (Görev 2'de 80 puan üzerinden 24 puan
+    # kayıp). Operatör bilinçli olarak yine kapatabilir — tooltip
+    # maliyeti açıkça söylüyor.
+    self._rth_cb.setChecked(True)
+    self._rth_cb.setToolTip(
+      "Görev sonunda kalkış noktasına dönüp OTONOM iniş yapılır.\n"
+      "VARSAYILAN AÇIK: kapatılırsa araç görev sonunda LOITER'da bekler ve\n"
+      "iniş MANUEL yapılır — görev 'tam otonom' sayılmaz, otonomi katsayısı\n"
+      "1.0 yerine 0.7 uygulanır (şartname s.2091-2094; Görev 2'de 80 puan\n"
+      "üzerinden 24 puan fark). Yalnızca bilinçli bir nedenle kapatın."
+    )
 
     self._uni_cb = QCheckBox("📏 Eşit İrtifa:")
 
@@ -1415,6 +1431,11 @@ class TargetDropMissionTab(_BaseMissionTab):
   _SEL_AREA  = "Tarama Köşesi"
   _SEL_POLE1 = "Direk 1"
   _SEL_POLE2 = "Direk 2"
+  # Pist başlangıç/bitiş çizgisi uçları — Görev 1'deki adlandırmayla AYNI
+  # (bkz. InfinityMissionTab._SEL_FINISH_A/B), operatör iki panelde de aynı
+  # kavramı aynı adla görsün.
+  _SEL_FINISH_A = "Pist Çizgisi Ucu A"
+  _SEL_FINISH_B = "Pist Çizgisi Ucu B"
   _SEL_FW_AREA = "Sabit Kanat Pisti Köşesi"
   # Operatörün haritada işaretlediği TAHMİNİ hedef bölgeleri (opsiyonel).
   # Verilmezse görev tam alan taraması yapar — geriye dönük tam uyumlu.
@@ -1473,7 +1494,10 @@ class TargetDropMissionTab(_BaseMissionTab):
       "(erken kimlik doğrulama, alan kontrolü, çoklu deneme) AKTİF kalır.\n"
       "Ayrık: sabit kanat ayrı bir pistte — bu mantık DEVRE DIŞI bırakılır, "
       "görev daha hızlı tamamlanır. Aşağıda sabit kanat pistinin alanını "
-      "(4 köşe) işaretleyin — yalnızca haritada/operatör bilgisi içindir."
+      "(4 köşe) işaretleyin — yalnızca haritada/operatör bilgisi içindir.\n\n"
+      "⚠ YARIŞMA UÇUŞUNDA 'Ayrık' KULLANMAYIN: çeldirici savunması kapanır — "
+      "sabit kanadın 4x4/2x2 m KARELERİ hedef sanılıp yük kareye "
+      "bırakılabilir (şartname s.1702-1704)."
     )
     guard_wheel(self._decoy_mode)
     self._decoy_mode.currentIndexChanged.connect(self._on_decoy_mode_changed)
@@ -1506,6 +1530,7 @@ class TargetDropMissionTab(_BaseMissionTab):
     sel_row.addWidget(QLabel("Harita tıklaması:"))
     self._sel_target = QComboBox()
     self._sel_target.addItems([self._SEL_AREA, self._SEL_POLE1, self._SEL_POLE2,
+                               self._SEL_FINISH_A, self._SEL_FINISH_B,
                                self._SEL_RED_AREA, self._SEL_BLUE_AREA,
                                 self._SEL_FW_AREA])
     guard_wheel(self._sel_target)  # kaydırma tıklama hedefini değiştirmesin
@@ -1515,6 +1540,44 @@ class TargetDropMissionTab(_BaseMissionTab):
     self._pole_lbl = QLabel("Direk 1: —    Direk 2: —")
     self._pole_lbl.setObjectName("mutedLabel")
     lay.addWidget(self._pole_lbl)
+
+    # ── Pist başlangıç/bitiş çizgisi (İSTEĞE BAĞLI — 2026-08-30 denetimi) ─
+    # Görev 1'deki finish_a/finish_b alanlarının birebir muadili (satır
+    # düzeni dahil — bkz. InfinityMissionTab._mk_coord_row NEDEN'i: etiket +
+    # iki koordinat yan yana dar panele sığmıyor, Enlem/Boylam ALT ALTA).
+    # NEDEN Görev 2'de de var: şartname görev sonunu "pist başlangıç/bitiş
+    # çizgisinden geçiş" ile tanımlar; bu hat Görev 2 için de aynı kavramdır.
+    # Boş bırakılırsa alan mission mesajına HİÇ konmaz (eski davranış).
+    def _mk_finish_row(icon_label: str):
+      row = QGridLayout()
+      row.setHorizontalSpacing(6)
+      row.setVerticalSpacing(4)
+      lbl = QLabel(icon_label)
+      lbl.setFixedWidth(70)
+      lat_e = QLineEdit()
+      lat_e.setPlaceholderText("Enlem (ör. 39.9250)")
+      lat_e.setMaximumWidth(220)
+      lon_e = QLineEdit()
+      lon_e.setPlaceholderText("Boylam (ör. 32.8662)")
+      lon_e.setMaximumWidth(220)
+      wire_coord_edit(lat_e, f"{icon_label} enlem — ondalıklı derece")
+      wire_coord_edit(lon_e, f"{icon_label} boylam — ondalıklı derece")
+      row.addWidget(lbl, 0, 0, 2, 1, Qt.AlignmentFlag.AlignVCenter)
+      row.addWidget(lat_e, 0, 1)
+      row.addWidget(lon_e, 1, 1)
+      row.setColumnStretch(1, 1)
+      return row, lat_e, lon_e
+
+    r_fa, self._fa_lat, self._fa_lon = _mk_finish_row("Pist Ucu A:")
+    r_fb, self._fb_lat, self._fb_lon = _mk_finish_row("Pist Ucu B:")
+    lay.addLayout(r_fa)
+    lay.addLayout(r_fb)
+    _fin_note = QLabel(
+      "Pist çizgisi (isteğe bağlı): görev sonunda araç bu hattı geçerek "
+      "bitirir. Boş bırakılırsa eski davranış (doğrudan dönüş) kullanılır.")
+    _fin_note.setStyleSheet(_SL)
+    _fin_note.setWordWrap(True)
+    lay.addWidget(_fin_note)
 
     # ── İrtifa ────────────────────────────────────────────────────────────
     alt_grp = QGroupBox("İrtifa"); alt_f = QFormLayout(alt_grp); alt_f.setSpacing(5)
@@ -1705,8 +1768,23 @@ class TargetDropMissionTab(_BaseMissionTab):
     # 2026-08-30: SERVO5 (gimbal) alanı KALDIRILDI — kanal BOŞTA. Buraya
     # yeni bir aktüatör bağlanırsa hem bu panel hem İHA config.json
     # fc_params_expected SERVO5_FUNCTION güncellenmelidir.
-    pin_form.addRow("Kırmızı Yük (red_drop):", self._pin_drop1)
-    pin_form.addRow("Mavi Yük (blue_drop):", self._pin_drop2)
+    # ── ETİKET NETLİĞİ (2026-08-30 şartname denetimi) ─────────────────────
+    # Şartname s.1674-1676: mavi altıgen hedefe KIRMIZI yük, kırmızı üçgen
+    # hedefe MAVİ yük bırakılır — yük rengi hedef renginin TERSİDİR. Servo
+    # adı "red_drop" HEDEFE göredir (kırmızı hedefe bırakan göz), taşıdığı
+    # yük MAVİDİR. Eski "Kırmızı Yük (red_drop)" etiketi bu ikisini
+    # karıştırıyordu; servo adları BİLEREK değiştirilmedi (firmware/YKİ
+    # protokolü red_drop/blue_drop üzerinden konuşur), yalnız görünen metin
+    # netleştirildi.
+    _capraz_tip = (
+      "Şartname s.1674-1676: yük rengi hedef renginin TERSİDİR —\n"
+      "mavi altıgene KIRMIZI yük, kırmızı üçgene MAVİ yük bırakılır.\n"
+      "Servo adı (red_drop/blue_drop) HEDEF rengine göredir."
+    )
+    self._pin_drop1.setToolTip(_capraz_tip)
+    self._pin_drop2.setToolTip(_capraz_tip)
+    pin_form.addRow("Kırmızı hedef gözü — MAVİ yük (red_drop):", self._pin_drop1)
+    pin_form.addRow("Mavi hedef gözü — KIRMIZI yük (blue_drop):", self._pin_drop2)
     pin_form.addRow("Sol Kapak (grab_L):", self._pin_grabL)
     pin_form.addRow("Sağ Kapak (grab_R):", self._pin_grabR)
     self._pin_sec = wrap_group(pin_grp, expanded=False)
@@ -2156,6 +2234,23 @@ class TargetDropMissionTab(_BaseMissionTab):
     is_separate = self._decoy_mode.currentText() == self._MODE_SEPARATE
     self._fw_area_lbl.setVisible(is_separate)
     self._update_fw_area_lbl()
+    # ── UYARI (2026-08-30 şartname denetimi) ──────────────────────────────
+    # "Ayrık" TÜM çeldirici savunmasını (erken kimlik bekleyişi, alan çapraz
+    # kontrolü, çoklu deneme) topluca kapatır. Şartname s.1702-1704: sabit
+    # kanadın 4x4 m (mavi) / 2x2 m (kırmızı) kareleri Döner Kanat alanında
+    # ÇELDİRİCİ olarak durur — savunma kapalıyken kareler hedef sanılır ve
+    # yük kareye bırakılır (puan kaybı + şartname ihlali). Engelleyici
+    # DEĞİL (bazı antrenman sahalarında sabit kanat gerçekten ayrı pistte),
+    # ama seçim anında yüksek sesle söylenir.
+    if is_separate:
+      QMessageBox.warning(
+        self, "Çeldirici Savunması Kapatılıyor",
+        "\"Ayrık\" modu TÜM çeldirici savunmasını devre dışı bırakır.\n\n"
+        "⚠ YARIŞMA UÇUŞUNDA KULLANMAYIN — sabit kanadın 4x4/2x2 m KARELERİ "
+        "hedef sanılır ve yük kareye bırakılabilir (şartname s.1702-1704).\n\n"
+        "Bu mod yalnızca sabit kanadın GERÇEKTEN ayrı pistte uçtuğu "
+        "antrenman sahaları içindir."
+      )
 
   def _update_hedef_bolge_lbl(self):
     """Tahmini hedef bölgelerinin köşe sayılarını göster."""
@@ -2192,6 +2287,17 @@ class TargetDropMissionTab(_BaseMissionTab):
       self._pole2 = {"lat": lat, "lon": lon}
       self._map.draw_circle(lat, lon, 3, _MAP_POLE2_COLOR)
       self._update_pole_lbl()
+    elif t == self._SEL_FINISH_A:
+      # Görev 1'deki desenle aynı: tıklama koordinat alanlarına yazılır;
+      # işaretçi self._wps'e EKLENMEZ — Görev 2'de _wps tarama poligonu
+      # köşeleridir ve _on_send hepsini WAYPOINT'e çevirir.
+      self._fa_lat.setText(f"{lat:.7f}")
+      self._fa_lon.setText(f"{lon:.7f}")
+      self._map.draw_circle(lat, lon, 2, _MAP_FINISH_COLOR)
+    elif t == self._SEL_FINISH_B:
+      self._fb_lat.setText(f"{lat:.7f}")
+      self._fb_lon.setText(f"{lon:.7f}")
+      self._map.draw_circle(lat, lon, 2, _MAP_FINISH_COLOR)
     elif t == self._SEL_FW_AREA:
       self._fw_wps.append({"lat": lat, "lon": lon})
       self._map.draw_circle(lat, lon, 3, _MAP_FW_AREA_COLOR)
@@ -2223,6 +2329,22 @@ class TargetDropMissionTab(_BaseMissionTab):
         self, "Görev",
         "Aracın konumu (kalkış noktası) henüz alınamadı.\n"
         "MAVLink telemetri bağlantısının aktif olduğundan emin olun."
+      )
+      return
+
+    # ── DİREKLER ZORUNLU (2026-08-30 şartname denetimi) ───────────────────
+    # NEDEN engelleyici: şartname s.1737-1738 — hedef tespiti 2. direği
+    # dışarıdan almadan yapılamaz; direk koordinatları GATE_RUN bacağının
+    # girdisidir. Önceden direkler isteğe bağlıydı ve boş bırakılınca görev
+    # SESSİZCE direksiz gönderiliyordu — operatör eksikliği ancak uçuşta
+    # fark ederdi. Görev 1'deki "Eksik Koordinat" engelinin muadili.
+    if not self._pole1 or not self._pole2:
+      QMessageBox.warning(
+        self, "Direk Koordinatları Eksik",
+        "Direk 1 ve Direk 2 koordinatları girilmeden Görev 2 gönderilemez.\n\n"
+        "Şartname s.1737-1738: hedef tespiti 2. direği dışarıdan almadan "
+        "yapılamaz — direk koordinatları zorunludur.\n\n"
+        "Haritada 'Direk 1' / 'Direk 2' seçerek noktalara tıklayın."
       )
       return
 
@@ -2322,11 +2444,29 @@ class TargetDropMissionTab(_BaseMissionTab):
     if self._cam_hfov_override.isChecked():
         params["camera_hfov_deg"] = self._cam_hfov.value()
 
-    # Direkler (GATE_RUN) — seçildiyse gönder
+    # Direkler (GATE_RUN) — yukarıdaki zorunluluk kapısı ikisinin de dolu
+    # olduğunu garanti eder; if'ler yalnızca savunmacı kaldı.
     if self._pole1:
       params["pole1"] = self._pole1
     if self._pole2:
       params["pole2"] = self._pole2
+
+    # ── Pist başlangıç/bitiş çizgisi — İSTEĞE BAĞLI (2026-08-30 denetimi) ─
+    # Görev 1'in finish_a/finish_b alanlarının birebir muadili; anahtar
+    # adları ve format Görev 1 ile AYNI ({"lat": float, "lon": float}) —
+    # firmware tek noktadan okur. İki uç da geçerli girilmemişse alan HİÇ
+    # gönderilmez; firmware yokluğu "eski davranış" olarak tolere eder
+    # (bitiş çizgisi transiti ana oturumda ekleniyor).
+    try:
+      params["finish_a"] = {"lat": float(self._fa_lat.text()),
+                            "lon": float(self._fa_lon.text())}
+      params["finish_b"] = {"lat": float(self._fb_lat.text()),
+                            "lon": float(self._fb_lon.text())}
+    except ValueError:
+      # Tek ucu dolu/bozuk olsa bile İKİSİ birden atılır — yarım hat
+      # firmware tarafında tanımsızdır.
+      params.pop("finish_a", None)
+      params.pop("finish_b", None)
 
     # ── Çeldirici yerleşimi modu (DEVIR §0p) ──────────────────────────────
     is_separate = self._decoy_mode.currentText() == self._MODE_SEPARATE
@@ -2933,7 +3073,23 @@ class InfinityMissionTab(_BaseMissionTab):
       params["finish_a"] = fa
       params["finish_b"] = fb
     except ValueError:
-      pass
+      # 2026-08-30 şartname denetimi: eskiden burada sessizce yutuluyordu
+      # (`pass`) ve operatör son bacağın atlanacağını FARK ETMEDEN görevi
+      # gönderebiliyordu. Alan isteğe bağlı OLMAYA devam ediyor (hazır
+      # olmayan saha için bilinçli atlama hâlâ mümkün) ama atlama artık
+      # AÇIK ONAY gerektiriyor — varsayılan buton 'Hayır' (DURDUR/RTL
+      # onayıyla aynı desen, bkz. top_bar._on_drop_click).
+      reply = QMessageBox.question(
+        self, "Pist Çizgisi Boş",
+        "Pist Ucu A/B boş ya da geçersiz — şartnamenin son bacağı\n"
+        "(direk 2 arkasından dönüş + bitiş çizgisi geçişi) ATLANACAK,\n"
+        "araç eski davranışla (doğrudan RTL/LOITER) bitirecek.\n\n"
+        "Yine de gönderilsin mi?",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.No,
+      )
+      if reply != QMessageBox.StandardButton.Yes:
+        return
     # BUG FIX: self._wps yalnızca harita işaretçilerini (DIREK 1/2) içerir —
     # bunlar uçuş rotası WP'si değildir. Companion, pole1/pole2'den ∞ rotayı üretir.
     params["waypoints"] = []

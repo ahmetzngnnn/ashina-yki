@@ -1360,18 +1360,35 @@ class DashboardView(QWidget):
 
         # Satır etiketleri: statik soluk metin → QSS "mutedLabel" class'ı
 
-        # 1. Kırmızı Yük
-        lbl_red = QLabel("Kırmızı Yük:")
+        # ── ETİKET NETLİĞİ (2026-08-30 şartname denetimi) ──────────────────
+        # Şartname s.1674-1676: yük rengi hedef renginin TERSİDİR — mavi
+        # altıgene KIRMIZI yük, kırmızı üçgene MAVİ yük bırakılır. Servo adı
+        # "red_drop" HEDEFE göredir (kırmızı hedefe bırakan göz), taşıdığı
+        # yük MAVİDİR. Eski "Kırmızı Yük" etiketi operatörü yük rengine
+        # yönlendiriyordu; servo adları/protokol DEĞİŞMEDİ, yalnız görünen
+        # metinler netleştirildi.
+        _capraz_tip = (
+            "Şartname s.1674-1676: yük rengi hedef renginin TERSİDİR —\n"
+            "mavi altıgene KIRMIZI yük, kırmızı üçgene MAVİ yük bırakılır.\n"
+            "Servo adı (red_drop/blue_drop) HEDEF rengine göredir."
+        )
+
+        # 1. Kırmızı hedef gözü (red_drop) — MAVİ yükü taşır
+        lbl_red = QLabel("Kırmızı hedef gözü — MAVİ yük:")
         lbl_red.setObjectName("mutedLabel")
+        lbl_red.setToolTip(_capraz_tip)
         btn_drop_red_open = QPushButton("Yük Bırak")
         btn_drop_red_open.setObjectName("dangerButton")
+        btn_drop_red_open.setToolTip(_capraz_tip)
         btn_drop_red_close = QPushButton("Yük Al")   # nötr — global QSS
-        
-        # 2. Mavi Yük
-        lbl_blue = QLabel("Mavi Yük:")
+
+        # 2. Mavi hedef gözü (blue_drop) — KIRMIZI yükü taşır
+        lbl_blue = QLabel("Mavi hedef gözü — KIRMIZI yük:")
         lbl_blue.setObjectName("mutedLabel")
+        lbl_blue.setToolTip(_capraz_tip)
         btn_drop_blue_open = QPushButton("Yük Bırak")
         btn_drop_blue_open.setObjectName("primaryButton")
+        btn_drop_blue_open.setToolTip(_capraz_tip)
         btn_drop_blue_close = QPushButton("Yük Al")   # nötr — global QSS
         
         # 3. Yük Alma Kapakları
@@ -1390,16 +1407,22 @@ class DashboardView(QWidget):
         # bittiğinde operatör hâlâ "Yük Al" butonuna basmalı; o buton hem
         # servoyu TAM pwm_close'a taşır (slider'ın bıraktığı ara PWM'den
         # değil) hem de sisteme "yük yüklendi" durumunu resmen kaydeder.
-        lbl_red_manual = QLabel("Kırmızı Manuel:")
+        lbl_red_manual = QLabel("Kırmızı Göz Manuel:")
         lbl_red_manual.setObjectName("mutedLabel")
+        lbl_red_manual.setToolTip(
+            "red_drop servosunun ham PWM'i (kırmızı HEDEFE bırakan göz — "
+            "MAVİ yükü taşır).\n" + _capraz_tip)
         self.red_drop_slider = QSlider(Qt.Orientation.Horizontal)
         self.red_drop_slider.setRange(200, 2000)
         self.red_drop_slider.setValue(1500)
         self.lbl_red_drop_pwm_val = QLabel("1500 µs")
         self.lbl_red_drop_pwm_val.setStyleSheet(self._gimbal_val_css())
 
-        lbl_blue_manual = QLabel("Mavi Manuel:")
+        lbl_blue_manual = QLabel("Mavi Göz Manuel:")
         lbl_blue_manual.setObjectName("mutedLabel")
+        lbl_blue_manual.setToolTip(
+            "blue_drop servosunun ham PWM'i (mavi HEDEFE bırakan göz — "
+            "KIRMIZI yükü taşır).\n" + _capraz_tip)
         self.blue_drop_slider = QSlider(Qt.Orientation.Horizontal)
         self.blue_drop_slider.setRange(200, 2000)
         self.blue_drop_slider.setValue(1500)
@@ -1436,12 +1459,17 @@ class DashboardView(QWidget):
         # NEDEN onay ("Aç" butonları): yük bırakma/kapak açma GERİ ALINAMAZ —
         # yanlış tıklama yükü havada, hedef dışında bırakır. "Kapat" onaysız
         # kalır (zararsız/geri alınabilir). Aynı desen top_bar.py._on_drop_click.
+        # Onay diyaloğu etiketi de çapraz-yük kuralını söyler (şartname
+        # s.1674-1676) — operatör bırakma ANINDA hangi renk yükün düşeceğini
+        # görsün.
         btn_drop_red_open.clicked.connect(
-            lambda: self._confirm_and_emit_servo("red_drop", "open", 0, "Kırmızı Yük")
+            lambda: self._confirm_and_emit_servo(
+                "red_drop", "open", 0, "Kırmızı hedef gözü (MAVİ yük)")
         )
         btn_drop_red_close.clicked.connect(lambda: self.send_servo_action.emit("red_drop", "close", 0, False))
         btn_drop_blue_open.clicked.connect(
-            lambda: self._confirm_and_emit_servo("blue_drop", "open", 0, "Mavi Yük")
+            lambda: self._confirm_and_emit_servo(
+                "blue_drop", "open", 0, "Mavi hedef gözü (KIRMIZI yük)")
         )
         btn_drop_blue_close.clicked.connect(lambda: self.send_servo_action.emit("blue_drop", "close", 0, False))
 
