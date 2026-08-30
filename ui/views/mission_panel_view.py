@@ -176,6 +176,16 @@ function drawRoute(pts,col,fit){
    fillOpacity:0,weight:2}).bindTooltip('Rota sonu').addTo(map));
  if(fit){try{map.fitBounds(L.latLngBounds(ll),{padding:[40,40]});}catch(e){}}
 }
+/* Önizleme katmanına EK çizgi — clearRoute ETMEZ, drawRoute'tan SONRA
+   çağrılır (Görev 1 şematik son bacağı: kesikli + ayrı renk). Aynı prv
+   dizisine eklenir ki clearRoute/drawRoute ana rotayla birlikte silsin. */
+function drawRouteExtra(pts,col,dash){
+ if(!pts||pts.length<2)return;
+ var ll=pts.map(function(p){return[p.lat,p.lon];});
+ prv.push(L.polyline(ll,{color:'#000',weight:5,opacity:0.3}).addTo(map));
+ prv.push(L.polyline(ll,{color:col||'#22c55e',weight:2.5,opacity:0.95,
+  dashArray:dash&&dash.length?dash:null}).addTo(map));
+}
 function setHome(lat,lon){
  if(window._hm)map.removeLayer(window._hm);
  window._hm=L.marker([lat,lon],{icon:mkIco('#00e5ff','H')}).addTo(map);
@@ -446,6 +456,17 @@ class MissionMapWidget(QWidget):
     js_pts = json.dumps([{"lat": p[0], "lon": p[1]} for p in pts])
     self._js(f"drawRoute({js_pts},'{color}',{'true' if fit else 'false'})")
 
+  def draw_route_extra(self, pts: list[tuple[float, float]],
+                       color: str = _MAP_ROUTE_COLOR, dash: str = ""):
+    """Önizleme katmanına EK çizgi çizer (mevcut rotayı SİLMEZ).
+
+    NEDEN ayrı fonksiyon: drawRoute her çağrıda önizleme katmanını sıfırlar;
+    Görev 1'in şematik son bacağı ana rotayla AYNI katmanda ama FARKLI stille
+    (kesikli, ayrı renk) durmalı — clear_route ikisini birlikte temizler.
+    dash: Leaflet dashArray (ör. "7,7"); boş string = düz çizgi."""
+    js_pts = json.dumps([{"lat": p[0], "lon": p[1]} for p in pts])
+    self._js(f"drawRouteExtra({js_pts},'{color}','{dash}')")
+
   def clear_route(self):
     self._js("clearRoute()")
 
@@ -473,6 +494,12 @@ class _BaseMissionTab(QWidget):
   # panelin bozuk olduğunu sanıyordu. Metin artık moda göre değişiyor.
   _HINT_SEL_OFF = "⚠ Önce 'Harita Seçim Modu'nu açın, sonra haritaya tıklayın."
   _HINT_SEL_ON  = "✓ Haritaya tıklayarak nokta ekleyin."
+
+  # Görev kronometresi bütçe varsayılanı (s) — sekmedeki "Görev Süre Bütçesi"
+  # alanı 0/60 s altı ("gönderme") ise kullanılır. Görev 2: 600 s (şartname
+  # 10 dk; firmware varsayılanıyla aynı — teknofest_task2.py
+  # DEFAULT_MISSION_BUDGET_S=600). Görev 1 sekmesi 300 s ile override eder.
+  _CLOCK_DEFAULT_BUDGET_S = 600.0
 
   def __init__(self, parent=None):
     super().__init__(parent)
@@ -502,6 +529,34 @@ class _BaseMissionTab(QWidget):
     self._hud_summary.setWordWrap(True)
     self._hud_summary.setObjectName("hintLabel")
     self._hud_lay.addWidget(self._hud_summary)
+
+    # ── GÖREV KRONOMETRESİ (2026-08-30 şartname denetimi) ─────────────────
+    # NEDEN: şartname uçuş süresini sınırlar (Görev 1: 5 dk, Görev 2: 10 dk)
+    # ve süre sınırını aşan uçuş BAŞARISIZ sayılır — operatörün elinde
+    # şimdiye kadar HİÇBİR saat yoktu. Sayaç TELEMETRİYE BAĞIMLI DEĞİLDİR
+    # (yerel QTimer): telemetri kesilse bile görev havada sürer, saat de
+    # sürmelidir. Başlat/durdur MissionPanelView köprüsünden gelir: TopBar
+    # başlat/abort sinyalleri + companion mission.active kenar geçişleri
+    # (main_window._on_rpi_status → set_mission_running).
+    clk_row = QHBoxLayout()
+    self._clock_lbl = QLabel("GÖREV SÜRESİ --:-- / bütçe --:--")
+    self._clock_lbl.setWordWrap(True)
+    clk_row.addWidget(self._clock_lbl, 1)
+    self._clock_stop_btn = QPushButton("⏹")
+    self._clock_stop_btn.setFixedWidth(28)
+    self._clock_stop_btn.setEnabled(False)
+    self._clock_stop_btn.setToolTip(
+      "Kronometreyi elle durdur (emniyet çıkışı).\n"
+      "Görev bitişi normalde companion durum akışından otomatik algılanır;\n"
+      "akış kesikse sayaç kendiliğinden durmaz — bu buton o durum içindir.")
+    self._clock_stop_btn.clicked.connect(self.stop_mission_clock)
+    clk_row.addWidget(self._clock_stop_btn)
+    self._hud_lay.addLayout(clk_row)
+    self._clock_timer = QTimer(self)
+    self._clock_timer.setInterval(1000)  # 1 s — şartname için sn çözünürlüğü yeterli
+    self._clock_timer.timeout.connect(self._on_clock_tick)
+    self._clock_t0: float | None = None
+    self._clock_budget_s: float = float(self._CLOCK_DEFAULT_BUDGET_S)
 
     lbl_wp_dists = QLabel("<b>WP Mesafeleri:</b>")
     self._hud_lay.addWidget(lbl_wp_dists)
@@ -1377,6 +1432,66 @@ class _BaseMissionTab(QWidget):
         self._first_home_set = True
       self._map.set_drone_pos(float(lat), float(lon), float(hdg))
 
+  # ── GÖREV KRONOMETRESİ (2026-08-30 şartname denetimi) ─────────────────────
+  def _clock_budget_from_field(self) -> float:
+    """Kronometre bütçesi — sekmedeki "Görev Süre Bütçesi" alanıyla SENKRON.
+
+    NEDEN >= 60 s şartı: 0 ve 60 s altı "alan gönderilmez, firmware kendi
+    varsayılanını kullanır" demektir (bkz. _on_send); kronometre aynı kuralı
+    izler ki ekrandaki bütçe ile araçtaki bütçe ayrışmasın."""
+    w = getattr(self, "_budget_s", None)
+    if w is not None and w.value() >= 60:
+      return float(w.value())
+    return float(self._CLOCK_DEFAULT_BUDGET_S)
+
+  def mission_clock_running(self) -> bool:
+    return self._clock_timer.isActive()
+
+  def start_mission_clock(self) -> None:
+    """Görev başlatıldığı anda çağrılır (MissionPanelView köprüsü)."""
+    self._clock_budget_s = self._clock_budget_from_field()
+    self._clock_t0 = time.monotonic()
+    self._clock_stop_btn.setEnabled(True)
+    self._clock_timer.start()
+    self._on_clock_tick()
+
+  def stop_mission_clock(self) -> None:
+    """Görev bitti/iptal edildi — sayaç durur, etiket son değerinde donar."""
+    if not self._clock_timer.isActive():
+      return
+    self._clock_timer.stop()
+    self._clock_stop_btn.setEnabled(False)
+    self._on_clock_tick(final=True)
+
+  def _on_clock_tick(self, final: bool = False) -> None:
+    if self._clock_t0 is None:
+      return
+    budget = max(1.0, float(self._clock_budget_s))
+    elapsed = time.monotonic() - self._clock_t0
+    remaining = budget - elapsed
+
+    def _mmss(s: float) -> str:
+      s_i = max(0, int(s))
+      return f"{s_i // 60:02d}:{s_i % 60:02d}"
+
+    text = f"GÖREV SÜRESİ {_mmss(elapsed)} / bütçe {_mmss(budget)}"
+    if remaining <= 0.0:
+      text += " — BÜTÇE AŞILDI"
+    if final:
+      text += " (durduruldu)"
+    # Renk kademesi: kalan > %25 normal, %10-25 sarı, < %10 kırmızı + kalın.
+    # NEDEN her tikte stil: tema tokenları yeniden okunur — tema değişse de
+    # 1 s içinde doğru renge döner, ayrıca tema dinleyicisi gerektirmez.
+    frac = remaining / budget
+    if frac < 0.10:
+      style = f"color:{theme.c('danger')};font-weight:bold;"
+    elif frac < 0.25:
+      style = f"color:{theme.c('warning')};"
+    else:
+      style = f"color:{theme.c('text')};"
+    self._clock_lbl.setStyleSheet(style)
+    self._clock_lbl.setText(text)
+
   def _on_send(self):
     """Görev gönderimi — her somut sekme kendi mission_type'ı ile override eder.
 
@@ -1692,10 +1807,27 @@ class TargetDropMissionTab(_BaseMissionTab):
     self._drop_radius   = _dsb(1, 15, 4.0, 0.5, " m", 1)
     self._scan_wp_radius = _dsb(1, 10, 3.0, 0.5, " m", 1)
     self._scan_timeout  = _isb(30, 600, 180, " s")
+    # ── GÖREV SÜRE BÜTÇESİ — firmware anahtarı: "mission_time_budget_s" ────
+    # NEDEN: firmware görevin TAMAMI için ayrı bir süre bütçesi tutar; bütçe
+    # dolunca kalan hedeflerden vazgeçip RTL yapar (IHA/missions/
+    # teknofest_task2.py:250 — p.get("mission_time_budget_s", 600),
+    # 60-3600 s'e kırpılır; anahtar KODDAN doğrulandı, uydurulmadı).
+    # Şartname Görev 2 uçuşunu 10 dk (600 s) ile sınırlar. 0 = alan HİÇ
+    # gönderilmez → firmware varsayılanı (600 s) geçerli olur. Soldaki
+    # GÖREV KRONOMETRESİ bütçesi de bu alandan okunur.
+    self._budget_s = _isb(0, 3600, 600, " s")
+    self._budget_s.setSpecialValueText("gönderme (fw: 600 s)")
+    self._budget_s.setToolTip(
+      "Şartname: Görev 2 uçuş süresi 10 dk (600 s) — sınırı aşan uçuş\n"
+      "BAŞARISIZ sayılır. Firmware bütçe dolunca kalan hedeflerden vazgeçip\n"
+      "RTL yapar; dönüş + iniş de 10 dk'ya dahilse rezerv bırakın (ör. 540 s).\n"
+      "0 girilirse alan gönderilmez (firmware varsayılanı 600 s kullanılır);\n"
+      "60 s altı değerler de gönderilmez.")
     sc_f.addRow("Tarama Hızı:", self._scan_speed)
     sc_f.addRow("Bırakma Yarıçapı:", self._drop_radius)
     sc_f.addRow("WP Kabul Yarıçapı:", self._scan_wp_radius)
     sc_f.addRow("Tarama Zaman Aşımı:", self._scan_timeout)
+    sc_f.addRow("Görev Süre Bütçesi:", self._budget_s)
     self._scan_sec = wrap_group(sc_grp, expanded=False)
     lay.addWidget(self._scan_sec)
 
@@ -2518,6 +2650,12 @@ class TargetDropMissionTab(_BaseMissionTab):
     if _bolgeler:
       params["target_areas"] = _bolgeler
 
+    # ── GÖREV SÜRE BÜTÇESİ (mission_time_budget_s) ────────────────────────
+    # 0 / 60 s altı → alan gönderilmez, firmware kendi varsayılanını (600 s)
+    # kullanır — "boş alan gönderilmez" deseni finish_a/b ile aynı.
+    if self._budget_s.value() >= 60:
+      params["mission_time_budget_s"] = float(self._budget_s.value())
+
     self.mission_ready_to_send.emit(params, [])
     # BUG FIX: _poll_timer bu sınıfta tanımlı değildi → AttributeError kaldırıldı
 
@@ -2551,6 +2689,10 @@ class InfinityMissionTab(_BaseMissionTab):
   _SEL_FINISH_A = "Pist Çizgisi Ucu A"
   _SEL_FINISH_B = "Pist Çizgisi Ucu B"
   _SEL_WP   = "Normal Waypoint"
+
+  # Şartname Görev 1 uçuşu 5 dk (300 s) — kronometre bütçe varsayılanı
+  # (bkz. _BaseMissionTab._CLOCK_DEFAULT_BUDGET_S).
+  _CLOCK_DEFAULT_BUDGET_S = 300.0
 
   def _build_specific_controls(self):
     grp = QGroupBox("Sonsuz Uçuş Görevi (TÜBİTAK Görev 1)")
@@ -2688,6 +2830,29 @@ class InfinityMissionTab(_BaseMissionTab):
     _lbl_accel = QLabel("İvmelenme (WPNAV_ACCEL):"); _lbl_accel.setStyleSheet(_SL)
     form.addRow(_lbl_accel, self._inf_accel)
 
+    # ── GÖREV SÜRE BÜTÇESİ — firmware anahtarı: "mission_time_budget_s" ────
+    # NEDEN: companion ∞ desen fazını bu bütçeyle sınırlar; dolunca görevi
+    # güvenle sonlandırır (IHA/missions/infinity_flight.py:1162 —
+    # p.get("mission_time_budget_s"); anahtar KODDAN doğrulandı, Görev 2 ile
+    # AYNI anahtar. Gönderilmez/0 ise firmware yol uzunluğundan otomatik
+    # tavan türetir: yol/v_min·2.5 + 60 s). Şartname Görev 1 uçuşunu 5 dk
+    # (300 s) ile sınırlar. Soldaki GÖREV KRONOMETRESİ bütçesi de bu alandan
+    # okunur.
+    self._budget_s = QSpinBox()
+    self._budget_s.setRange(0, 3600)
+    self._budget_s.setValue(300)
+    self._budget_s.setSuffix(" s")
+    self._budget_s.setSpecialValueText("gönderme (fw: otomatik)")
+    self._budget_s.setMaximumWidth(160)
+    self._budget_s.setToolTip(
+      "Şartname: Görev 1 uçuş süresi 5 dk (300 s) — sınırı aşan uçuş\n"
+      "BAŞARISIZ sayılır. Bütçe ∞ desen fazını sınırlar; dolunca görev\n"
+      "güvenle sonlandırılır. Kalkış/dönüş de 5 dk'ya dahilse rezerv bırakın\n"
+      "(ör. 270 s). 0 girilirse alan gönderilmez (firmware yol uzunluğundan\n"
+      "kendi tavanını türetir); 60 s altı değerler de gönderilmez.")
+    _lbl_budget = QLabel("Görev Süre Bütçesi:"); _lbl_budget.setStyleSheet(_SL)
+    form.addRow(_lbl_budget, self._budget_s)
+
     # ── İNCE-AYAR PARAMETRELERİ (2026-08-25 — DEVIR, Görev 1 parametre
     # süpürmesi) ──────────────────────────────────────────────────────────
     # NEDEN eklendi: companion (missions/infinity_flight.py) bu 4 alanı
@@ -2748,7 +2913,8 @@ class InfinityMissionTab(_BaseMissionTab):
 
     # tekerlek koruması: paneli kaydırırken sayısal alanlar bozulmasın
     guard_wheel(self._inf_algo, self._inf_alt, self._inf_laps, self._inf_accel,
-                self._inf_bank, self._inf_radius, self._inf_lookahead, self._inf_cross_mult)
+                self._inf_bank, self._inf_radius, self._inf_lookahead,
+                self._inf_cross_mult, self._budget_s)
 
     lay.addLayout(form)
 
@@ -2845,21 +3011,54 @@ class InfinityMissionTab(_BaseMissionTab):
     if len(pts) < 2:
       return None, "Rota: geçerli nokta üretilemedi."
 
+    # ── ŞARTNAMENİN SON BACAĞI (2026-08-30 denetimi) ──────────────────────
+    # Pist Ucu A/B doluysa gerçek uçuş, desen bittikten sonra direk 2'yi son
+    # kez DIŞINDAN dolanır, pist başlangıç/bitiş çizgisini keser ve kalkış
+    # noktasına iner (companion finish_a/finish_b bacağı). Önizleme bunu HİÇ
+    # çizmiyordu — "önizleme = uçulan rota" sözleşmesi bozuktu. Buradaki
+    # bacak ŞEMATİKTİR: ek dolanmanın tam eğrisi üretilmez; niyet (desen
+    # sonu → direk 2 arkası → pist çizgisi ortası → kalkış) düz parçalarla
+    # gösterilir ve haritada KESİKLİ + ayrı renkte çizilir (drawRouteExtra).
+    finish_leg = None
+    finish_ab = None
+    try:
+      fa = (float(self._fa_lat.text()), float(self._fa_lon.text()))
+      fb = (float(self._fb_lat.text()), float(self._fb_lon.text()))
+    except ValueError:
+      fa = fb = None   # Pist uçları boş → önizleme eski davranışında kalır
+    if fa is not None and fb is not None:
+      # Direk 2'nin "arkası": direk1→direk2 doğrultusunda dönüş yarıçapı
+      # kadar ötesi — ek dolanmanın en dış noktasının kaba temsilcisi.
+      _brg = _bearing(p1["lat"], p1["lon"], p2["lat"], p2["lon"])
+      _behind = _offset_point(p2["lat"], p2["lon"], _brg, max(8.0, radius))
+      _mid_ab = ((fa[0] + fb[0]) / 2.0, (fa[1] + fb[1]) / 2.0)
+      finish_leg = [pts[-1], _behind, _mid_ab, tkf]
+      finish_ab = [fa, fb]
+
     # Gerçek uçuş yolu kalkıştan başlar ve RTH açıksa oraya döner —
     # önizlemenin bunu göstermesi gerekir, yoksa operatör kalkış ile ∞
-    # arasındaki geçiş bacağını hiç görmez.
+    # arasındaki geçiş bacağını hiç görmez. Son bacak çiziliyorsa dönüş O
+    # BACAK üzerinden gösterilir; aynı dönüşü ikinci kez düz RTH çizgisi
+    # olarak çizmek iki farklı dönüş yolu varmış izlenimi verirdi.
     full = [tkf] + pts
-    if self._rth_cb.isChecked():
+    if self._rth_cb.isChecked() and finish_leg is None:
       full.append(tkf)
 
     # Yol uzunluğu ve kaba süre (döngü hızıyla; DUBINS'te düz geçiş daha hızlı
     # olduğu için bu tahmin ÜST sınırdır, uçuş biraz daha kısa sürer).
     length = sum(_haversine(full[i][0], full[i][1], full[i + 1][0], full[i + 1][1])
                  for i in range(len(full) - 1))
+    if finish_leg is not None:
+      # Son bacak da uçulacak yolun parçası — uzunluk/süre tahminine dahil.
+      length += sum(
+        _haversine(finish_leg[i][0], finish_leg[i][1],
+                   finish_leg[i + 1][0], finish_leg[i + 1][1])
+        for i in range(len(finish_leg) - 1))
     return full, {
       "n": len(pts), "length_m": length, "radius": radius,
       "loop_v": loop_v, "cross_v": cross_v, "dist": dist, "algo": algo,
       "eta_s": length / max(0.5, loop_v),
+      "finish_leg": finish_leg, "finish_ab": finish_ab,
     }
 
   def _refresh_inf_preview(self, fit: bool = False):
@@ -2876,6 +3075,14 @@ class InfinityMissionTab(_BaseMissionTab):
       return
     try:
       self._map.draw_route(pts, _MAP_ROUTE_COLOR, fit=fit)
+      # Son bacak: pist çizgisi (düz, A-B hattı) + şematik bitiş bacağı
+      # (kesikli). drawRoute her çağrıda önizleme katmanını sıfırladığı için
+      # ekler ONDAN SONRA çizilmeli (draw_route_extra temizlemez, ekler).
+      if info.get("finish_ab"):
+        self._map.draw_route_extra(list(info["finish_ab"]), _MAP_FINISH_COLOR)
+      if info.get("finish_leg"):
+        self._map.draw_route_extra(list(info["finish_leg"]),
+                                   _MAP_FINISH_COLOR, dash="7,7")
     except Exception:
       pass
     _eta = info["eta_s"]
@@ -2887,7 +3094,11 @@ class InfinityMissionTab(_BaseMissionTab):
       f"Döngü hızı {info['loop_v']:.1f} m/s"
       + (f", düz geçiş {info['cross_v']:.1f} m/s" if info["algo"] == "DUBINS"
          and info["cross_v"] > info["loop_v"] + 0.05 else "")
-      + f".  İrtifa {self._inf_alt.value():.0f} m.")
+      + f".  İrtifa {self._inf_alt.value():.0f} m."
+      + ("  Son bacak (direk 2 ek dolanması + pist çizgisi geçişi) haritada "
+         "kesikli yeşille ŞEMATİK çizildi." if info.get("finish_leg") else
+         "  Pist Ucu A/B boş — şartnamenin son bacağı çizilmedi (araç düz "
+         "RTL/LOITER ile bitirir)."))
 
   # ── WP'leri QGC .waypoints olarak indir ───────────────────────────────────
   def _on_download_wp(self):
@@ -3058,6 +3269,11 @@ class InfinityMissionTab(_BaseMissionTab):
       "lookahead_m":              self._inf_lookahead.value(),
       "infinity_cross_speed_mult": self._inf_cross_mult.value(),
     })
+    # ── GÖREV SÜRE BÜTÇESİ (mission_time_budget_s) ────────────────────────
+    # 0 / 60 s altı → alan gönderilmez; companion yol uzunluğundan kendi
+    # güvenli tavanını türetir (infinity_flight.py:1155-1168 NEDEN bloğu).
+    if self._budget_s.value() >= 60:
+      params["mission_time_budget_s"] = float(self._budget_s.value())
     # turn_radius_m: 0 = "otomatik" (companion D/2.75'ten türetir) —
     # yalnızca operatör AÇIKÇA bir değer girdiyse gönderilir (finish_a/b ile
     # AYNI "isteğe bağlı alan" deseni).
@@ -3133,6 +3349,17 @@ class MissionPanelView(QWidget):
     # Hedef tespit bildirimini dışarı taşı (Görev 2 sekmesi → panel → uygulama)
     self._target_drop_tab.target_detected.connect(self.target_detected)
 
+    # ── GÖREV KRONOMETRESİ köprüsü (2026-08-30 şartname denetimi) ─────────
+    # NEDEN sekme takibi: TopBar'daki "GÖREVİ BAŞLAT" hangi görevin yüklü
+    # olduğunu bilmez; saat, görevi EN SON GÖNDEREN sekmede başlamalıdır
+    # (bütçe o sekmenin "Görev Süre Bütçesi" alanından okunur). Hiç gönderim
+    # yoksa (YKİ yeniden açıldı, görev companion'da hazır) açık sekme
+    # kullanılır — bkz. notify_mission_started.
+    self._last_sent_tab = None
+    for tab in _all_tabs:
+      tab.mission_ready_to_send.connect(
+        lambda *_a, _t=tab: setattr(self, "_last_sent_tab", _t))
+
   @pyqtSlot(dict)
   def update_telemetry(self, data: dict):
     for tab in (self._target_drop_tab, self._infinity_tab):
@@ -3142,3 +3369,42 @@ class MissionPanelView(QWidget):
   def update_detection_status(self, resp: dict):
     """Air'den gelen durum yanıtını Görev 2 sekmesine ilet."""
     self._target_drop_tab.update_detection_status(resp)
+
+  # ── Görev kronometresi köprüsü (bkz. _BaseMissionTab kronometre bloğu) ────
+  def _clock_tabs(self):
+    return (self._target_drop_tab, self._infinity_tab)
+
+  @pyqtSlot()
+  def notify_mission_started(self) -> None:
+    """TopBar başlat onayı (companion VEYA FCU) — saat o an başlar.
+
+    NEDEN telemetri beklenmez: başlat komutunun araca ulaşması / companion'ın
+    "görev aktif" demesi arasındaki saniyeler de şartname saatinden yer;
+    operatör gerçek geçen süreyi görmelidir (yerel QTimer, telemetriden
+    bağımsız)."""
+    tab = self._last_sent_tab or self._tabs.currentWidget()
+    for t in self._clock_tabs():
+      if t is not tab:
+        t.stop_mission_clock()
+    if tab in self._clock_tabs():
+      tab.start_mission_clock()
+
+  @pyqtSlot()
+  def notify_mission_stopped(self) -> None:
+    """Görev bitti/iptal edildi (TopBar abort ya da companion durum akışı)."""
+    for t in self._clock_tabs():
+      t.stop_mission_clock()
+
+  @pyqtSlot(bool)
+  def set_mission_running(self, running: bool) -> None:
+    """Companion mission.active kenar geçişleri (main_window._on_rpi_status).
+
+    NEDEN True kenarı yalnızca saat HİÇ çalışmıyorsa başlatır: başlat butonu
+    saati birkaç saniye önce zaten başlatmıştır; yeniden başlatmak geçen
+    süreyi (yanlış şekilde) siler ve operatörü olduğundan erken bir zamanda
+    sanırdı. False kenarı her durumda durdurur (görev bitti/iptal)."""
+    if running:
+      if not any(t.mission_clock_running() for t in self._clock_tabs()):
+        self.notify_mission_started()
+    else:
+      self.notify_mission_stopped()

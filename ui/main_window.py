@@ -361,6 +361,19 @@ class MainWindow(QMainWindow):
 
         # TopBar — görev başlatma companion'a (ai_worker)
         self.top_bar.start_mission_requested.connect(self.ai_worker.send_start_command)
+        # ── GÖREV KRONOMETRESİ (2026-08-30 şartname denetimi) ────────────
+        # NEDEN: şartname uçuş süresini sınırlar (Görev 1: 5 dk, Görev 2:
+        # 10 dk) ve sınırı aşan uçuş BAŞARISIZ sayılır. Saat, operatörün
+        # başlat ONAYI anında telemetriden bağımsız başlar — her iki
+        # başlatma yolu (companion + FCU) da aynı saati sürer. Abort saati
+        # durdurur; companion görev durumu kenar geçişleri _on_rpi_status
+        # içinde ayrıca bağlıdır (görev kendiliğinden bitince de durur).
+        self.top_bar.start_mission_requested.connect(
+            self._mission_panel.notify_mission_started)
+        self.top_bar.fcu_start_mission_requested.connect(
+            self._mission_panel.notify_mission_started)
+        self.top_bar.abort_mission_requested.connect(
+            self._mission_panel.notify_mission_stopped)
         # E3/E4: görevi durdur (companion abort + doğrudan RTL) ve manuel bırakma
         # — handler'a yönlendirilir ki worker yeniden yaratılsa da güncel olanı kullansın
         self.top_bar.abort_mission_requested.connect(self._on_abort_mission)
@@ -1167,7 +1180,20 @@ class MainWindow(QMainWindow):
         mission_running = bool(m_active) and str(m_state).upper() not in (
             "COMPLETED", "ABORTED", "IDLE", "BEKLEMEDE", "ERROR"
         )
+        _was_running = self._last_mission_running
         self._last_mission_running = mission_running
+
+        # ── GÖREV KRONOMETRESİ: companion görev durumu kenar geçişleri ───
+        # NEDEN: görev bitince/iptal olunca sayaç DURMALIDIR; ayrıca YKİ
+        # görevi kendisi başlatmadıysa (çökme sonrası yeniden açılış,
+        # otonom başlatma) yükselen kenar saati yine başlatır.
+        # set_mission_running True kenarında zaten çalışan saati yeniden
+        # BAŞLATMAZ (başlat butonu birkaç sn önce başlatmıştır).
+        if mission_running != _was_running:
+            try:
+                self._mission_panel.set_mission_running(mission_running)
+            except Exception as exc:
+                logger.error("Görev kronometresi güncellenemedi: %s", exc)
 
         # ── KRİTİK: Acil kontrolleri GERÇEK göreve bağla ─────────────────────
         # NEDEN: "DURDUR / RTL" ve "ŞİMDİ BIRAK" ÖNCEDEN yalnızca YKİ'nin BU
