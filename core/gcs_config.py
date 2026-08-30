@@ -31,12 +31,21 @@ DEFAULTS: dict = {
     # bayrağı override eder. Uçtan-uca sim (SITL+IHA-sim) için "real" + 127.0.0.1 host.
     "mode":                   "real",
     "ui_theme":               "dark",        # Arayüz teması: "dark" | "light"
-    "companion_host":         "192.168.1.10",   # İHA RPi — yardımcı bilgisayar + video (8080/8081)
+    "companion_host":         "192.168.1.229",  # İHA RPi — yardımcı bilgisayar + video (8080/8081)
     "companion_mission_port": 5601,
+    # GÜVENLİK (2026-08-25): companion'daki config.json gcs_server.auth_token
+    # ile BİREBİR AYNI olmalı. Boş ("") = kimlik doğrulama KAPALI — port 5601
+    # aynı WiFi/telemetri ağındaki HERKESE açık kalır (companion 0.0.0.0'da
+    # dinliyor, yalnızca localhost değil). Gerçek uçuş/yarışma öncesi rastgele
+    # bir dizgiyle DOLDURUN ve companion tarafında da AYNI değeri girin.
+    "companion_auth_token":   "",
     "companion_status_port":  5602,
     "companion_video_port":   8081,          # İşlenmiş video (görev sırasında, vision annotated)
     "companion_video_raw_port": 8080,        # Ham kamera (her zaman açık)
-    "mavlink_host":           "192.168.1.10",   # MAVLink de aynı RPi üzerinden (port 5763)
+    # tools/human_guided_bench.py'nin MJPEG portu (--port, varsayılan 8090) —
+    # normal uçuş kamerasından (8080/8081) AYRI, saha testi paneli bunu kullanır.
+    "companion_bench_port":  8090,
+    "mavlink_host":           "192.168.1.229",  # MAVLink de aynı RPi üzerinden (port 5763)
     "mavlink_port":           5763,
     # FIX P1-4: Timeout değerleri artık configurable
     "ai_connect_timeout":     5.0,           # AISocketWorker TCP bağlantı timeout (s)
@@ -46,44 +55,39 @@ DEFAULTS: dict = {
     "video_open_timeout":     5.0,           # VideoStreamWorker HTTP bağlantı timeout (s)
     "video_retry_delay":      10,            # VideoStreamWorker yeniden deneme aralığı (s)
 
-    # ── Anten Takip Sistemi (RUTX10 + Pixhawk 2.4.8 gimbal) ────────────────
-    "antenna_tracker_enabled":  False,       # Anten takip aktif mi (kullanıcı açar)
-    "antenna_pixhawk_conn":     "udp:0.0.0.0:14560",  # Anten Pixhawk MAVLink adresi (RUTX10 üzerinden)
-    "antenna_tracker_mode":     "forward",   # "forward" (ArduPilot AntennaTracker) | "compute" (YKİ hesaplar)
-    "antenna_home_lat":         0.0,         # Anten sabit konumu (0 → otomatik Pixhawk GPS)
-    "antenna_home_lon":         0.0,
-    "antenna_home_alt":         0.0,
-    "antenna_min_distance_m":   3.0,         # Bu mesafeden yakında anteni oynatma (gürültü önleme)
-    "antenna_update_hz":        5.0,         # Takip güncelleme hızı
+    # ── RTK GPS izleme paneli (u-blox F9P, NMEA üzerinden salt-okunur) ──────
+    # NOT: Bu YALNIZCA canlı durum göstergesidir — İHA'ya RTCM düzeltme
+    # AKTARMAZ (o ayrı bir özellik, ntrip_worker + MAVLink GPS_RTCM_DATA).
+    "rtk_gps_enabled":  True,             # panel worker'ı başlasın mı
+    # NEDEN by-id path (2026-08-28, kullanıcı talebi — F9P u-center'da RTCM3
+    # USB moduna alındı + 115200 baud): İLK denemede RFD900A telemetri
+    # radyosunun CP2102 USB-UART köprüsü YANLIŞLIKLA F9P sanılmıştı (ikisi de
+    # o an bağlıydı, RFD'nin akışı ArduPilot parametre listesi — EK3_* —
+    # çıkarınca fark edildi). RFD çıkarılıp SADECE F9P bağlıyken doğru port
+    # bulundu: F9P kendi NATIVE USB'sinde (u-blox CDC-ACM, /dev/ttyACM0),
+    # ham baytlarla DOĞRULANDI (0xD3 RTCM3 preamble'ı + \xb5\x62 UBX sync +
+    # okunabilir $GNRMC NMEA cümlesi). by-id path /dev/ttyACM* numarasının
+    # değişmesine karşı dayanıklı (Pixhawk bağlantısıyla AYNI desen).
+    "rtk_gps_port":     "/dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_GNSS_receiver-if00",
+    "rtk_gps_baud":     115200,
 
-    # ── Step motor direği (NEMA 17 + TB6600, YKİ'nin koştuğu RPi4 GPIO'sundan) ──
-    # Sürüş katmanı: core/stepper_driver.py. Arka uç "auto" → pigpio varsa onu,
-    # yoksa RPi.GPIO'yu, o da yoksa sim'i (donanımsız dizüstü) kullanır.
-    "antenna_drive":            "pixhawk",   # "pixhawk" (eski) | "stepper" (NEMA17+TB6600)
-    "antenna_stepper_backend":  "auto",      # "auto" | "pigpio" | "rpigpio" | "sim"
-    # Pin numaraları BCM. Mekanik henüz yok — gear_ratio takılan dişliye göre
-    # güncellenir, kod değişmez. min/max: kablo sarmasını önleyen yumuşak limit.
-    # Azimut: iki katı dayanak arası 270° (sol limit -135°, sağ limit +135°).
-    # Elevasyon: yatayın 10° altı ile 60° üstü arası (toplam 70°).
-    # gear_ratio saha kurulumunda arayüzden girilir; adım/derece otomatik
-    # yeniden hesaplanır (bkz. StepperAxis.set_gear_ratio).
-    "antenna_axis_az": {
-        "step_pin": 17, "dir_pin": 27, "ena_pin": 22, "ena_active_low": True,
-        "invert_dir": False, "motor_steps_per_rev": 200, "microstep": 8,
-        "gear_ratio": 1.0, "min_deg": -135.0, "max_deg": 135.0,
-        "max_speed_dps": 20.0, "accel_dps2": 40.0,
-    },
-    "antenna_axis_el": {
-        "step_pin": 23, "dir_pin": 24, "ena_pin": 25, "ena_active_low": True,
-        "invert_dir": False, "motor_steps_per_rev": 200, "microstep": 8,
-        "gear_ratio": 1.0, "min_deg": -10.0, "max_deg": 60.0,
-        "max_speed_dps": 15.0, "accel_dps2": 30.0,
-    },
-    # Kapalı çevrim: anten üzerindeki uçuş kontrol kartının manyetometresinden
-    # gelen GERÇEK yön ile adım sayacı arasındaki farkı yavaşça kapatır
-    # (kaçan adımları telafi eder). 0 → kapalı çevrim kapalı, saf açık çevrim.
-    "antenna_heading_correction_gain": 0.25,  # 0..1, tik başına düzeltme oranı
-    "antenna_heading_deadband_deg":    2.0,   # bu farkın altını düzeltme (salınım önler)
+    # ── NTRIP (TUSAGA-Aktif) ─────────────────────────────────────────────
+    # NEDEN varsayılan dolu (2026-08-28, kullanıcı talebi): "Gelişmiş → RTK/
+    # NTRIP" sekmesi her seferinde elle doldurulmasın diye kullanıcının
+    # kendi TUSAGA-Aktif abonelik bilgileri buraya varsayılan olarak
+    # gömüldü, VE ntrip_autostart=True ile YKİ açılışında otomatik
+    # bağlanır (bkz. main_window._start_workers). Mountpoint BÜYÜK HARF
+    # olmalı ("VRSRTCM34") — sourcetable'da böyle kayıtlı, küçük harfle
+    # caster SOURCETABLE yanıtı döner (bkz. RTK_DEVIR.md).
+    # GÜVENLİK NOTU: bu, gerçek bir abonelik şifresini düz metin olarak
+    # kaynak koduna gömer — bu repo git'e push edilirse şifre repo
+    # geçmişinde kalır. Kullanıcı bilerek bu kolaylığı istedi.
+    "ntrip_autostart":  True,
+    "ntrip_host":       "212.156.70.42",
+    "ntrip_port":       2101,
+    "ntrip_mountpoint": "VRSRTCM34",
+    "ntrip_username":   "NTRIP_KULLANICI_BURAYA",
+    "ntrip_password":   "NTRIP_SIFRE_BURAYA",
 }
 
 
@@ -155,6 +159,10 @@ class GCSConfig:
         return int(self._data["companion_mission_port"])
 
     @property
+    def companion_auth_token(self) -> str:
+        return str(self._data.get("companion_auth_token", "") or "")
+
+    @property
     def companion_status_port(self) -> int:
         return int(self._data["companion_status_port"])
 
@@ -166,56 +174,47 @@ class GCSConfig:
     def companion_video_raw_port(self) -> int:
         return int(self._data.get("companion_video_raw_port", 8080))
 
-    # ── Anten Takip property'leri ─────────────────────────────────────────
     @property
-    def antenna_tracker_enabled(self) -> bool:
-        return bool(self._data.get("antenna_tracker_enabled", False))
+    def companion_bench_port(self) -> int:
+        return int(self._data.get("companion_bench_port", 8090))
+
+    # ── RTK GPS izleme paneli ────────────────────────────────────────────────
+    @property
+    def rtk_gps_enabled(self) -> bool:
+        return bool(self._data.get("rtk_gps_enabled", True))
 
     @property
-    def antenna_pixhawk_conn(self) -> str:
-        return str(self._data.get("antenna_pixhawk_conn", "udp:0.0.0.0:14560"))
+    def rtk_gps_port(self) -> str:
+        return str(self._data.get("rtk_gps_port", "/dev/ttyACM0"))
 
     @property
-    def antenna_tracker_mode(self) -> str:
-        return str(self._data.get("antenna_tracker_mode", "forward"))
+    def rtk_gps_baud(self) -> int:
+        return int(self._data.get("rtk_gps_baud", 38400))
+
+    # ── NTRIP ─────────────────────────────────────────────────────────────
+    @property
+    def ntrip_autostart(self) -> bool:
+        return bool(self._data.get("ntrip_autostart", False))
 
     @property
-    def antenna_home(self) -> tuple:
-        return (float(self._data.get("antenna_home_lat", 0.0)),
-                float(self._data.get("antenna_home_lon", 0.0)),
-                float(self._data.get("antenna_home_alt", 0.0)))
+    def ntrip_host(self) -> str:
+        return str(self._data.get("ntrip_host", ""))
 
     @property
-    def antenna_min_distance_m(self) -> float:
-        return float(self._data.get("antenna_min_distance_m", 3.0))
-
-    # ── Step motor direği ────────────────────────────────────────────────
-    @property
-    def antenna_drive(self) -> str:
-        """'pixhawk' (MAVLink mount komutu) | 'stepper' (NEMA17 + TB6600)."""
-        v = str(self._data.get("antenna_drive", "pixhawk")).strip().lower()
-        return v if v in ("pixhawk", "stepper") else "pixhawk"
+    def ntrip_port(self) -> int:
+        return int(self._data.get("ntrip_port", 2101))
 
     @property
-    def antenna_stepper_backend(self) -> str:
-        v = str(self._data.get("antenna_stepper_backend", "auto")).strip().lower()
-        return v if v in ("auto", "pigpio", "rpigpio", "sim") else "auto"
+    def ntrip_mountpoint(self) -> str:
+        return str(self._data.get("ntrip_mountpoint", ""))
 
     @property
-    def antenna_axes(self) -> dict:
-        """build_mount() için {'az': {...}, 'el': {...}} sözlüğü."""
-        return {"az": dict(self._data.get("antenna_axis_az") or {}),
-                "el": dict(self._data.get("antenna_axis_el") or {})}
+    def ntrip_username(self) -> str:
+        return str(self._data.get("ntrip_username", ""))
 
     @property
-    def antenna_heading_correction(self) -> tuple:
-        """(kazanç, ölü bant derece) — kapalı çevrim yön düzeltmesi."""
-        return (float(self._data.get("antenna_heading_correction_gain", 0.25)),
-                float(self._data.get("antenna_heading_deadband_deg", 2.0)))
-
-    @property
-    def antenna_update_hz(self) -> float:
-        return float(self._data.get("antenna_update_hz", 5.0))
+    def ntrip_password(self) -> str:
+        return str(self._data.get("ntrip_password", ""))
 
     # FIX P1-4: Timeout property'leri
     @property

@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core import theme
+from core.gcs_config import config
 
 logger = logging.getLogger(__name__)
 
@@ -471,23 +472,32 @@ class AdvancedView(QWidget):
         form.setSpacing(6)
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
 
+        # NEDEN varsayılan değerler config'ten (2026-08-28, kullanıcı talebi):
+        # kullanıcının TUSAGA-Aktif abonelik bilgileri gcs_config.py'de kayıtlı
+        # (ntrip_host/port/mountpoint/username/password) — panel her açılışta
+        # elle doldurulmasın diye buradan önceden dolduruluyor. Otomatik
+        # başlatma main_window._start_workers()'ta (ntrip_autostart=True ise).
         self._ntrip_host = QLineEdit()
         self._ntrip_host.setPlaceholderText("rtk2go.com")
         self._ntrip_host.setMaximumWidth(220)
+        self._ntrip_host.setText(config.ntrip_host)
         self._ntrip_port = QSpinBox()
         self._ntrip_port.setRange(1, 65535)
-        self._ntrip_port.setValue(2101)
+        self._ntrip_port.setValue(config.ntrip_port or 2101)
         self._ntrip_port.setMaximumWidth(120)
         self._ntrip_mount = QLineEdit()
         self._ntrip_mount.setPlaceholderText("MOUNTPOINT")
         self._ntrip_mount.setMaximumWidth(200)
+        self._ntrip_mount.setText(config.ntrip_mountpoint)
         self._ntrip_user = QLineEdit()
         self._ntrip_user.setPlaceholderText("Kullanıcı adı")
         self._ntrip_user.setMaximumWidth(200)
+        self._ntrip_user.setText(config.ntrip_username)
         self._ntrip_pass = QLineEdit()
         self._ntrip_pass.setPlaceholderText("Şifre")
         self._ntrip_pass.setEchoMode(QLineEdit.EchoMode.Password)
         self._ntrip_pass.setMaximumWidth(200)
+        self._ntrip_pass.setText(config.ntrip_password)
 
         form.addRow("Sunucu IP/Host:", self._ntrip_host)
         form.addRow("Port:", self._ntrip_port)
