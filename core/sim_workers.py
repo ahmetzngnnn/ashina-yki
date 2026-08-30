@@ -201,7 +201,7 @@ class FakeRpiStatusWorker(RpiStatusWorker):
                 "fc_mission": {"type": "teknofest_task1", "wp_count": 6,
                                "source": "companion", "ts": int(t0)},
                 "payload_loaded": True,
-                "servo_state": {"gimbal_angle": 30.0, "grabber": "close",
+                "servo_state": {"gimbal_angle": 90.0, "grabber": "close",
                                 "red_drop": "close", "blue_drop": "close",
                                 "last_cmd_ok": {}},
                 "vision_status": {"connected": True, "target_detected": (int(t) % 6 < 2)},

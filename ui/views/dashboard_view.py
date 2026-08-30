@@ -1425,14 +1425,28 @@ class DashboardView(QWidget):
         # (yere dik) — gimbal artık açılışta otomatik bu konuma gidiyor
         # (bkz. main.py _home_servos_on_startup), slider varsayılanı da
         # gerçek başlangıç durumuyla eşleşsin diye 90'da başlıyor.
-        lbl_gimbal = QLabel("Gimbal Açısı (90°=Nadir/Yere Dik):")
+        # ── 2026-08-30: GİMBAL SÖKÜLDÜ ──────────────────────────────────
+        # Kamera gövdeye SABİT monte edildi ve daima nadire (90°) bakıyor.
+        # Kontrol KALDIRILMADI, DEVRE DIŞI bırakıldı: gimbal geri takılırsa
+        # (İHA config.json servos.gimbal.present=true) tek satırla geri gelir.
+        # Companion tarafı bu komutu zaten gerekçeli hata ile reddediyor
+        # (comms/gcs_server.py) — burada da göstermek, operatörün olmayan bir
+        # kontrolü denemesini baştan engelliyor.
+        lbl_gimbal = QLabel("Gimbal Açısı — ARAÇTA GİMBAL YOK")
         lbl_gimbal.setObjectName("mutedLabel")
+        lbl_gimbal.setToolTip(
+            "Kamera gövdeye sabit monte edildi ve daima nadire (90°) bakıyor.\n"
+            "Araç tutumunun telafisi artık yazılımda yapılıyor "
+            "(missions/task2/camera_pose.py).\n"
+            "Gimbal geri takılırsa İHA config.json → servos.gimbal.present=true.")
         self.gimbal_slider = QSlider(Qt.Orientation.Horizontal)
         self.gimbal_slider.setRange(15, 90)
         self.gimbal_slider.setValue(90)
+        self.gimbal_slider.setEnabled(False)
+        self.gimbal_slider.setToolTip(lbl_gimbal.toolTip())
         # Küçük accent değer — valueLabel (18px) bu ızgara satırına sığmıyor,
         # bu yüzden satır-içi kalıyor ama rengi tema token'ından geliyor.
-        self.lbl_gimbal_val = QLabel("90°")
+        self.lbl_gimbal_val = QLabel("90° sabit")
         self.lbl_gimbal_val.setStyleSheet(self._gimbal_val_css())
         
         # Sinyal bağlantıları
