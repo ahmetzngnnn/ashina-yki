@@ -11,6 +11,15 @@ Sekmeler:
 
 import json
 import math
+
+
+def _vfov_deg(hfov_deg: float, en_boy: float = 0.75) -> float:
+  """HFOV -> VFOV, pinhole tanjant bağıntısıyla (İHA ile AYNI).
+
+  tan(vfov/2) = (H/W)·tan(hfov/2).  4:3 karede H/W = 0.75.
+  `vfov = hfov·0.75` kestirmesi 65.9°'de 2.4° hata verir.
+  """
+  return 2.0 * math.degrees(math.atan(en_boy * math.tan(math.radians(hfov_deg) / 2.0)))
 import time
 import logging
 
@@ -1544,7 +1553,10 @@ class TargetDropMissionTab(_BaseMissionTab):
     # ── Kamera / Gimbal ───────────────────────────────────────────────────
     cam_grp = QGroupBox("Kamera / Gimbal"); cam_f = QFormLayout(cam_grp); cam_f.setSpacing(5)
     cam_f.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
-    self._scan_tilt = _isb(30, 90, 50, "°")
+    # 2026-08-30: İLERİ-BAKIŞ AÇISI (tilt) alanı KALDIRILDI — araçta gimbal
+    # YOK, kamera gövdeye sabit ve daima nadire bakıyor. Ayarlanacak bir açı
+    # kalmadı. (Firmware tarafı: config servos.gimbal.present=false,
+    # tuning body_fixed_camera=1, scan_tilt=90.)
 
     # ── KALİBRASYON EZME — VARSAYILAN OLARAK KAPALI ────────────────────────
     # NEDEN: bu alan İHA'nın ÖLÇÜLEN kalibrasyonunu (config.camera.calibration)
@@ -1597,7 +1609,6 @@ class TargetDropMissionTab(_BaseMissionTab):
       "merkezde olduğu için 0. Sıfırdan farklı değer, hedefin yer izdüşümünü\n"
       "o kadar kaydırır.")
 
-    cam_f.addRow("İleri-Bakış Açısı (tilt):", self._scan_tilt)
     # Tek arg → satır iki sütuna yayılır; "" etiketli form satırı checkbox
     # metnini sağ sütuna sıkıştırıp kırpıyordu.
     cam_f.addRow(self._cam_hfov_override)
@@ -1691,12 +1702,13 @@ class TargetDropMissionTab(_BaseMissionTab):
     self._pin_drop2 = _isb(5, 9, 7)
     self._pin_grabL = _isb(5, 9, 8)
     self._pin_grabR = _isb(5, 9, 9)
-    self._pin_gimbal = _isb(5, 9, 5)
+    # 2026-08-30: SERVO5 (gimbal) alanı KALDIRILDI — kanal BOŞTA. Buraya
+    # yeni bir aktüatör bağlanırsa hem bu panel hem İHA config.json
+    # fc_params_expected SERVO5_FUNCTION güncellenmelidir.
     pin_form.addRow("Kırmızı Yük (red_drop):", self._pin_drop1)
     pin_form.addRow("Mavi Yük (blue_drop):", self._pin_drop2)
     pin_form.addRow("Sol Kapak (grab_L):", self._pin_grabL)
     pin_form.addRow("Sağ Kapak (grab_R):", self._pin_grabR)
-    pin_form.addRow("Gimbal (pitch):", self._pin_gimbal)
     self._pin_sec = wrap_group(pin_grp, expanded=False)
     lay.addWidget(self._pin_sec)
 
@@ -1718,13 +1730,8 @@ class TargetDropMissionTab(_BaseMissionTab):
 
     g3_f = QFormLayout(); g3_f.setSpacing(5)
     g3_f.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
-    self._grab_gimbal = _dsb(60, 90, 90.0, 1.0, "°", 0)
-    self._grab_gimbal.setToolTip(
-      "Yük alma sırasındaki gimbal açısı. 90° = tam aşağı (nadir).\n"
-      "Nadirden sapma, İRTİFADAN BAĞIMSIZ sabit bir piksel kayması üretir:\n"
-      "kamera öne bakınca araç yükün tam üstündeyken bile yük karede\n"
-      "merkezde görünmez. ÖLÇÜLDÜ: 85°'de normalize hataya sabit +0.18\n"
-      "eklendi (kapı 0.35) ve araç yükün 17 cm yanındayken bile tırmandı.")
+    # 2026-08-30: Görev 3 gimbal açısı alanı KALDIRILDI — gimbal yok,
+    # kavrama zaten nadirden yapılıyor (firmware grab_gimbal=90 sabiti).
 
     self._grab_vz_max = _dsb(0.1, 1.5, 0.60, 0.05, " m/s", 2)
     self._grab_vz_max.setToolTip("Tam hizalıyken azami alçalma hızı.")
@@ -1749,7 +1756,6 @@ class TargetDropMissionTab(_BaseMissionTab):
       "inmek daha isabetli. Kör fazda düzeltme zaten yok; tek değişken\n"
       "bozucuya maruz kalma SÜRESİ. 480 benzetim uçuşunda 0.50→0.60→0.80\n"
       "m/s gittikçe isabet monoton arttı (415→445→464 / 480).")
-    g3_f.addRow("Gimbal Açısı:", self._grab_gimbal)
     g3_f.addRow("Alçalma Hızı (tavan):", self._grab_vz_max)
     g3_f.addRow("Alçalma Kapısı (u):", self._grab_u_gate)
     g3_f.addRow("Taahhüt İrtifası:", self._grab_commit_alt)
@@ -1930,12 +1936,9 @@ class TargetDropMissionTab(_BaseMissionTab):
       "Hizalama tabanında hedefin kadrajı kaplama oranı.\n"
       "1.0 = hedef kadrajı tam doldurur (en alçak geçerli irtifa).\n"
       "0.8 = %25 kenar payı — rüzgâr/yalpa ile hedef kenara kaysa da kırpılmaz.")
-    self._ap_gimbal_cb = QCheckBox("Gimbal hedefi kademeli izlesin")
-    self._ap_gimbal_cb.setChecked(True)
-    self._ap_gimbal_cb.setToolTip(
-      "Kapalıysa gimbal eskisi gibi tek adımda hizalama açısına atlar.\n"
-      "Bu sıçrama hedefi bir karede kadrajın bir ucundan öbürüne taşır ve\n"
-      "dedektörün ardışıklık filtresi bunu tespit kaybı sayar.")
+    # 2026-08-30: 'Gimbal hedefi kademeli izlesin' kutusu KALDIRILDI —
+    # parametresi (approach_gimbal_track) firmware'de ZATEN ölüydü ve
+    # gimbal söküldüğü için kavramın kendisi de kalmadı.
 
     self._ap_floor_red = _dsb(0.0, 20.0, 0.0, 0.5, " m", 1)
     self._ap_floor_blue = _dsb(0.0, 20.0, 0.0, 0.5, " m", 1)
@@ -1950,7 +1953,6 @@ class TargetDropMissionTab(_BaseMissionTab):
     ap_f.addRow("Kırmızı Hizalama Tabanı:", self._ap_floor_red)
     ap_f.addRow("Mavi Hizalama Tabanı:", self._ap_floor_blue)
     ap_v.addLayout(ap_f)
-    ap_v.addWidget(self._ap_gimbal_cb)
 
     self._ap_floor_lbl = QLabel("")
     self._ap_floor_lbl.setWordWrap(True)
@@ -2006,7 +2008,13 @@ class TargetDropMissionTab(_BaseMissionTab):
   # Formüller İHA tarafındakiyle aynı (missions/task2/geometry.py):
   #   çevrel çap  2R = 2·√(2A / (n·sin(2π/n)))
   #   taban        h = extent / (2·fill·tan(fov/2)),  yatay ve dikeyin BÜYÜĞÜ
-  # VFOV oranı da İHA ile aynı: vfov = hfov · 0.75.
+  # VFOV: 2026-08-30 DÜZELTİLDİ. Eskiden `vfov = hfov · 0.75` yazıyordu —
+  # bu, görüş açısının sensör boyutuyla DOĞRUSAL değiştiğini varsayar ve
+  # YANLIŞTIR. Pinhole geometrisinde bağıntı TANJANTLAR üzerindendir:
+  #     tan(vfov/2) = (H/W) · tan(hfov/2)
+  # HFOV 65.9° / 4:3 karede gerçek VFOV 51.80°, eski kural 49.43° veriyordu
+  # — 2.4° hata. İHA tarafı bu düzeltmeyi zaten yapmıştı
+  # (teknofest_task2.py TargetFilter kurulumu); YKİ önizlemesi ayrışıktı.
   @staticmethod
   def _poly_extent_m(area_m2: float, n: int) -> float:
     if area_m2 <= 0 or n < 3:
@@ -2031,7 +2039,7 @@ class TargetDropMissionTab(_BaseMissionTab):
   def _fit_alt_m(extent_m: float, hfov_deg: float, fill: float) -> float:
     if extent_m <= 0 or hfov_deg <= 0:
       return 0.0
-    vfov = hfov_deg * 0.75
+    vfov = _vfov_deg(hfov_deg)
     f = max(0.05, min(1.0, fill))
     hw = extent_m / (2.0 * f * math.tan(math.radians(hfov_deg) / 2.0))
     hh = extent_m / (2.0 * f * math.tan(math.radians(vfov) / 2.0))
@@ -2067,8 +2075,10 @@ class TargetDropMissionTab(_BaseMissionTab):
     if not hasattr(self, "_yaw_stage_lbl"):
       return
     hfov, kaynak = self._geo_hfov()
-    vfov = hfov * 0.75
-    size = 0.08                     # yükün kenarı (m) — tuning.payload_size_m
+    vfov = _vfov_deg(hfov)
+    # 2026-08-30: 0.08 -> 0.061. Firmware tuning.payload_size_m = 0.061
+    # (yük 6.1x6.1x2.1 cm). YKİ önizlemesi 8 cm varsayıyordu — %31 büyük.
+    size = 0.061                    # yükün kenarı (m) — tuning.payload_size_m
     # Kaplama oranı DOĞRUSAL: frac = yük_boyu / kare_dar_kenarı.
     # Kare dar kenarı irtifa h'de: 2·h·tan(vfov/2)  (dikey daima daha dar).
     tan_v = math.tan(math.radians(vfov) / 2.0)
@@ -2241,7 +2251,9 @@ class TargetDropMissionTab(_BaseMissionTab):
       "scan_altitude_m":     self._scan_alt.value(),
       "drop_altitude_m":     self._drop_alt.value(),
       # Kamera / gimbal
-      "scan_tilt_deg":       self._scan_tilt.value(),
+      # "scan_tilt_deg" GÖNDERİLMİYOR (2026-08-30): gimbal söküldü, kamera
+      # sabit nadir. Gönderilseydi firmware'in scan_tilt=90 varsayılanını
+      # EZERDİ — bu tam olarak yaşanan hataydı.
       "cam_offset_cm":       self._cam_offset.value(),
       # Tarama davranışı
       "scan_speed_ms":       self._scan_speed.value(),
@@ -2256,7 +2268,7 @@ class TargetDropMissionTab(_BaseMissionTab):
       "align_descend_max_vz": self._align_max_vz.value(),
       "align_coarse_factor":  self._align_coarse.value(),
       # ── Görev 3 — kamerayla yük alma ────────────────────────────────
-      "grab_gimbal_deg":     self._grab_gimbal.value(),
+      # "grab_gimbal_deg" GÖNDERİLMİYOR — sabit nadir (firmware 90 kullanır).
       "grab_vz_max":         self._grab_vz_max.value(),
       "grab_u_gate":         self._grab_u_gate.value(),
       "grab_commit_alt":     self._grab_commit_alt.value(),
@@ -2279,7 +2291,7 @@ class TargetDropMissionTab(_BaseMissionTab):
       # ── Hedefe yaklaşma eğrisi + gimbal izleme (Görev 2 ve 3 ortak) ──
       "approach_curve_enable":  (1.0 if self._ap_enable.isChecked() else 0.0),
       "approach_curve_k":       self._ap_k.value(),
-      "approach_gimbal_track":  (1.0 if self._ap_gimbal_cb.isChecked() else 0.0),
+      # "approach_gimbal_track" GÖNDERİLMİYOR — firmware'de zaten ölü parametre.
       "approach_fill":          self._ap_fill.value(),
       "approach_floor_red_m":   self._ap_floor_red.value(),
       "approach_floor_blue_m":  self._ap_floor_blue.value(),
@@ -2299,7 +2311,6 @@ class TargetDropMissionTab(_BaseMissionTab):
           "drop2": self._pin_drop2.value(),
           "grab_l": self._pin_grabL.value(),
           "grab_r": self._pin_grabR.value(),
-          "gimbal": self._pin_gimbal.value(),
       },
     })
     # ── KAMERA KALİBRASYONU: yalnız operatör AÇIKÇA isterse gönderilir ──

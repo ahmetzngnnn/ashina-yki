@@ -1050,8 +1050,6 @@ class DashboardView(QWidget):
         self._ai_cards: list = []
         # Fix: yol haritası son uygulanan durum listesi (gereksiz stylesheet parse'ı önler)
         self._last_roadmap_statuses = None
-        # Fix: gimbal debounce — son gönderilen açı (tekrar komut göndermemek için)
-        self._last_gimbal_sent = None
         # Kırmızı/mavi manuel PWM slider debounce'u — son gönderilen değerler
         self._last_red_drop_pwm_sent = None
         self._last_blue_drop_pwm_sent = None
@@ -1086,6 +1084,11 @@ class DashboardView(QWidget):
 
     @staticmethod
     def _gimbal_val_css() -> str:
+        """Slider yanindaki accent deger etiketi stili.
+
+        AD TARİHSEL: gimbal slider'ı için yazılmıştı, gimbal 2026-08-30'da
+        söküldü. Kırmızı/mavi yük bırakma PWM slider'ları hâlâ kullanıyor,
+        o yüzden fonksiyon duruyor."""
         return (f"font-weight:bold;color:{theme.c('accent')};"
                 f"font-size:11px;padding-left:4px;")
 
@@ -1120,7 +1123,6 @@ class DashboardView(QWidget):
         self._rpi_msg_log.setStyleSheet(self._log_css("success"))
         self._video_frame.setStyleSheet(self._video_frame_css())
         self._servo_panel.setStyleSheet(self._servo_panel_css())
-        self.lbl_gimbal_val.setStyleSheet(self._gimbal_val_css())
         self._apply_health_bar_colors()
         # Yol haritası: son bilinen durum listesiyle yeniden boyanır
         self._apply_roadmap_styles(
@@ -1425,29 +1427,10 @@ class DashboardView(QWidget):
         # (yere dik) — gimbal artık açılışta otomatik bu konuma gidiyor
         # (bkz. main.py _home_servos_on_startup), slider varsayılanı da
         # gerçek başlangıç durumuyla eşleşsin diye 90'da başlıyor.
-        # ── 2026-08-30: GİMBAL SÖKÜLDÜ ──────────────────────────────────
-        # Kamera gövdeye SABİT monte edildi ve daima nadire (90°) bakıyor.
-        # Kontrol KALDIRILMADI, DEVRE DIŞI bırakıldı: gimbal geri takılırsa
-        # (İHA config.json servos.gimbal.present=true) tek satırla geri gelir.
-        # Companion tarafı bu komutu zaten gerekçeli hata ile reddediyor
-        # (comms/gcs_server.py) — burada da göstermek, operatörün olmayan bir
-        # kontrolü denemesini baştan engelliyor.
-        lbl_gimbal = QLabel("Gimbal Açısı — ARAÇTA GİMBAL YOK")
-        lbl_gimbal.setObjectName("mutedLabel")
-        lbl_gimbal.setToolTip(
-            "Kamera gövdeye sabit monte edildi ve daima nadire (90°) bakıyor.\n"
-            "Araç tutumunun telafisi artık yazılımda yapılıyor "
-            "(missions/task2/camera_pose.py).\n"
-            "Gimbal geri takılırsa İHA config.json → servos.gimbal.present=true.")
-        self.gimbal_slider = QSlider(Qt.Orientation.Horizontal)
-        self.gimbal_slider.setRange(15, 90)
-        self.gimbal_slider.setValue(90)
-        self.gimbal_slider.setEnabled(False)
-        self.gimbal_slider.setToolTip(lbl_gimbal.toolTip())
-        # Küçük accent değer — valueLabel (18px) bu ızgara satırına sığmıyor,
-        # bu yüzden satır-içi kalıyor ama rengi tema token'ından geliyor.
-        self.lbl_gimbal_val = QLabel("90° sabit")
-        self.lbl_gimbal_val.setStyleSheet(self._gimbal_val_css())
+        # 2026-08-30: GİMBAL AÇI KONTROLÜ KALDIRILDI — araçta gimbal YOK.
+        # Kamera gövdeye sabit ve daima nadire (90°) bakıyor; ayarlanacak
+        # açı kalmadı. Araç tutumunun telafisi yazılımda yapılıyor
+        # (İHA missions/task2/camera_pose.py).
         
         # Sinyal bağlantıları
         # NEDEN onay ("Aç" butonları): yük bırakma/kapak açma GERİ ALINAMAZ —
@@ -1469,23 +1452,6 @@ class DashboardView(QWidget):
         btn_grab_close.clicked.connect(
             lambda: self.send_servo_action.emit(
                 "grabber", "close", 0, self.chk_grab_hold_torque.isChecked())
-        )
-        # Etiket anlık güncellenir (ucuz, yerel)
-        self.gimbal_slider.valueChanged.connect(lambda v: self.lbl_gimbal_val.setText(f"{v}°"))
-        # NEDEN: valueChanged sürükleme boyunca her adımda tetikleniyordu → 30-90
-        # aralığında tek sürükleme ~60 ayrı TCP servo komutu üretiyor, komut kuyruğu
-        # (maxsize=10) taşıyor, komutlar düşüyor ve abort/drop gibi kritik komutlar
-        # aynı öncelik sınıfında sırada bekliyordu. Komut artık YALNIZCA sürükleme
-        # bittiğinde (sliderReleased) tek sefer gönderilir.
-        self.gimbal_slider.sliderReleased.connect(self._send_gimbal_cmd)
-        # Klavye/fare tekerleği ile değişimde sliderReleased tetiklenmez → 250 ms
-        # debounce ile tek komut gönderilir (sürükleme sırasında bastırılır).
-        self._gimbal_debounce = QTimer(self)
-        self._gimbal_debounce.setSingleShot(True)
-        self._gimbal_debounce.setInterval(250)
-        self._gimbal_debounce.timeout.connect(self._send_gimbal_cmd)
-        self.gimbal_slider.valueChanged.connect(
-            lambda _v: self._gimbal_debounce.start()
         )
 
         # Kırmızı/mavi manuel PWM slider'ları — gimbal ile AYNI debounce deseni
@@ -1530,9 +1496,6 @@ class DashboardView(QWidget):
         servo_lay.addWidget(lbl_hold, 3, 0)
         servo_lay.addWidget(self.chk_grab_hold_torque, 3, 1, 1, 2)
 
-        servo_lay.addWidget(lbl_gimbal, 4, 0)
-        servo_lay.addWidget(self.gimbal_slider, 4, 1)
-        servo_lay.addWidget(self.lbl_gimbal_val, 4, 2)
 
         servo_lay.addWidget(lbl_red_manual, 5, 0)
         servo_lay.addWidget(self.red_drop_slider, 5, 1)
@@ -1797,21 +1760,6 @@ class DashboardView(QWidget):
         if reply == QMessageBox.StandardButton.Yes:
             self.send_servo_action.emit(channel, action, value, hold_torque)
 
-    # ── Gimbal komutu (debounce'lu) ────────────────────────────────────────
-    def _send_gimbal_cmd(self) -> None:
-        """Gimbal açısını TEK komut olarak gönderir.
-
-        NEDEN: Sürükleme sırasında komut gönderilmez (kuyruk taşmasını ve kritik
-        komutların düşmesini engeller); yalnızca bırakıldığında veya klavye/tekerlek
-        değişiminden 250 ms sonra tek komut gider."""
-        if self.gimbal_slider.isSliderDown():
-            return   # hâlâ sürükleniyor — sliderReleased'de gönderilecek
-        self._gimbal_debounce.stop()
-        val = int(self.gimbal_slider.value())
-        if val == self._last_gimbal_sent:
-            return   # aynı açı — gereksiz komut yok
-        self._last_gimbal_sent = val
-        self.send_servo_action.emit("gimbal", "", val, False)
 
     # ── Kırmızı/mavi yük bırakma manuel PWM (debounce'lu, gimbal ile aynı desen) ──
     def _send_red_drop_pwm_cmd(self) -> None:
