@@ -104,6 +104,18 @@ class MavlinkWorker(QThread):
         # ÖNCEDEN bu slotlar soketi doğrudan GUI thread'inde kullanıyordu ve run()'ın
         # recv_match'iyle AYNI bağlantıya eşzamanlı erişip MAVLink akışını bozabiliyordu.
         self._action_queue: queue.Queue = queue.Queue(maxsize=64)
+        # 2026-08-26 DÜZELTME: inject_rtcm ÖNCEDEN _action_queue'yu set_param/
+        # manual_control/request_log_list ile PAYLAŞIYORDU. Yerel bir F9P baz
+        # istasyonundan (core/rtk_gps_worker.py) RTCM3 aktarımı devreye girince
+        # bu paylaşılan kuyruk saniyede onlarca kez DOLDU ("Aksiyon kuyruğu dolu
+        # — istek atlandı") — canlı ölçüldü. RTCM sürekli/patlamalı bir akış,
+        # ARM/parametre/manuel kontrol gibi SEYREK AMA KRİTİK komutlarla aynı
+        # sınırlı kuyruğu paylaşmamalı: bir drone bağlıyken RTCM baskını ARM
+        # komutunu kuyruktan DÜŞÜREBİLİRDİ. Ayrı, daha büyük bir kuyruk —
+        # RTCM'in kendi patlamaları kendi içinde kalır, diğer komutları asla
+        # etkilemez.
+        self._rtcm_queue: queue.Queue = queue.Queue(maxsize=256)
+        self._rtcm_seq: int = 0  # bkz. _do_inject_rtcm — flags alanındaki 5-bit sequence ID
         self._last_heartbeat_time: float = 0.0
         # ── Yeniden bağlanma durumu (bkz. run() / _note_connect_failure) ──────
         # NEDEN: backoff merdiveninde nerede olduğumuzu ve aynı hatanın kaç kez
@@ -319,7 +331,7 @@ class MavlinkWorker(QThread):
                 except queue.Empty:
                     break
 
-            # Genel aksiyon kuyruğu (set_param/inject_rtcm/... gövdeleri) — worker
+            # Genel aksiyon kuyruğu (set_param/manual_control/... gövdeleri) — worker
             # thread'de çalışır, soket erişimi recv_match ile serileşir.
             while True:
                 try:
@@ -330,6 +342,18 @@ class MavlinkWorker(QThread):
                     action()
                 except Exception as exc:
                     logger.error("Aksiyon çalıştırılamadı: %s", exc)
+
+            # RTCM3 düzeltme kuyruğu — AYRI (bkz. __init__ NEDEN notu), böylece
+            # patlamalı/sık RTCM akışı yukarıdaki genel kuyruğu asla doldurmaz.
+            while True:
+                try:
+                    rtcm_data = self._rtcm_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._do_inject_rtcm(rtcm_data)
+                except Exception as exc:
+                    logger.error("RTCM enjeksiyonu çalıştırılamadı: %s", exc)
 
             # NED hız komutları (yalnızca en güncel komutu gönder)
             last_vel = None
@@ -410,6 +434,9 @@ class MavlinkWorker(QThread):
                     "gps_sats": msg.satellites_visible,
                     "gps_hdop": msg.eph / 100.0 if msg.eph != 65535 else 99.0,
                 })
+                logger.info("IHA_GPS_TESHIS: fix=%s sat=%d eph=%s epv=%s",
+                            _GPS_FIX_NAMES.get(msg.fix_type, "?"), msg.satellites_visible,
+                            msg.eph, msg.epv)
             elif msg_type == "EKF_STATUS_REPORT":
                 self._telemetry_accumulator["ekf_flags"] = msg.flags
             elif msg_type == "STATUSTEXT":
@@ -417,6 +444,7 @@ class MavlinkWorker(QThread):
                 if isinstance(txt, bytes):
                     txt = txt.decode("utf-8", errors="replace")
                 txt = txt.rstrip("\x00")
+                logger.info("STATUSTEXT_TESHIS: sev=%d %s", msg.severity, txt)
                 self.status_text_received.emit(txt, msg.severity)
             elif msg_type == "RC_CHANNELS":
                 self._telemetry_accumulator.update({
@@ -741,17 +769,54 @@ class MavlinkWorker(QThread):
 
     @pyqtSlot(bytes)
     def inject_rtcm(self, data: bytes) -> None:
-        self._enqueue_action(lambda: self._do_inject_rtcm(data))
+        # Ayrı kuyruk — bkz. __init__'teki _rtcm_queue NEDEN notu. _enqueue_action
+        # (paylaşılan _action_queue) KASITLI OLARAK kullanılmıyor.
+        try:
+            self._rtcm_queue.put_nowait(data)
+        except queue.Full:
+            logger.warning("RTCM kuyruğu dolu — düzeltme çerçevesi atlandı "
+                           "(bir sonraki çerçeve zaten yolda, RTK için zararsız)")
 
     def _do_inject_rtcm(self, data: bytes) -> None:
         if self._mav is None:
             return
         try:
             chunk_size = 180
-            flags = 0
-            for i in range(0, len(data), chunk_size):
-                chunk = data[i:i + chunk_size]
-                self._mav.mav.gps_rtcm_data_send(flags, len(chunk), bytearray(chunk))
+            chunks = [data[i:i + chunk_size] for i in range(0, len(data), chunk_size)] or [b""]
+            # NEDEN: GPS_RTCM_DATA.flags biçimi (MAVLink spec) — LSB=fragmented,
+            # sonraki 2 bit=fragment_id, kalan 5 bit=sequence ID. flags HER ZAMAN
+            # 0 gönderiliyordu; ArduPilot flags=0 gördüğünde çerçeveyi TEK BAŞINA
+            # TAM bir RTCM mesajı sanıp GPS'e olduğu gibi iletiyor. 180 baytı aşan
+            # (>1 parçalı) çerçevelerde bu, her parçayı ayrı ayrı bozuk/eksik bir
+            # RTCM mesajı olarak GPS'e gönderiyordu — GPS'in CRC24Q kontrolü bunları
+            # sessizce reddediyordu. Çoğu MSM gözlem mesajı (RTK Float/Fixed için
+            # asıl gereken taşıyıcı-faz verisi) 180 bayttan büyük olduğundan, bu
+            # sistematik olarak TAM OLARAK en kritik RTCM mesajlarını düşürüyordu
+            # (küçük mesajlar — istasyon koordinatı vb. — tek parçada gittiği için
+            # etkilenmiyordu, bu da DGPS seviyesinde kısmi düzeltmeyi açıklıyor).
+            if len(chunks) > 4:
+                logger.warning(
+                    "RTCM çerçevesi çok büyük (%d bayt, %d parça) — GPS_RTCM_DATA "
+                    "protokolü en fazla 4 parçayı destekliyor, çerçeve atlanıyor",
+                    len(data), len(chunks))
+                return
+            seq = self._rtcm_seq
+            self._rtcm_seq = (self._rtcm_seq + 1) % 32
+            fragmented = len(chunks) > 1
+            for frag_id, chunk in enumerate(chunks):
+                n = len(chunk)
+                # NEDEN dolgu: GPS_RTCM_DATA.data alanı SABİT 180 bayt —
+                # pymavlink kısa bir bytearray verilince 180'e kadar
+                # indekslemeye çalışıp "bytearray index out of range"
+                # patlıyordu (RTCM çerçevesi 180'in tam katı olmadığında,
+                # yani neredeyse her zaman son parçada). Gerçek uzunluk
+                # (n) ayrı alanla iletildiği için dolgu baytları alıcı
+                # tarafından yok sayılır, veri bütünlüğünü bozmaz.
+                padded = bytes(chunk) + b"\x00" * (chunk_size - n)
+                flags = (1 if fragmented else 0) | (frag_id << 1) | (seq << 3)
+                self._mav.mav.gps_rtcm_data_send(flags, n, bytearray(padded))
+            logger.info("RTCM_TESHIS: %d bayt gönderildi (İHA'ya, %d parça)",
+                        len(data), len(chunks))
         except Exception as exc:
             logger.error("RTCM enjeksiyonu başarısız: %s", exc)
 
@@ -1234,11 +1299,28 @@ class MavlinkWorker(QThread):
             if m is None:
                 continue
             if m.get_type() == "LOG_DATA" and getattr(m, "id", -1) == log_id:
-                ofs  = m.ofs
-                data = bytes(m.data[:m.count])
-                end  = min(ofs + len(data), total_size)
-                buf[ofs:end] = data[:end - ofs]
-                received_offsets.add(ofs)
+                # NEDEN yerel try/except: ofs/m.count FC'den gelen ham telemetri —
+                # bozuk/aralık dışı bir paket (ör. ofs > total_size) buf[ofs:end]
+                # slice atamasında ValueError/başka istisna atabilirdi. Eskiden bu
+                # hata burada yakalanmadığı için _do_log_download'ı çağıran run()
+                # döngüsündeki GENEL except Exception'a düşüyor, TÜM MAVLink
+                # bağlantısı kapatılıp yeniden bağlanmaya (full reconnect) yol
+                # açıyordu — tek bozuk log paketi için orantısız bir sonuç.
+                # Kardeş worker'lardaki (rpi_status_worker, video_stream_worker)
+                # savunmacı desen: paketi atla/logla, işleme (burada: indirmeye)
+                # devam et.
+                try:
+                    ofs  = m.ofs
+                    data = bytes(m.data[:m.count])
+                    end  = min(ofs + len(data), total_size)
+                    buf[ofs:end] = data[:end - ofs]
+                    received_offsets.add(ofs)
+                except Exception as exc:
+                    logger.warning(
+                        "Log paketi atlandı (bozuk/aralık dışı ofs=%s count=%s): %s",
+                        getattr(m, "ofs", "?"), getattr(m, "count", "?"), exc,
+                    )
+                    continue
                 self.log_download_progress.emit(len(received_offsets) * CHUNK, total_size)
                 if end >= total_size:
                     break
