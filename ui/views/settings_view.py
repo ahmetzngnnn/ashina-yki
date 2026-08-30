@@ -127,13 +127,23 @@ class SettingsView(QWidget):
 
         self._add_field(comp_layout, 0, "IP Adresi",
                         "companion_host", is_spin=False,
-                        placeholder="192.168.1.10")
+                        placeholder="192.168.1.229")
         self._add_field(comp_layout, 1, "Görev Portu (TCP)",
                         "companion_mission_port", is_spin=True, spin_range=(1, 65535))
         self._add_field(comp_layout, 2, "Durum Portu (TCP)",
                         "companion_status_port", is_spin=True, spin_range=(1, 65535))
         self._add_field(comp_layout, 3, "Video Portu (HTTP)",
                         "companion_video_port", is_spin=True, spin_range=(1, 65535))
+        self._add_field(comp_layout, 4, "Kimlik Doğrulama Anahtarı",
+                        "companion_auth_token", is_spin=False,
+                        placeholder="boş = doğrulama KAPALI (güvensiz)",
+                        password=True)
+        _auth_note = QLabel(
+            "Görev/servo/abort komutları bu kanaldan (5601) geçer — companion'daki\n"
+            "config.json → gcs_server.auth_token ile BİREBİR AYNI olmalı. Boş\n"
+            "bırakılırsa aynı ağdaki herhangi bir cihaz komut gönderebilir.")
+        _auth_note.setWordWrap(True)
+        comp_layout.addWidget(_auth_note, 5, 0, 1, 2)
 
         root.addWidget(comp_grp)
 
@@ -145,7 +155,7 @@ class SettingsView(QWidget):
 
         self._add_field(mav_layout, 0, "Host / IP",
                         "mavlink_host", is_spin=False,
-                        placeholder="192.168.1.10")
+                        placeholder="192.168.1.229")
         self._add_field(mav_layout, 1, "Port",
                         "mavlink_port", is_spin=True, spin_range=(1, 65535))
 
@@ -199,7 +209,7 @@ class SettingsView(QWidget):
 
     def _add_field(self, layout: QGridLayout, row: int, label: str,
                    key: str, is_spin: bool, placeholder: str = "",
-                   spin_range: tuple = (1, 65535)) -> None:
+                   spin_range: tuple = (1, 65535), password: bool = False) -> None:
         lbl = QLabel(label + ":")
         layout.addWidget(lbl, row, 0)
 
@@ -207,12 +217,35 @@ class SettingsView(QWidget):
             widget = QSpinBox()
             widget.setRange(*spin_range)
             widget.setMaximumWidth(140)
+            layout.addWidget(widget, row, 1)
         else:
             widget = QLineEdit()
             widget.setPlaceholderText(placeholder)
             widget.setMaximumWidth(200)
+            if password:
+                # 2026-08-26: paylaşılan sır düz metin gösteriliyordu (omuz
+                # sörfü/ekran paylaşımı riski) — diğer parola alanlarıyla
+                # (NTRIP, giriş) tutarlı şekilde varsayılan olarak maskeli,
+                # "Göster" ile açılıp kapanabilir.
+                widget.setEchoMode(QLineEdit.EchoMode.Password)
+                row_box = QHBoxLayout()
+                row_box.setContentsMargins(0, 0, 0, 0)
+                row_box.addWidget(widget)
+                toggle = QPushButton("Göster")
+                toggle.setMaximumWidth(70)
+                toggle.setCheckable(True)
 
-        layout.addWidget(widget, row, 1)
+                def _toggle_echo(checked: bool, w=widget, b=toggle) -> None:
+                    w.setEchoMode(QLineEdit.EchoMode.Normal if checked
+                                  else QLineEdit.EchoMode.Password)
+                    b.setText("Gizle" if checked else "Göster")
+
+                toggle.toggled.connect(_toggle_echo)
+                row_box.addWidget(toggle)
+                layout.addLayout(row_box, row, 1)
+            else:
+                layout.addWidget(widget, row, 1)
+
         layout.setColumnStretch(2, 1)
         self._fields[key] = widget
 
@@ -295,19 +328,27 @@ class SettingsView(QWidget):
                            "worker'lar yeniden yapılandırılamadı.")
         return delivered
 
-    def _applied_text(self, delivered: bool) -> str:
+    def _applied_text(self, delivered: bool, auth_token: str = "") -> str:
         """Kaydetme sonrası DÜRÜST özet metni.
 
         NEDEN: Eski metin "Bağlantı worker'ları yeniden yapılandırıldı" diyordu;
         oysa MAVLink adresi hiçbir worker'a uygulanmıyor. Neyin anında geçerli
         olduğu ile neyin yeniden bağlanma gerektirdiği ayrı ayrı yazılıyor.
         """
+        warn = ""
+        if not auth_token:
+            # 2026-08-26: boş auth_token ile kaydedilirse/sıfırlanırsa göz
+            # ardı edilemez bir uyarı gösterilmeli — önceden risk yalnızca
+            # kod yorumunda belgeliydi, kullanıcıya hiç görünmüyordu.
+            warn = ("⚠ GÜVENLİK: Kimlik Doğrulama Anahtarı BOŞ — companion "
+                    "komut (5601) ve durum (5602) kanalları aynı ağdaki "
+                    "HERKESE açık. Yarışma/gerçek uçuş öncesi doldurun.\n\n")
         if not delivered:
-            return ("Ayarlar dosyaya kaydedildi.\n\n"
+            return (warn + "Ayarlar dosyaya kaydedildi.\n\n"
                     "⚠ Ancak ayar kanalı bağlı değil — çalışan worker'lar "
                     "güncellenmedi. Değişikliklerin geçerli olması için "
                     "uygulamayı yeniden başlatın.")
-        return ("Ayarlar kaydedildi.\n\n"
+        return (warn + "Ayarlar kaydedildi.\n\n"
                 "• Companion (görev/durum) ve video worker'ları yeniden "
                 "yapılandırıldı — anında geçerli.\n"
                 "• MAVLink host/port UYGULANMADI: TopBar'dan 'Kes' → 'Bağlan' ile "
@@ -327,7 +368,9 @@ class SettingsView(QWidget):
         delivered = self._persist(vals)
         logger.info("Ayarlar kaydedildi ve uygulanmaya gönderildi.")
 
-        QMessageBox.information(self, "Kaydedildi", self._applied_text(delivered))
+        QMessageBox.information(
+            self, "Kaydedildi",
+            self._applied_text(delivered, vals.get("companion_auth_token", "")))
 
     def _on_reset(self) -> None:
         # NEDEN (ölü kontrol düzeltmesi): Onay metni "fabrika değerlerine dönecek"
@@ -357,5 +400,5 @@ class SettingsView(QWidget):
         QMessageBox.information(
             self, "Sıfırlandı",
             "Ayarlar fabrika değerlerine döndürüldü ve kaydedildi.\n\n"
-            + self._applied_text(delivered)
+            + self._applied_text(delivered, vals.get("companion_auth_token", ""))
         )

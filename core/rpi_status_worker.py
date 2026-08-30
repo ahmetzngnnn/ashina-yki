@@ -37,9 +37,9 @@ class RpiStatusWorker(QThread):
     # Yeni: Görevden anlık bildiri mesajları
     mission_notification = pyqtSignal(str)
 
-    def __init__(self, host: str = "192.168.1.10", port: int = 5602,
+    def __init__(self, host: str = "192.168.1.229", port: int = 5602,
                  connect_timeout: float = 5.0, read_timeout: float = 3.0,
-                 parent=None):
+                 auth_token: str = "", parent=None):
         super().__init__(parent)
         # FIX P0-3: _host/_port/_reconnect_flag paylaşımlı → Lock ile koru
         self._addr_lock      = threading.Lock()
@@ -48,6 +48,10 @@ class RpiStatusWorker(QThread):
         # FIX P1-4: Timeout değerleri parametre
         self._connect_timeout = connect_timeout
         self._read_timeout    = read_timeout
+        # 2026-08-26: status_server.py artık auth_token bekliyor (bkz.
+        # AISocketWorker ile aynı desen) — ayarlıysa bağlantıdan hemen sonra
+        # ilk satır olarak gönderilir.
+        self._auth_token      = auth_token or ""
         self._enabled        = False
         self._active         = False
         self._reconnect_flag = False
@@ -144,9 +148,16 @@ class RpiStatusWorker(QThread):
 
         with socket.create_connection((host, port), timeout=self._connect_timeout) as sock:
             logger.info("RPi StatusBroadcaster bağlandı: %s:%d", host, port)
+            sock.settimeout(self._read_timeout)
+            if self._auth_token:
+                try:
+                    sock.sendall((json.dumps({"auth_token": self._auth_token}) + "\n").encode("utf-8"))
+                except Exception as exc:
+                    logger.error("RPi status auth_token gönderilemedi: %s", exc)
+                    self.error_occurred.emit(f"Kimlik doğrulama gönderilemedi: {exc}")
+                    return
             self._active = True
             self.rpi_connected.emit(True)
-            sock.settimeout(self._read_timeout)
 
             buf = b""
             # Yeni bağlantı → gecikme ölçümü geçmişini sıfırla (kopukluk süresi
@@ -203,40 +214,6 @@ class RpiStatusWorker(QThread):
                         continue
                     try:
                         data = json.loads(line)
-                        json_error_count = 0          # Başarılı parse → sayacı sıfırla
-                        last_data_ts = time.monotonic()  # sessiz-donma tespiti için
-                        # LAN gecikmesi: MEVCUT soketteki veri geliş aralığından
-                        # türetilir — ayrı bağlantı AÇILMAZ (bkz. __init__ notu).
-                        self._update_link_latency(time.monotonic())
-                        if self._last_ping_ms is not None:
-                            data["ping_ms"] = self._last_ping_ms
-                        self.rpi_status_updated.emit(data)
-
-                        # ── Health Alerts (FAILED/CRITICAL) ──────────────────
-                        now = time.monotonic()
-                        active_keys: set = set()
-                        for alert in data.get("health_alerts", []):
-                            lvl = alert.get("level", "")
-                            if lvl in ("FAILED", "CRITICAL"):
-                                sub = alert.get("subsystem", "?")
-                                msg = alert.get("message", "")
-                                key = (sub, lvl, msg)
-                                active_keys.add(key)
-                                last = self._alert_last_emit.get(key, 0.0)
-                                if now - last >= self._ALERT_COOLDOWN:
-                                    self._alert_last_emit[key] = now
-                                    self.health_alert.emit(sub, lvl, msg)
-                        # Düzelen alertlerin cache'ini temizle (tekrar oluşursa anında göster)
-                        for key in list(self._alert_last_emit):
-                            if key not in active_keys:
-                                del self._alert_last_emit[key]
-
-                        # ── Mission Notifications ─────────────────────────────
-                        for notif in data.get("notifications", []):
-                            msg = notif.get("msg", "") if isinstance(notif, dict) else str(notif)
-                            if msg:
-                                self.mission_notification.emit(msg)
-
                     except json.JSONDecodeError as exc:
                         json_error_count += 1
                         logger.debug("JSON parse hatası (%d/%d): %s",
@@ -248,6 +225,63 @@ class RpiStatusWorker(QThread):
                             logger.warning(msg)
                             self.error_occurred.emit(msg)
                             return   # _connect_and_read'den çık → dış döngü reconnect yapar
+                        continue
+
+                    if not isinstance(data, dict):
+                        # NEDEN: json.loads geçerli JSON'u (ör. bir liste/sayı/string)
+                        # da başarıyla parse eder — ama aşağıdaki data.get(...)
+                        # çağrıları dict OLMAYAN bir tür için AttributeError atar.
+                        # Bu, genel except Exception'a (run()) düşüp GEREKSİZ TAM
+                        # RECONNECT tetikliyordu. Aynı "bozuk satır" sayma/eşik
+                        # mantığına (json_error_count / _JSON_ERROR_THRESHOLD) dahil
+                        # edip döngüye devam et — diğer bozuk satırlarla TUTARLI.
+                        json_error_count += 1
+                        logger.warning(
+                            "RPi durum satırı geçerli JSON ama nesne (dict) DEĞİL "
+                            "(tür=%s) — atlanıyor (%d/%d)",
+                            type(data).__name__, json_error_count, _JSON_ERROR_THRESHOLD,
+                        )
+                        if json_error_count >= _JSON_ERROR_THRESHOLD:
+                            msg = (f"RPi veri akışında {json_error_count} ardışık JSON hatası "
+                                   f"— yeniden bağlanılıyor")
+                            logger.warning(msg)
+                            self.error_occurred.emit(msg)
+                            return
+                        continue
+
+                    json_error_count = 0          # Başarılı parse (dict) → sayacı sıfırla
+                    last_data_ts = time.monotonic()  # sessiz-donma tespiti için
+                    # LAN gecikmesi: MEVCUT soketteki veri geliş aralığından
+                    # türetilir — ayrı bağlantı AÇILMAZ (bkz. __init__ notu).
+                    self._update_link_latency(time.monotonic())
+                    if self._last_ping_ms is not None:
+                        data["ping_ms"] = self._last_ping_ms
+                    self.rpi_status_updated.emit(data)
+
+                    # ── Health Alerts (FAILED/CRITICAL) ──────────────────
+                    now = time.monotonic()
+                    active_keys: set = set()
+                    for alert in data.get("health_alerts", []):
+                        lvl = alert.get("level", "")
+                        if lvl in ("FAILED", "CRITICAL"):
+                            sub = alert.get("subsystem", "?")
+                            msg = alert.get("message", "")
+                            key = (sub, lvl, msg)
+                            active_keys.add(key)
+                            last = self._alert_last_emit.get(key, 0.0)
+                            if now - last >= self._ALERT_COOLDOWN:
+                                self._alert_last_emit[key] = now
+                                self.health_alert.emit(sub, lvl, msg)
+                    # Düzelen alertlerin cache'ini temizle (tekrar oluşursa anında göster)
+                    for key in list(self._alert_last_emit):
+                        if key not in active_keys:
+                            del self._alert_last_emit[key]
+
+                    # ── Mission Notifications ─────────────────────────────
+                    for notif in data.get("notifications", []):
+                        msg = notif.get("msg", "") if isinstance(notif, dict) else str(notif)
+                        if msg:
+                            self.mission_notification.emit(msg)
 
                 # FIX P0-3: Flag'i Lock altında güvenli oku
                 with self._addr_lock:

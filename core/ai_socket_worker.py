@@ -14,6 +14,14 @@ from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot
 
 logger = logging.getLogger(__name__)
 
+# Yanıt okuma tampon üst sınırı. NEDEN: _send_mission içindeki "\n" bekleyen
+# recv döngüsü önceden yalnızca response_timeout ile sınırlıydı — sunucu "\n"
+# hiç göndermeden veri akıtmaya devam ederse (bozuk/yanlış protokol) tampon
+# sınırsız büyürdü. Kardeş worker'larla TUTARLI (rpi_status_worker 1 MB,
+# video_stream_worker 512 KB) — burada da yanıt küçük bir JSON olduğundan
+# aynı büyüklük mertebesi kullanılıyor.
+_MAX_RESPONSE_BUF = 1_048_576  # 1 MB — taşma koruması
+
 # AI model display adı → .pt dosya adı
 _MODEL_NAME_MAP = {
     "YOLOv8n — Hızlı (Nano)":        "yolov8n.pt",
@@ -72,10 +80,14 @@ class AISocketWorker(QThread):
 
     def __init__(self, host: str = "127.0.0.1", port: int = 5601,
                  connect_timeout: float = 5.0, response_timeout: float = 5.0,
-                 parent=None):
+                 auth_token: str = "", parent=None):
         super().__init__(parent)
         self._host = host
         self._port = port
+        # GÜVENLİK (2026-08-25): companion'ın gcs_server.auth_token'ıyla
+        # AYNI dizgi olmalı — boşsa (varsayılan) kanal kimlik doğrulamasız
+        # kalır (companion tarafı bunu zaten yüksek sesle uyarır).
+        self._auth_token = auth_token
         # FIX P1-4: Timeout değerleri artık parametre — gcs_config'den beslenebilir
         self._connect_timeout  = connect_timeout
         self._response_timeout = response_timeout
@@ -111,6 +123,11 @@ class AISocketWorker(QThread):
                 self.error_occurred.emit(str(exc))
 
     def _send_mission(self, mission: dict) -> None:
+        # GÜVENLİK: token TEK noktadan (burada, serileştirmeden hemen önce)
+        # eklenir ki hangi çağrı yolundan geldiğine bakılmaksızın (görev
+        # yükleme, servo, abort, drop_now ...) HİÇBİR mesaj tokensız gitmesin.
+        if self._auth_token:
+            mission = {**mission, "auth_token": self._auth_token}
         payload = json.dumps(mission, ensure_ascii=False).encode("utf-8") + b"\n"
         try:
             with socket.create_connection(
@@ -120,6 +137,13 @@ class AISocketWorker(QThread):
                 sock.settimeout(self._response_timeout)
                 raw = b""
                 while b"\n" not in raw:
+                    if len(raw) > _MAX_RESPONSE_BUF:
+                        # Taşma koruması — bkz. modül üstü not / rpi_status_worker.
+                        raise ConnectionError(
+                            f"MissionReceiver yanıtı {_MAX_RESPONSE_BUF} bayttan "
+                            "büyük ama satır sonu (\\n) bulunamadı — bağlantı "
+                            "sonlandırılıyor"
+                        )
                     chunk = sock.recv(1024)
                     if not chunk:
                         break
@@ -220,14 +244,32 @@ class AISocketWorker(QThread):
         """Manuel yük bırakma (Görev 2/3 manuel mod) — yüksek öncelik."""
         self._enqueue({"action": "drop_now"}, high_priority=True)
 
-    @pyqtSlot(str, str, int)
-    def send_servo_command(self, target: str, state: str = "", angle: int = 0) -> None:
-        """Manuel servo ve gimbal kontrolünü Companion PC'ye iletir."""
+    @pyqtSlot(str, str, int, bool)
+    def send_servo_command(self, target: str, state: str = "", angle: int = 0,
+                            hold_torque: bool = False) -> None:
+        """Manuel servo ve gimbal kontrolünü Companion PC'ye iletir.
+
+        hold_torque: yalnızca grabber ailesi (grabber/grabber_left/grabber_right)
+        için anlamlıdır — limit switch'e ulaşınca sürekli-dönüş servoyu tam nötr
+        (pwm_stop) yerine çok küçük bir tutma PWM'inde bırakır (bkz. companion
+        hardware/servo_controller.py _spin_grabber_until_switch). Diğer
+        hedeflerde (red_drop/blue_drop/gimbal) yok sayılır.
+
+        target red_drop/blue_drop VE state="" iken: 'angle' parametresi ham
+        PWM (µs) olarak yorumlanır — manuel yükleme slider'ı için (bkz.
+        dashboard_view.py _send_red/blue_drop_pwm_cmd). Normal Aç/Yük Al
+        butonları her zaman state="open"/"close" gönderir, bu yol o zaman
+        DEVREYE GİRMEZ.
+        """
         cmd: dict = {"action": "servo_command", "target": target}
         if target == "gimbal":
             cmd["angle"] = angle
+        elif target in ("red_drop", "blue_drop") and not state:
+            cmd["pwm"] = angle
         else:
             cmd["state"] = state
+            if target in ("grabber", "grabber_left", "grabber_right"):
+                cmd["hold_torque"] = bool(hold_torque)
         self._enqueue(cmd, high_priority=True)
 
     @pyqtSlot(int)

@@ -253,16 +253,27 @@ def _gen_dubins_pts(p1: dict, p2: dict, num_laps: int, turn_radius_m: float,
 
 
 def compute_optimal_turn_radius(D: float, turn_radius_override: float = 0.0) -> float:
-  """R'yi DOĞRUDAN direk mesafesinden (D) türetir — companion _build_route ile
-  AYNI mantık. D/R≈2.75 sweet spot: en akıcı + en çok sekize benzeyen oran."""
+  """R'yi DOĞRUDAN direk mesafesinden (D) türetir — companion
+  (missions/infinity_flight.py::InfinityFlightMission._TARGET_D_R_RATIO) ile
+  AYNI oran/taban olmalı, iki taraf BAĞIMSIZ birer kopya tutuyor (2026-08-25
+  çakışma incelemesinde bulundu — tek kaynağa taşınmadı çünkü YKİ ve İHA ayrı
+  repo/süreç, ortak import yok). Biri değişirse diğeri BİLEREK güncellenmeli.
+  D/R≈2.75, 8-60 m taban/tavan: HENÜZ ÖLÇÜLMEMİŞ bir geometrik sezgiseldir
+  (gerçek şartname direk mesafesi ~150 m'de doğrulanmadı)."""
   TARGET_D_R_RATIO = 2.75
   if turn_radius_override > 0:
     return turn_radius_override
   return max(8.0, min(60.0, D / TARGET_D_R_RATIO))
 
 
-def compute_ideal_cruise(R: float, bank_design_deg: float = 20.0) -> float:
-  """Verilen R'nin bank_design_deg bankta karşılığı olan ideal tur hızı (m/s)."""
+def compute_ideal_cruise(R: float, bank_design_deg: float = 10.0) -> float:
+  """Verilen R'nin bank_design_deg bankta karşılığı olan ideal tur hızı (m/s).
+
+  NEDEN 10.0 (ÖNCEDEN 20.0 — İHA ile ÇAKIŞIYORDU): companion tarafı
+  (missions/infinity_flight.py::_BANK_DESIGN_DEG) 10° kullanıyor; bu önizleme
+  fonksiyonu 20° varsayılanla FARKLI bir hız hesaplıyordu — operatör
+  önizlemede gördüğü hız ile gerçek uçuşta olacak hız BİRBİRİNİ TUTMUYORDU.
+  2026-08-25 çakışma incelemesinde bulundu, senkronize edildi."""
   return math.sqrt(9.81 * R * math.tan(math.radians(bank_design_deg)))
 
 
@@ -272,16 +283,27 @@ def build_infinity_route(p1: dict, p2: dict, cruise_ms: float, num_laps: int,
                          max_turn_deg: float = 18.0,
                          min_chord_m: float = 5.0,
                          turn_radius_override: float = 0.0,
-                         cross_speed_mult: float = 1.3,
+                         cross_speed_mult: float = 1.35,
+                         bank_design_deg: float = 10.0,
                          decel_mps2: float = 2.0) -> tuple:
   """
   _build_route (companion) ile AYNI parametre seçimi:
   R DOĞRUDAN direk mesafesinden (D) türetilir (D/R≈2.75 sweet spot) — girilen
-  mesafe ne olursa olsun şekil aynı oranda kalır. Bu R'nin 20° bankta karşılığı
-  olan İDEAL DÖNGÜ hızı (loop_speed) hesaplanır ve döngü boyunca DAİMA kullanılır.
-  DUBINS'te ayrıca düz geçişte daha hızlı cross_speed hedeflenir (loop_speed ile
-  loop_speed×cross_speed_mult arasında, cruise_ms sadece bunu kelepçeler) ve
-  yavaşlama komutu frenleme mesafesi kadar erken (decel_mps2'ye göre) eklenir.
+  mesafe ne olursa olsun şekil aynı oranda kalır. Bu R'nin bank_design_deg
+  bankta karşılığı olan İDEAL DÖNGÜ hızı (loop_speed) hesaplanır ve döngü
+  boyunca DAİMA kullanılır. DUBINS'te ayrıca düz geçişte daha hızlı cross_speed
+  hedeflenir (loop_speed ile loop_speed×cross_speed_mult arasında, cruise_ms
+  sadece bunu kelepçeler) ve yavaşlama komutu frenleme mesafesi kadar erken
+  (decel_mps2'ye göre) eklenir.
+
+  NEDEN varsayılanlar companion (missions/infinity_flight.py) ile AYNI
+  (bank_design_deg=10°, cross_speed_mult=1.35 — ÖNCEDEN sırasıyla 20°/1.3
+  idi, 2026-08-25 çakışma incelemesinde bulunup düzeltildi; cross_speed_mult
+  ayrıca AYNI oturumda D=150 m'de 45 koşuluk süpürmeyle 1.35'in en hızlı
+  VE güvenli seçenek olduğu doğrulanıp companion'da da uygulandı): bu
+  fonksiyon yalnızca ÖNİZLEME/QGC export ürettiği için, varsayılanları
+  companion'dan sapınca operatör önizlemede gördüğünden FARKLI bir gerçek
+  uçuş görüyordu.
 
   Dönüş: (route_items, loop_speed, cross_speed, turn_radius)
   route_items: [{"cmd":82,"lat":..,"lon":..}, {"cmd":178,"params":(..)}, ...]
@@ -294,7 +316,7 @@ def build_infinity_route(p1: dict, p2: dict, cruise_ms: float, num_laps: int,
   lat2, lon2 = float(p2["lat"]), float(p2["lon"])
   D = _haversine(lat1, lon1, lat2, lon2)
   turn_radius = compute_optimal_turn_radius(D, turn_radius_override)
-  loop_speed = compute_ideal_cruise(turn_radius)
+  loop_speed = compute_ideal_cruise(turn_radius, bank_design_deg)
   cross_speed_ceiling = loop_speed * cross_speed_mult
   cruise_requested = cruise_ms if cruise_ms > 0 else cross_speed_ceiling
   cross_speed = min(max(cruise_requested, loop_speed), cross_speed_ceiling)

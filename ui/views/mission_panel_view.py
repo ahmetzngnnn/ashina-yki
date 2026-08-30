@@ -220,6 +220,7 @@ _MAP_ROUTE_COLOR = "#4ade80"   # rota önizleme çizgisi
 _MAP_AREA_COLOR  = "#bb86fc"   # tarama poligonu / yarıçap çemberi
 _MAP_POLE1_COLOR = "#ffd700"   # Direk 1 çemberi
 _MAP_POLE2_COLOR = "#ff8c00"   # Direk 2 çemberi
+_MAP_FW_AREA_COLOR = "#a78bfa"  # Sabit Kanat pisti köşe çemberi (mor — ana tarama alanından ayırt edilsin)
 
 # ── Fare Tekerleği Koruması ───────────────────────────────────────────────────
 # NEDEN: Sağ parametre paneli tekerlekle kaydırılırken imlecin ALTINDAKİ
@@ -337,7 +338,27 @@ class MissionMapWidget(QWidget):
         for js in self._buf:
           _page.runJavaScript(js)
       self._buf.clear()
+      # NEDEN isVisible() kontrolü: sekme henüz görünür değilken (arka planda
+      # yüklenirken) polling'i BAŞLATMA — showEvent zaten görünür olunca
+      # başlatacak. Bkz. showEvent/hideEvent altında (performans: gizli
+      # sekmede 450 ms'de bir runJavaScript çağırmamak için).
+      if self.isVisible():
+        self._timer.start()
+
+  def showEvent(self, event):
+    # Widget (veya üst sekmesi) tekrar görünür olunca polling'i devam ettir.
+    # NEDEN: main_window._dispatch_telemetry'deki "yalnızca aktif sekme"
+    # ilkesiyle AYNI motivasyon — gizli sekmede 450 ms'de bir runJavaScript
+    # çağırmak gereksiz CPU/JS köprüsü yükü yaratıyordu.
+    super().showEvent(event)
+    if _WE and self._ready and hasattr(self, "_timer") and not self._timer.isActive():
       self._timer.start()
+
+  def hideEvent(self, event):
+    # Widget (veya üst sekmesi) gizlenince polling'i durdur — bkz. showEvent.
+    super().hideEvent(event)
+    if _WE and hasattr(self, "_timer") and self._timer.isActive():
+      self._timer.stop()
 
   def _js(self, code: str):
     if not _WE:
@@ -1383,10 +1404,16 @@ class TargetDropMissionTab(_BaseMissionTab):
   _SEL_AREA  = "Tarama Köşesi"
   _SEL_POLE1 = "Direk 1"
   _SEL_POLE2 = "Direk 2"
+  _SEL_FW_AREA = "Sabit Kanat Pisti Köşesi"
+
+  # Çeldirici yerleşimi modu — bkz. _MODE_MIXED/_MODE_SEPARATE NEDEN
+  _MODE_MIXED    = "Karışık (çeldiriciler hedeflerle aynı alanda)"
+  _MODE_SEPARATE = "Ayrık (Sabit Kanat ayrı pistte)"
 
   def _build_specific_controls(self):
     self._pole1: dict | None = None
     self._pole2: dict | None = None
+    self._fw_wps: list = []
 
     # NEDEN: Bu sekmedeki TÜM spin kutuları uçuş parametresi taşıyor; fabrika
     # fonksiyonlarına tek noktadan tekerlek koruması eklenir (canlı testte
@@ -1407,11 +1434,46 @@ class TargetDropMissionTab(_BaseMissionTab):
     self._task2_grp = grp
     lay = QVBoxLayout(grp); lay.setSpacing(6)
 
+    # ── ÇELDİRİCİ YERLEŞİMİ MODU (DEVIR §0p, kullanıcı isteğiyle) ─────────
+    # NEDEN: şartname (s.27/48-49), sabit kanat kategorisinin gerçek
+    # hedeflerinin ("çeldirici" dediğimiz kareler) Döner Kanat ile AYNI
+    # uçuş alanını paylaştığını gösteriyor — AMA bazı sahalarda sabit kanat
+    # ayrı bir pistte/alanda uçurulabiliyor. Ayrıksa, İHA'nın çeldirici-
+    # savunma mekanizmalarının (erken kimlik bekleyişi, alan çapraz
+    # kontrolü, çoklu deneme — hepsi §0j-§0m'de eklendi) HİÇBİRİNE gerek
+    # yok, yalnızca SÜRE maliyeti eklerler. Mod seçimi tek bir "decoy_layout"
+    # parametresiyle İHA'ya gider (Task2Tuning.from_params, _SEPARATE_
+    # LAYOUT_PRESET); "Karışık" gönderilmezse ya da seçilirse davranış
+    # BUGÜNKÜYLE BİREBİR AYNI kalır (geriye dönük tam uyumlu).
+    mode_row = QHBoxLayout()
+    mode_row.addWidget(QLabel("Çeldirici yerleşimi:"))
+    self._decoy_mode = QComboBox()
+    self._decoy_mode.addItems([self._MODE_MIXED, self._MODE_SEPARATE])
+    self._decoy_mode.setToolTip(
+      "Karışık: çeldiriciler (sabit kanadın gerçek hedefleri) Döner Kanat "
+      "tarama alanıyla aynı bölgede — mevcut çeldirici-savunma mantığı "
+      "(erken kimlik doğrulama, alan kontrolü, çoklu deneme) AKTİF kalır.\n"
+      "Ayrık: sabit kanat ayrı bir pistte — bu mantık DEVRE DIŞI bırakılır, "
+      "görev daha hızlı tamamlanır. Aşağıda sabit kanat pistinin alanını "
+      "(4 köşe) işaretleyin — yalnızca haritada/operatör bilgisi içindir."
+    )
+    guard_wheel(self._decoy_mode)
+    self._decoy_mode.currentIndexChanged.connect(self._on_decoy_mode_changed)
+    mode_row.addWidget(self._decoy_mode, 1)
+    lay.addLayout(mode_row)
+
+    self._fw_area_lbl = QLabel("Sabit Kanat pisti: 0 köşe işaretlendi (en az 3 gerekir).")
+    self._fw_area_lbl.setObjectName("mutedLabel")
+    self._fw_area_lbl.setWordWrap(True)
+    self._fw_area_lbl.setVisible(False)
+    lay.addWidget(self._fw_area_lbl)
+
     # ── Görev akışı: harita seçim hedefi + Direk 1/2 ──────────────────────
     sel_row = QHBoxLayout()
     sel_row.addWidget(QLabel("Harita tıklaması:"))
     self._sel_target = QComboBox()
-    self._sel_target.addItems([self._SEL_AREA, self._SEL_POLE1, self._SEL_POLE2])
+    self._sel_target.addItems([self._SEL_AREA, self._SEL_POLE1, self._SEL_POLE2,
+                                self._SEL_FW_AREA])
     guard_wheel(self._sel_target)  # kaydırma tıklama hedefini değiştirmesin
     sel_row.addWidget(self._sel_target, 1)
     lay.addLayout(sel_row)
@@ -1586,12 +1648,25 @@ class TargetDropMissionTab(_BaseMissionTab):
     pin_form = QFormLayout(pin_grp); pin_form.setSpacing(4)
     pin_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
     # Varsayılanlar config.json "servos" ile hizalı (gerçek kablolama):
-    # gimbal=1, red_drop=2, blue_drop=3, grabber_left=4, grabber_right=5
-    self._pin_drop1 = _isb(1, 16, 2)
-    self._pin_drop2 = _isb(1, 16, 3)
-    self._pin_grabL = _isb(1, 16, 4)
-    self._pin_grabR = _isb(1, 16, 5)
-    self._pin_gimbal = _isb(1, 16, 1)
+    # gimbal=5, red_drop=6, blue_drop=7, grabber_left=8, grabber_right=9
+    # 2026-08-25 KRİTİK DÜZELTME: eskiden gimbal=1, red=2, blue=3, gripL=4,
+    # gripR=5 idi — gerçek uçuş logu SERVO1-4'ün MOTOR olduğunu ortaya
+    # çıkardı (bkz. İHA config.json fc_params_expected notu). Bu alanlar
+    # HER Görev 2/3 başlatmasında KOŞULSUZ gönderiliyor (aşağıda
+    # params["gpio_pins"]) — eski değerler kalsaydı her başlatmada 4 kanal
+    # reddedilir (izinli aralık artık 5-9) VE grab_r=5 sessizce KABUL EDİLİP
+    # gimbal'in kanalıyla ÇAKIŞIRDI (5, artık gimbal'e ait).
+    # 2026-08-26 DÜZELTME: aralık 1-16'ydı — İHA tarafı (servo_controller.py
+    # is_safe_channel) motor kanallarını (1-4) fail-closed reddediyor, ama
+    # YKİ'de hiçbir ön-kontrol yoktu; operatör 1-4 arası bir kanal girip
+    # göndersin diye izin verilebiliyordu (reddedilme artık İHA'dan GCS
+    # bildirimiyle görünür — bkz. teknofest_task2.py — ama en iyisi kullanıcıyı
+    # baştan izinli aralığa sınırlamak). İzinli aralık: 5-9 (SERVO1-4=motor).
+    self._pin_drop1 = _isb(5, 9, 6)
+    self._pin_drop2 = _isb(5, 9, 7)
+    self._pin_grabL = _isb(5, 9, 8)
+    self._pin_grabR = _isb(5, 9, 9)
+    self._pin_gimbal = _isb(5, 9, 5)
     pin_form.addRow("Kırmızı Yük (red_drop):", self._pin_drop1)
     pin_form.addRow("Mavi Yük (blue_drop):", self._pin_drop2)
     pin_form.addRow("Sol Kapak (grab_L):", self._pin_grabL)
@@ -2041,9 +2116,21 @@ class TargetDropMissionTab(_BaseMissionTab):
     p2 = f"{self._pole2['lat']:.5f},{self._pole2['lon']:.5f}" if self._pole2 else "—"
     self._pole_lbl.setText(f"Direk 1: {p1}    Direk 2: {p2}")
 
+  def _on_decoy_mode_changed(self, _idx: int = 0):
+    """Mod "Ayrık" iken sabit kanat pisti köşe-sayacı görünür olur."""
+    is_separate = self._decoy_mode.currentText() == self._MODE_SEPARATE
+    self._fw_area_lbl.setVisible(is_separate)
+    self._update_fw_area_lbl()
+
+  def _update_fw_area_lbl(self):
+    n = len(self._fw_wps)
+    ok = "✓" if n >= 3 else "⚠"
+    self._fw_area_lbl.setText(
+      f"Sabit Kanat pisti: {n} köşe işaretlendi (en az 3 gerekir) {ok}")
+
   @pyqtSlot(float, float)
   def _add_wp(self, lat: float, lon: float):
-    """Harita tıklaması: seçime göre Direk 1/2 veya tarama köşesi ekle."""
+    """Harita tıklaması: seçime göre Direk 1/2, sabit kanat pisti ya da tarama köşesi ekle."""
     t = self._sel_target.currentText()
     if t == self._SEL_POLE1:
       self._pole1 = {"lat": lat, "lon": lon}
@@ -2053,6 +2140,10 @@ class TargetDropMissionTab(_BaseMissionTab):
       self._pole2 = {"lat": lat, "lon": lon}
       self._map.draw_circle(lat, lon, 3, _MAP_POLE2_COLOR)
       self._update_pole_lbl()
+    elif t == self._SEL_FW_AREA:
+      self._fw_wps.append({"lat": lat, "lon": lon})
+      self._map.draw_circle(lat, lon, 3, _MAP_FW_AREA_COLOR)
+      self._update_fw_area_lbl()
     else:
       super()._add_wp(lat, lon)
 
@@ -2176,6 +2267,24 @@ class TargetDropMissionTab(_BaseMissionTab):
     if self._pole2:
       params["pole2"] = self._pole2
 
+    # ── Çeldirici yerleşimi modu (DEVIR §0p) ──────────────────────────────
+    is_separate = self._decoy_mode.currentText() == self._MODE_SEPARATE
+    params["decoy_layout"] = "separate" if is_separate else "mixed"
+    if is_separate:
+      if len(self._fw_wps) < 3:
+        QMessageBox.warning(
+          self, "Sabit Kanat Pisti Eksik",
+          "\"Ayrık\" modu seçildi ama Sabit Kanat pisti için en az 3 köşe "
+          "işaretlenmedi. Haritada \"Sabit Kanat Pisti Köşesi\" seçerek "
+          "pistin sınırlarını işaretleyin, ya da modu \"Karışık\"a alın."
+        )
+        return
+      # NEDEN yalnızca operatör/harita bilgisi: İHA'nın tarama alanı ZATEN
+      # bu bölgeyi içermez (ayrı pist varsayımı) — bu liste bir geofence
+      # DEĞİL, yalnızca YKİ haritasında ve companion loglarında görünürlük
+      # sağlar (bkz. Task2Tuning._SEPARATE_LAYOUT_PRESET NEDEN).
+      params["fixed_wing_area"] = list(self._fw_wps)
+
     self.mission_ready_to_send.emit(params, [])
     # BUG FIX: _poll_timer bu sınıfta tanımlı değildi → AttributeError kaldırıldı
 
@@ -2206,6 +2315,8 @@ class InfinityMissionTab(_BaseMissionTab):
   _SEL_TAKEOFF = "Kalkış Noktası"
   _SEL_POLE1  = "Direk 1"
   _SEL_POLE2  = "Direk 2"
+  _SEL_FINISH_A = "Pist Çizgisi Ucu A"
+  _SEL_FINISH_B = "Pist Çizgisi Ucu B"
   _SEL_WP   = "Normal Waypoint"
 
   def _build_specific_controls(self):
@@ -2222,7 +2333,8 @@ class InfinityMissionTab(_BaseMissionTab):
     sel_row.addWidget(_lbl_map)
     self._sel_target = QComboBox()
     self._sel_target.addItems([
-      self._SEL_TAKEOFF, self._SEL_POLE1, self._SEL_POLE2, self._SEL_WP
+      self._SEL_TAKEOFF, self._SEL_POLE1, self._SEL_POLE2,
+      self._SEL_FINISH_A, self._SEL_FINISH_B, self._SEL_WP
     ])
     guard_wheel(self._sel_target)  # kaydırma tıklama hedefini değiştirmesin
     sel_row.addWidget(self._sel_target, 1)
@@ -2257,9 +2369,29 @@ class InfinityMissionTab(_BaseMissionTab):
     r0, self._tkf_lat, self._tkf_lon = _mk_coord_row("Kalkış:")
     r1, self._p1_lat, self._p1_lon = _mk_coord_row("Direk 1:")
     r2, self._p2_lat, self._p2_lon = _mk_coord_row("Direk 2:")
+    r3, self._fa_lat, self._fa_lon = _mk_coord_row("Pist Ucu A:")
+    r4, self._fb_lat, self._fb_lon = _mk_coord_row("Pist Ucu B:")
     lay.addLayout(r0)
     lay.addLayout(r1)
     lay.addLayout(r2)
+    lay.addLayout(r3)
+    lay.addLayout(r4)
+    # NEDEN (DEVIR §0o): şartname, 2 tur tamamlandıktan sonra "direk 2'nin
+    # arka tarafından geçerek dışından dönüş" yapılıp "pist başlangıç/bitiş
+    # çizgisinden geçerek" görevin sonlandırılmasını İSTER — bu çizgi kalkış
+    # noktasından AYRI bir kavramdır (bir NOKTA değil, aracın fiilen İÇİNDEN
+    # GEÇMESİ gereken bir HAT). İki uç nokta olarak tanımlanır; İHA bu hattı
+    # geçtiğini konum-tarafı testiyle doğrular. İsteğe bağlı bırakıldı
+    # (boşsa İHA eski davranışa — RTL/LOITER — döner) ki hazır olmayan
+    # takımlar/sahalar Görev 1'i eskisi gibi uçurabilsin.
+    _fin_note = QLabel(
+      "Pist çizgisi (isteğe bağlı): 2 tur bittikten sonra araç, direk 2'yi "
+      "son kez dışından dolanıp bu hattı geçerek kalkış noktasına iner "
+      "(kalkış = iniş noktası). Boş bırakılırsa eski davranış (doğrudan "
+      "RTL/LOITER) kullanılır.")
+    _fin_note.setStyleSheet(_SL)
+    _fin_note.setWordWrap(True)
+    lay.addWidget(_fin_note)
 
     # Uçuş parametreleri
     form = QFormLayout()
@@ -2270,12 +2402,35 @@ class InfinityMissionTab(_BaseMissionTab):
     # Yuvarlak Sekiz varsayılan (ilk sıra): sabit yarıçaplı iki döngü — dönüş
     # açısı HER noktada aynı, en akıcı/yumuşak seçenek, sert dönüş yapmaz.
     # Lemniscate: matematiksel olarak tam ∞ eğrisi ama apekste daha keskin.
+    #
+    # ÇAKIŞMA UYARISI (2026-08-25 incelemesi, öğe METNİ KASITLI DEĞİŞTİRİLMEDİ
+    # — kayıtlı profiller bu metne göre eşleşiyor, bkz. _apply_params):
+    # companion (missions/infinity_flight.py) CANLI GUIDED akışında SADECE
+    # Lemniscate (Gerono ∞) matematiğini uygular; "Yuvarlak Sekiz/DUBINS"
+    # gönderilirse companion bunu SESSİZCE Lemniscate'e çevirir (GCS'e uyarı
+    # bildirimiyle). Bu seçim GERÇEKTE yalnızca (a) aşağıdaki rota önizlemesi
+    # ve (b) "İndir" (QGC WPL) dosyası için anlamlıdır — Mission Planner'da
+    # AYRI/manuel bir uçuş için. Canlı companion uçuşunda ikisi de AYNI sonucu
+    # (Lemniscate) verir; "Önerilen" etiketi CANLI UÇUŞ için değil, QGC
+    # dosyası/önizleme akıcılığı içindir.
     self._inf_algo.addItems([
         "Yuvarlak Sekiz (Akıcı — Önerilen)",
         "Lemniscate (Tam ∞ Şekli — Daha Keskin Apeks)"
     ])
+    self._inf_algo.setToolTip(
+        "Yalnızca rota ÖNİZLEMESİNİ ve 'İndir' (QGC WPL) dosyasını etkiler.\n"
+        "CANLI companion uçuşu HER İKİ seçimde de Lemniscate (Gerono ∞)\n"
+        "matematiğini kullanır — 'Yuvarlak Sekiz' gönderilirse companion\n"
+        "bunu sessizce Lemniscate'e çevirir ve GCS'e uyarı bildirir."
+    )
     _lbl_algo = QLabel("Algoritma:"); _lbl_algo.setStyleSheet(_SL)
     form.addRow(_lbl_algo, self._inf_algo)
+    _algo_note = QLabel(
+        "Not: bu seçim yalnızca önizleme/QGC dosyasını etkiler — canlı uçuşta "
+        "companion her zaman Lemniscate (Gerono ∞) uçar.")
+    _algo_note.setStyleSheet(_SL)
+    _algo_note.setWordWrap(True)
+    form.addRow(_algo_note)
 
     self._inf_alt = QDoubleSpinBox()
     self._inf_alt.setRange(5, 500)
@@ -2300,8 +2455,67 @@ class InfinityMissionTab(_BaseMissionTab):
     _lbl_accel = QLabel("İvmelenme (WPNAV_ACCEL):"); _lbl_accel.setStyleSheet(_SL)
     form.addRow(_lbl_accel, self._inf_accel)
 
-    # tekerlek koruması: paneli kaydırırken algoritma/irtifa/tur/ivme bozulmasın
-    guard_wheel(self._inf_algo, self._inf_alt, self._inf_laps, self._inf_accel)
+    # ── İNCE-AYAR PARAMETRELERİ (2026-08-25 — DEVIR, Görev 1 parametre
+    # süpürmesi) ──────────────────────────────────────────────────────────
+    # NEDEN eklendi: companion (missions/infinity_flight.py) bu 4 alanı
+    # zaten JSON parametresi olarak KABUL EDİYORDU ama YKİ'de HİÇ arayüz
+    # yoktu — operatör yalnızca companion'ın kendi sabit varsayılanlarına
+    # güveniyordu, sahada ayarlayamıyordu. Varsayılanlar companion'ın KENDİ
+    # varsayılanlarıyla AYNI (0 = companion kendi hesabını kullanır) —
+    # gönderilmeyen/0 alan companion davranışını DEĞİŞTİRMEZ.
+    self._inf_bank = QDoubleSpinBox()
+    self._inf_bank.setRange(5.0, 35.0)
+    self._inf_bank.setValue(10.0)
+    self._inf_bank.setSuffix("°")
+    self._inf_bank.setMaximumWidth(140)
+    self._inf_bank.setToolTip(
+        "Viraj tasarım banka açısı — hedef tur hızını belirler (v=√(g·R·tanβ)).\n"
+        "Gerçek uçuşta ÖLÇÜLEN güvenli tavan: 21.8°. Bu açının ÜSTÜNE çıkmak\n"
+        "gerçek aracın hiç test edilmediği bir bölgedir — yalnızca sim'de\n"
+        "doğrulanmış bir değer girin. Companion varsayılanı: 10°.")
+    _lbl_bank = QLabel("Tasarım Banka Açısı:"); _lbl_bank.setStyleSheet(_SL)
+    form.addRow(_lbl_bank, self._inf_bank)
+
+    self._inf_radius = QDoubleSpinBox()
+    self._inf_radius.setRange(0.0, 60.0)
+    self._inf_radius.setValue(0.0)
+    self._inf_radius.setSuffix(" m (0=otomatik)")
+    self._inf_radius.setMaximumWidth(160)
+    self._inf_radius.setToolTip(
+        "Viraj yarıçapı — 0 bırakılırsa companion direk mesafesinden otomatik\n"
+        "türetir (D/2.75, 8-60 m arası kırpılır). Şartname direk mesafesi\n"
+        "(~150 m) için bu otomatik değer HENÜZ sim'de doğrulanmadı — burayı\n"
+        "yalnızca kendi ölçtüğünüz bir değerle doldurun.")
+    _lbl_radius = QLabel("Viraj Yarıçapı:"); _lbl_radius.setStyleSheet(_SL)
+    form.addRow(_lbl_radius, self._inf_radius)
+
+    self._inf_lookahead = QDoubleSpinBox()
+    self._inf_lookahead.setRange(0.3, 3.0)
+    self._inf_lookahead.setValue(1.0)
+    self._inf_lookahead.setSuffix(" m")
+    self._inf_lookahead.setMaximumWidth(140)
+    self._inf_lookahead.setToolTip(
+        "Pure-pursuit 'havuç' bakış mesafesi — büyütmek kalıcı bir önde-hedef\n"
+        "pozisyon hatası yaratıp hızı tasarım bandının üstüne çıkarabilir\n"
+        "(ölçüldü). Companion varsayılanı: 1.0 m.")
+    _lbl_lookahead = QLabel("Bakış Mesafesi (Lookahead):"); _lbl_lookahead.setStyleSheet(_SL)
+    form.addRow(_lbl_lookahead, self._inf_lookahead)
+
+    self._inf_cross_mult = QDoubleSpinBox()
+    self._inf_cross_mult.setRange(1.0, 2.0)
+    self._inf_cross_mult.setValue(1.35)
+    self._inf_cross_mult.setSingleStep(0.05)
+    self._inf_cross_mult.setMaximumWidth(140)
+    self._inf_cross_mult.setToolTip(
+        "Merkez geçişi/viraj hız oranı — merkezde viraj hızının kaç katı\n"
+        "hızlanılacağı. Companion varsayılanı: 1.35 (D=150 m'de 45 koşuluk\n"
+        "süpürmeyle en hızlı VE güvenli seçenek olarak doğrulandı).")
+    _lbl_cross = QLabel("Merkez Geçiş Hız Oranı:"); _lbl_cross.setStyleSheet(_SL)
+    form.addRow(_lbl_cross, self._inf_cross_mult)
+
+    # tekerlek koruması: paneli kaydırırken sayısal alanlar bozulmasın
+    guard_wheel(self._inf_algo, self._inf_alt, self._inf_laps, self._inf_accel,
+                self._inf_bank, self._inf_radius, self._inf_lookahead, self._inf_cross_mult)
 
     lay.addLayout(form)
 
@@ -2350,10 +2564,12 @@ class InfinityMissionTab(_BaseMissionTab):
     """
     super()._apply_tab_constraints()
     for _e in (self._tkf_lat, self._tkf_lon, self._p1_lat, self._p1_lon,
-               self._p2_lat, self._p2_lon):
+               self._p2_lat, self._p2_lon, self._fa_lat, self._fa_lon,
+               self._fb_lat, self._fb_lon):
       _e.textChanged.connect(lambda *_: self._refresh_inf_preview())
     self._inf_algo.currentIndexChanged.connect(lambda *_: self._refresh_inf_preview())
-    for _s in (self._inf_alt, self._inf_laps, self._sp_crz):
+    for _s in (self._inf_alt, self._inf_laps, self._sp_crz,
+               self._inf_bank, self._inf_radius, self._inf_cross_mult):
       _s.valueChanged.connect(lambda *_: self._refresh_inf_preview())
     self._rth_cb.toggled.connect(lambda *_: self._refresh_inf_preview())
     self._refresh_inf_preview()
@@ -2385,7 +2601,10 @@ class InfinityMissionTab(_BaseMissionTab):
     algo = "LEMNISCATE" if "Lemniscate" in self._inf_algo.currentText() else "DUBINS"
     try:
       route, loop_v, cross_v, radius = build_infinity_route(
-        p1, p2, float(self._sp_crz.value()), int(self._inf_laps.value()), algo)
+        p1, p2, float(self._sp_crz.value()), int(self._inf_laps.value()), algo,
+        turn_radius_override=float(self._inf_radius.value()),
+        cross_speed_mult=float(self._inf_cross_mult.value()),
+        bank_design_deg=float(self._inf_bank.value()))
     except Exception as exc:
       return None, f"Rota üretilemedi: {exc}"
 
@@ -2472,7 +2691,10 @@ class InfinityMissionTab(_BaseMissionTab):
 
     try:
       route, loop_speed, cross_speed, turn_radius = build_infinity_route(
-        p1, p2, cruise, num_laps, algo)
+        p1, p2, cruise, num_laps, algo,
+        turn_radius_override=float(self._inf_radius.value()),
+        cross_speed_mult=float(self._inf_cross_mult.value()),
+        bank_design_deg=float(self._inf_bank.value()))
       text = infinity_to_qgc_wpl(tkf_lat, tkf_lon, route, alt_m, rth)
     except Exception as exc:
       QMessageBox.critical(self, "Üretim Hatası", f"Rota üretilemedi:\n{exc}")
@@ -2533,6 +2755,20 @@ class InfinityMissionTab(_BaseMissionTab):
       self._wps.append({"lat": lat, "lon": lon, "alt": 0, "type": "DIREK 2", "idx": len(self._wps)})
       self._refresh_map()
       self._refresh_table()
+    elif t == self._SEL_FINISH_A:
+      self._fa_lat.setText(f"{lat:.7f}")
+      self._fa_lon.setText(f"{lon:.7f}")
+      self._wps = [w for w in self._wps if w["type"] != "PIST UCU A"]
+      self._wps.append({"lat": lat, "lon": lon, "alt": 0, "type": "PIST UCU A", "idx": len(self._wps)})
+      self._refresh_map()
+      self._refresh_table()
+    elif t == self._SEL_FINISH_B:
+      self._fb_lat.setText(f"{lat:.7f}")
+      self._fb_lon.setText(f"{lon:.7f}")
+      self._wps = [w for w in self._wps if w["type"] != "PIST UCU B"]
+      self._wps.append({"lat": lat, "lon": lon, "alt": 0, "type": "PIST UCU B", "idx": len(self._wps)})
+      self._refresh_map()
+      self._refresh_table()
     else:
       super()._add_wp(lat, lon)
 
@@ -2580,7 +2816,31 @@ class InfinityMissionTab(_BaseMissionTab):
       "flight_altitude_m": self._inf_alt.value(),
       "algorithm":         algo_key,
       "wpnav_accel":       self._inf_accel.value(),
+      # 2026-08-25 DEVIR: companion bu 3 alanı zaten kabul ediyordu, YKİ
+      # şimdiye kadar hiç göndermiyordu — companion kendi sabit
+      # varsayılanlarını (10°/1.0m/1.15) kullanıyordu. Artık operatör
+      # ayarlayabiliyor; alanların KENDİSİ companion varsayılanlarıyla
+      # AYNI değerde başlar, göndermek davranışı DEĞİŞTİRMEZ.
+      "bank_design_deg":          self._inf_bank.value(),
+      "lookahead_m":              self._inf_lookahead.value(),
+      "infinity_cross_speed_mult": self._inf_cross_mult.value(),
     })
+    # turn_radius_m: 0 = "otomatik" (companion D/2.75'ten türetir) —
+    # yalnızca operatör AÇIKÇA bir değer girdiyse gönderilir (finish_a/b ile
+    # AYNI "isteğe bağlı alan" deseni).
+    if self._inf_radius.value() > 0.0:
+      params["turn_radius_m"] = self._inf_radius.value()
+    # Pist başlangıç/bitiş çizgisi — İSTEĞE BAĞLI (DEVIR §0o). İki uç da
+    # girilmemişse alan hiç gönderilmez; İHA tarafı bunu "eski davranış"
+    # (doğrudan RTL/LOITER, ek yarım tur/hat-geçişi YOK) olarak yorumlar —
+    # geriye dönük uyumluluk, hazır olmayan sahalar için görevi bozmaz.
+    try:
+      fa = {"lat": float(self._fa_lat.text()), "lon": float(self._fa_lon.text())}
+      fb = {"lat": float(self._fb_lat.text()), "lon": float(self._fb_lon.text())}
+      params["finish_a"] = fa
+      params["finish_b"] = fb
+    except ValueError:
+      pass
     # BUG FIX: self._wps yalnızca harita işaretçilerini (DIREK 1/2) içerir —
     # bunlar uçuş rotası WP'si değildir. Companion, pole1/pole2'den ∞ rotayı üretir.
     params["waypoints"] = []
