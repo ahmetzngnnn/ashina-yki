@@ -183,7 +183,20 @@ class TuningView(QWidget):
         fs_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
 
         self._fs_action = QComboBox()
-        self._fs_action.addItems(["RTL (Eve Dön)", "Land (İniş)"])
+        # ── DÜZELTİLDİ 2026-08-31 — ŞARTNAME İHLALİ ÜRETİYORDU ───────────
+        # ESKİ HÂLİ: seçenekler ["RTL", "Land"] ve eşleme `2 if idx==0 else 1`
+        # idi; koddaki yorum da "1=Land, 2=RTL" diyordu. ArduCopter'da doğrusu:
+        #   0=Disabled · 1=Always RTL · 2=(4.x'te KALDIRILDI) · 3=Always LAND
+        # Yani operatör "Land (İniş)" seçince araca 1 = **RTL** yazılıyordu —
+        # TAM TERSİ. Şartname §9.2 RTL'i AÇIKÇA YASAKLIYOR ("eve dönüş modu
+        # seçilemez") ve failsafe kontrolünü geçemeyen İHA UÇAMIYOR.
+        # config.json fc_params_expected FS_THR_ENABLE=3 bekliyor; panel
+        # 3'ü HİÇBİR seçimle yazamıyordu.
+        # Sıra ŞARTNAMEYE UYGUN olan ÖNCE olacak şekilde değiştirildi.
+        self._fs_action.addItems([
+            "Land — kontrollü iniş (ŞARTNAME GEREĞİ)",
+            "RTL — eve dön (ŞARTNAME DIŞI, yalnız test)",
+        ])
         self._fs_action.setMaximumWidth(260)
         fs_form.addRow("Bağlantı Kopunca:", self._fs_action)
 
@@ -353,21 +366,34 @@ class TuningView(QWidget):
 
     def _apply_failsafe(self) -> None:
         action_idx = self._fs_action.currentIndex()
-        # FS_THR_ENABLE: 1=Land, 2=RTL
-        fs_mode = 2 if action_idx == 0 else 1
+        # ArduCopter FS_THR_ENABLE: 0=Disabled, 1=Always RTL, 3=Always LAND.
+        # (2 ArduCopter 4.x'te KALDIRILDI — eski kod onu yazıyordu.)
+        # idx 0 = Land (şartname), idx 1 = RTL (şartname dışı).
+        fs_mode = 3 if action_idx == 0 else 1
         radius = self._geofence_radius.value()
 
         # NEDEN onay: Failsafe/GeoFence parametrelerini değiştirmek, bağlantı
         # koptuğunda veya araç sınırı aştığında aracın NE yapacağını belirler —
         # yanlış bir değer acil durumda beklenmeyen davranışa yol açabilir.
         # Aynı desen _write_all_pids'te kullanılıyor.
+        # ŞARTNAME UYARISI: §9.2 radyo failsafe'inin KONTROLLÜ İNİŞ olmasını
+        # şart koşuyor ve "eve dönüş modu (RTL) seçilemez" diyor; failsafe
+        # kontrolünü geçemeyen İHA UÇUŞ YAPAMAZ. RTL seçimi teknik kontrolde
+        # takılmaya yol açar, o yüzden ayrıca ve açıkça uyarılır.
+        _sartname_disi = (action_idx != 0)
+        _ek = ("\n\n⚠ ŞARTNAME İHLALİ RİSKİ: §9.2 radyo failsafe'inin "
+               "KONTROLLÜ İNİŞ olmasını şart koşar ve RTL'i AÇIKÇA yasaklar. "
+               "Failsafe kontrolünü geçemeyen İHA uçuş yapamaz. RTL yalnız "
+               "yarışma dışı testler içindir." if _sartname_disi else "")
         reply = QMessageBox.warning(
             self, "Failsafe/GeoFence Değişikliği Onayı",
             "Failsafe ve GeoFence parametrelerini değiştirmek, bağlantı kopması "
             "veya sınır aşımı gibi acil durumlarda aracın davranışını etkiler.\n\n"
             f"  • Bağlantı Kopunca: {self._fs_action.currentText()}\n"
+            f"    → FS_THR_ENABLE = {fs_mode}"
+            f" ({'Always LAND' if fs_mode == 3 else 'Always RTL'})\n"
             f"  • GeoFence Yarıçapı: {radius:.0f} m\n\n"
-            "Devam etmek istediğinize emin misiniz?",
+            "Devam etmek istediğinize emin misiniz?" + _ek,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
@@ -375,4 +401,8 @@ class TuningView(QWidget):
 
         self.set_param.emit("FS_THR_ENABLE", float(fs_mode))
         self.set_param.emit("FENCE_RADIUS", radius)
+        # FENCE_ENABLE de gönderilmeli: yalnız yarıçap yazmak çiti KURAR ama
+        # AÇMAZ — operatör "çit 100 m" görüp korunduğunu sanır, oysa çit pasif.
+        # (SAHA_KONTROL A5 önerisi: FENCE_ENABLE=1 + FENCE_ALT_MAX=100.)
+        self.set_param.emit("FENCE_ENABLE", 1.0)
         logger.info("Failsafe uygulandı: mode=%s, fence=%s", fs_mode, radius)

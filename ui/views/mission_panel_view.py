@@ -1946,7 +1946,7 @@ class TargetDropMissionTab(_BaseMissionTab):
     self._grab_vz_max = _dsb(0.1, 1.5, 0.60, 0.05, " m/s", 2)
     self._grab_vz_max.setToolTip("Tam hizalıyken azami alçalma hızı.")
 
-    self._grab_u_gate = _dsb(0.10, 0.60, 0.35, 0.01, "", 2)
+    self._grab_u_gate = _dsb(0.10, 0.60, 0.40, 0.01, "", 2)  # 2026-08-31: firmware varsayılanıyla HİZALANDI (tuning.py). Panel eski değeri gönderiyor ve firmware düzeltmesini SESSİZCE EZİYORDU.
     self._grab_u_gate.setToolTip(
       "Alçalma kapısı: hedefin kare yarı-boyutuna göre normalize hatası.\n"
       "0 = merkez, 1 = kare kenarı. Bu değerin üstünde alçalma DURUR,\n"
@@ -2150,8 +2150,10 @@ class TargetDropMissionTab(_BaseMissionTab):
     # parametresi (approach_gimbal_track) firmware'de ZATEN ölüydü ve
     # gimbal söküldüğü için kavramın kendisi de kalmadı.
 
-    self._ap_floor_red = _dsb(0.0, 20.0, 0.0, 0.5, " m", 1)
-    self._ap_floor_blue = _dsb(0.0, 20.0, 0.0, 0.5, " m", 1)
+    self._ap_floor_red = _dsb(0.0, 20.0, 2.0, 0.5, " m", 1)  # 2026-08-31: firmware varsayılanıyla HİZALANDI (tuning.py). Panel eski değeri gönderiyor ve firmware düzeltmesini SESSİZCE EZİYORDU.
+    # kırmızı üçgen çevrel çapı 0.577 m
+    self._ap_floor_blue = _dsb(0.0, 20.0, 5.0, 0.5, " m", 1)  # 2026-08-31: firmware varsayılanıyla HİZALANDI (tuning.py). Panel eski değeri gönderiyor ve firmware düzeltmesini SESSİZCE EZİYORDU.
+    # mavi altıgen 2.0 m'ye inince KADRAJDAN TAŞTI (kullanıcı gözlemi)
     _floor_tip = ("0 = OTOMATİK: hedef alanı + aktif kamera FOV'undan türetilir.\n"
                   "Kamera profili değişince kendiliğinden güncellenir — sabit\n"
                   "yazılan bir değer, profil değişince sessizce yanlışlanır.")
@@ -2187,7 +2189,9 @@ class TargetDropMissionTab(_BaseMissionTab):
       "Kuyruğa yazmadan önce gereken ardışık onay sayısı.\n"
       "Tek kare yeterli değil: yanlış-pozitif bir izdüşüm, alanın dışında\n"
       "bir koordinatı kuyruğa sokar ve o hedef 'denendi' sayılıp kaybedilir.")
-    self._queue_spread = _dsb(1.0, 30.0, 6.0, 0.5, " m", 1)
+    self._queue_spread = _dsb(1.0, 30.0, 3.0, 0.5, " m", 1)  # 2026-08-31: firmware varsayılanıyla HİZALANDI (tuning.py). Panel eski değeri gönderiyor ve firmware düzeltmesini SESSİZCE EZİYORDU.
+    # 6.0 hedefle çeldiriciyi TEK KÜMEDE birleştirip ikisinin arasında
+    # "hayalet" koordinat üretiyordu (tuning.py:1024-1038, ölçüldü).
     self._queue_spread.setToolTip(
       "Ardışık onaylar bu mesafeden fazla oynarsa örneklem sıfırlanır —\n"
       "kararsız bir tespitin ortalaması 'üç kez onaylandı' diye güven verir\n"
@@ -2862,15 +2866,26 @@ class InfinityMissionTab(_BaseMissionTab):
     # varsayılanlarıyla AYNI (0 = companion kendi hesabını kullanır) —
     # gönderilmeyen/0 alan companion davranışını DEĞİŞTİRMEZ.
     self._inf_bank = QDoubleSpinBox()
-    self._inf_bank.setRange(5.0, 35.0)
+    # ARALIK companion KELEPÇESİYLE AYNI olmalı (2026-08-31 denetimi):
+    # infinity_flight.py::_MIN_BANK_DEG=5.0 / _MAX_BANK_DEG=22.0. Kutu
+    # ÖNCEDEN 5-35° kabul ediyordu; 22-35 bandında operatör bir değer
+    # girebiliyor, companion onu SESSİZCE 22°'ye kelepçeliyor (uyarı
+    # gönderiyor ama görev çoktan gönderilmiş oluyor) ve YKİ önizlemesi
+    # girilen açıyla hesap yaptığı için YANLIŞ hız/geometri gösteriyordu:
+    # D=150 m'de 30° girilince önizleme tur hızını 17.6 m/s sanıyor,
+    # gerçekte 22° kelepçesiyle 14.7 m/s uçuluyor (%19 abartı).
+    # İki taraf AYRI repo, ortak import yok — biri değişirse diğeri
+    # BİLEREK güncellenmeli (compute_optimal_turn_radius ile aynı kural).
+    self._inf_bank.setRange(5.0, 22.0)
     self._inf_bank.setValue(10.0)
     self._inf_bank.setSuffix("°")
     self._inf_bank.setMaximumWidth(140)
     self._inf_bank.setToolTip(
         "Viraj tasarım banka açısı — hedef tur hızını belirler (v=√(g·R·tanβ)).\n"
-        "Gerçek uçuşta ÖLÇÜLEN güvenli tavan: 21.8°. Bu açının ÜSTÜNE çıkmak\n"
-        "gerçek aracın hiç test edilmediği bir bölgedir — yalnızca sim'de\n"
-        "doğrulanmış bir değer girin. Companion varsayılanı: 10°.")
+        "Gerçek uçuşta ÖLÇÜLEN güvenli tavan: 21.8°. Üst sınır 22° —\n"
+        "companion'ın KENDİ kelepçesi (_MAX_BANK_DEG); üstünde bir değer\n"
+        "girilse bile araç 22° uçar, bu yüzden kutu da oraya kadar açık.\n"
+        "Companion varsayılanı: 10°.")
     _lbl_bank = QLabel("Tasarım Banka Açısı:"); _lbl_bank.setStyleSheet(_SL)
     form.addRow(_lbl_bank, self._inf_bank)
 
@@ -2971,6 +2986,7 @@ class InfinityMissionTab(_BaseMissionTab):
                self._inf_bank, self._inf_radius, self._inf_cross_mult):
       _s.valueChanged.connect(lambda *_: self._refresh_inf_preview())
     self._rth_cb.toggled.connect(lambda *_: self._refresh_inf_preview())
+    self._kur_inf_hiz_otomatik()
     self._refresh_inf_preview()
 
   # ── Görev 1 rota önizlemesi ──────────────────────────────────────────────
@@ -3054,17 +3070,133 @@ class InfinityMissionTab(_BaseMissionTab):
         _haversine(finish_leg[i][0], finish_leg[i][1],
                    finish_leg[i + 1][0], finish_leg[i + 1][1])
         for i in range(len(finish_leg) - 1))
+    # canli_cross_v: CANLI uçuşta gerçekleşecek düz geçiş hızı. Önizleme
+    # algoritması LEMNISCATE seçilince build_infinity_route cross_v yerine
+    # loop_v döndürüyor (o dalda WP-bazlı hız profili üretilmiyor) ve
+    # etiket düz geçiş satırını HİÇ göstermiyordu — oysa companion her iki
+    # seçimde de lemniskat uçuyor ve düz geçişte v_max'e çıkıyor
+    # (infinity_flight.py:1133). Önizleme bu yüzden canlı uçuşu EKSİK
+    # anlatıyordu; artık ayrı bir alan olarak taşınıyor.
+    canli_cross_v = self._inf_turetilen_tavan()
+    if canli_cross_v is None:
+      canli_cross_v = cross_v
+    elif not self._inf_crz_auto.isChecked():
+      # Elle tavan: companion min(max(tavan, loop), tavan_max) uyguluyor.
+      canli_cross_v = min(max(float(self._sp_crz.value()), loop_v), canli_cross_v)
     return full, {
       "n": len(pts), "length_m": length, "radius": radius,
-      "loop_v": loop_v, "cross_v": cross_v, "dist": dist, "algo": algo,
+      "loop_v": loop_v, "cross_v": cross_v, "canli_cross_v": canli_cross_v,
+      "dist": dist, "algo": algo,
       "eta_s": length / max(0.5, loop_v),
       "finish_leg": finish_leg, "finish_ab": finish_ab,
     }
+
+  # ── Tur Hızı: otomatik türetme (2026-08-31) ─────────────────────────────
+  # BULUNAN HATA: taban sınıf `speeds.cruise` alanını KOŞULSUZ gönderiyordu
+  # (varsayılan 8.0 m/s). Companion tarafında (infinity_flight.py:1132-1133):
+  #     cruise_requested = speeds.cruise  (yoksa loop_speed*cross_mult)
+  #     v_max = min(max(cruise_requested, loop_speed), loop_speed*cross_mult)
+  # yani GÖNDERİLEN değer bir TAVAN. Yarışma mesafesi D=150 m'de:
+  #     R = 150/2.75 = 54.5 m
+  #     loop_speed = sqrt(9.81*54.5*tan10°) = 9.71 m/s
+  #     tavan      = 9.71 * 1.35            = 13.11 m/s
+  #     v_max = min(max(8.0, 9.71), 13.11)  = 9.71 m/s
+  # → merkez geçiş hız çarpanı TAMAMEN ölüyordu; araç düz bacakta 13.11
+  # yerine 9.71 m/s uçuyordu (%26 yavaş). Görev 1'de uçuş süresi puanın
+  # %40'ı (şartname §11.1.2: 12/30 puan t_uçuş'tan) — doğrudan puan kaybı.
+  # Önizleme de AYNI kelepçeyi uyguladığı için operatör tutarlı ama YANLIŞ
+  # bir sayı görüyordu ve "düz geçiş" satırı hiç görünmüyordu.
+  #
+  # ÇÖZÜM: alan İSTEĞE BAĞLI yapıldı — turn_radius_m / finish_a-b /
+  # mission_time_budget_s ile AYNI "gönderilmezse companion türetir" deseni.
+  # Otomatik AÇIK (varsayılan): kutu kilitli, türetilen tavanı GÖSTERİR
+  # (batarya tahmini ve önizleme doğru kalsın diye) ve gönderimde
+  # `speeds.cruise` HİÇ gönderilmez → companion kendi tam değerini kullanır.
+  # Otomatik KAPALI: operatörün girdiği değer tavan olarak gönderilir —
+  # rüzgârda hız sınırlama gibi bilinçli müdahaleler mümkün kalır.
+  def _kur_inf_hiz_otomatik(self):
+    self._inf_crz_auto = QCheckBox("Otomatik (direk mesafesinden türet)")
+    self._inf_crz_auto.setChecked(True)
+    self._inf_crz_auto.setToolTip(
+        "AÇIK: tur hızı direk mesafesi, banka ve merkez geçiş oranından\n"
+        "türetilir; İHA'ya hız TAVANI gönderilmez (companion kendi\n"
+        "optimumunu kullanır).\n"
+        "KAPALI: yandaki değer TAVAN olarak gönderilir — companion'ın\n"
+        "hesapladığı optimum bu değerin üstündeyse KISILIR.")
+    form = self._speed_grp.layout()
+    # Satır indeksini ARAYARAK bul: kutu bir QHBoxLayout içinde ("Varsayılan"
+    # düğmesiyle birlikte), sabit indeks yazmak satır eklendiğinde sessizce
+    # yanlış yere koyardı.
+    _row = form.rowCount()
+    for _r in range(form.rowCount()):
+      _it = form.itemAt(_r, QFormLayout.ItemRole.FieldRole)
+      _lay = _it.layout() if _it is not None else None
+      if _lay is not None and _lay.indexOf(self._sp_crz) >= 0:
+        _row = _r + 1
+        break
+    form.insertRow(_row, "", self._inf_crz_auto)
+    self._inf_crz_auto.toggled.connect(lambda *_: self._refresh_inf_preview())
+
+  def _inf_turetilen_tavan(self):
+    """Companion'ın kullanacağı düz-geçiş hız tavanı (m/s) — koordinat
+    eksikse None. Formül companion ile AYNI olmalı (ayrı repo, ortak import
+    yok): loop = sqrt(g*R*tan(banka)), tavan = loop*cross_mult."""
+    try:
+      p1lat = float(self._p1_lat.text()); p1lon = float(self._p1_lon.text())
+      p2lat = float(self._p2_lat.text()); p2lon = float(self._p2_lon.text())
+    except ValueError:
+      return None
+    D = _haversine(p1lat, p1lon, p2lat, p2lon)
+    if D < 5.0:
+      return None
+    R = compute_optimal_turn_radius(D, float(self._inf_radius.value()))
+    loop_v = compute_ideal_cruise(R, float(self._inf_bank.value()))
+    return loop_v * float(self._inf_cross_mult.value())
+
+  def _sync_inf_cruise(self):
+    """Otomatik açıkken tur hızı kutusunu türetilen tavana eşitler."""
+    if not hasattr(self, "_inf_crz_auto"):
+      return
+    auto = self._inf_crz_auto.isChecked()
+    self._sp_crz.setEnabled(not auto)
+    if not auto:
+      self._speed_note.setText(
+          "Tur Hızı ELLE: bu değer İHA'ya hız TAVANI olarak gönderilir. "
+          "Companion'ın türettiği optimum bunun üstündeyse KISILIR "
+          "(düz geçiş yavaşlar, uçuş süresi uzar).")
+      self._speed_note.setVisible(True)
+      return
+    tavan = self._inf_turetilen_tavan()
+    if tavan is None:
+      self._speed_note.setText(
+          "Tur Hızı otomatik — direk koordinatları girilince türetilecek. "
+          "İHA'ya hız tavanı gönderilmez.")
+      self._speed_note.setVisible(True)
+      return
+    lo, hi = self._sp_crz.minimum(), self._sp_crz.maximum()
+    gosterim = max(lo, min(hi, tavan))
+    # blockSignals: setValue → valueChanged → _refresh_inf_preview →
+    # _sync_inf_cruise özyinelemesini keser.
+    _b = self._sp_crz.blockSignals(True)
+    self._sp_crz.setValue(gosterim)
+    self._sp_crz.blockSignals(_b)
+    self._update_battery()
+    _kirpildi = ("  (kutu aralığı %.0f-%.0f m/s olduğu için %.1f gösteriliyor; "
+                 "İHA gerçek değeri kullanır)" % (lo, hi, gosterim)
+                 ) if abs(gosterim - tavan) > 0.05 else ""
+    self._speed_note.setText(
+        f"Tur Hızı OTOMATİK: direk mesafesinden türetilen düz geçiş tavanı "
+        f"{tavan:.1f} m/s. İHA'ya hız tavanı GÖNDERİLMEZ — companion kendi "
+        f"optimumunu kullanır.{_kirpildi}")
+    self._speed_note.setVisible(True)
 
   def _refresh_inf_preview(self, fit: bool = False):
     """Rota önizlemesini haritaya çizer ve özet etiketini günceller."""
     if not hasattr(self, "_inf_prev_lbl"):
       return
+    # Kutuyu ÖNCE senkronla: _inf_route_pts() tur hızını kutudan okur,
+    # sonra senkronlamak önizlemeyi bir adım geride bırakırdı.
+    self._sync_inf_cruise()
     pts, info = self._inf_route_pts()
     if pts is None:
       self._inf_prev_lbl.setText(str(info))
@@ -3092,8 +3224,8 @@ class InfinityMissionTab(_BaseMissionTab):
       f"Direk arası {info['dist']:.0f} m → dönüş yarıçapı {info['radius']:.1f} m "
       f"(D/R={info['dist'] / max(0.1, info['radius']):.2f}).  "
       f"Döngü hızı {info['loop_v']:.1f} m/s"
-      + (f", düz geçiş {info['cross_v']:.1f} m/s" if info["algo"] == "DUBINS"
-         and info["cross_v"] > info["loop_v"] + 0.05 else "")
+      + (f", düz geçiş {info['canli_cross_v']:.1f} m/s"
+         if info.get("canli_cross_v", 0.0) > info["loop_v"] + 0.05 else "")
       + f".  İrtifa {self._inf_alt.value():.0f} m."
       + ("  Son bacak (direk 2 ek dolanması + pist çizgisi geçişi) haritada "
          "kesikli yeşille ŞEMATİK çizildi." if info.get("finish_leg") else
@@ -3247,7 +3379,13 @@ class InfinityMissionTab(_BaseMissionTab):
     p2 = {"lat": p2_lat, "lon": p2_lon}
 
     params = self.get_mission_params()
-    
+    # Tur hızı otomatikse alanı HİÇ gönderme — companion
+    # loop_speed*cross_mult optimumunu kendisi kullansın
+    # (gerekçe: _kur_inf_hiz_otomatik NEDEN bloğu).
+    if getattr(self, "_inf_crz_auto", None) is not None \
+        and self._inf_crz_auto.isChecked():
+      (params.get("speeds") or {}).pop("cruise", None)
+
     # Enum-like parsing
     algo_text = self._inf_algo.currentText()
     algo_key = "LEMNISCATE" if "Lemniscate" in algo_text else "DUBINS"

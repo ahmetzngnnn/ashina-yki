@@ -17,9 +17,24 @@ C_YELLOW = "rgb(204, 204, 25)"
 
 class TofWidget(QFrame):
     """
-    Görev 3 (Yük Alma) sırasında TOF sensör okumalarını görselleştiren araç.
-    3x3 bir ızgara yapısında 4 sensörün durumunu gösterir.
-    VeriGörselleştirme.py mantığına sadık kalınarak tasarlanmıştır.
+    Görev 3 (Yük Alma) TOF halkasını görselleştirir — 5×VL53L1X, ARTI düzeni.
+
+    2026-08-31 GÜNCELLEMESİ — panel ÖLÜYDÜ ve yanlış geometriyi çiziyordu:
+      * Widget 4 KÖŞE sensörü (L1/L2/L4/L5) ve 240 mm beklenen mesafe
+        varsayıyordu. Araçta böyle bir düzen YOK: 5 sensör ARTI düzeninde
+        (merkez + ön/arka/sağ/sol, gövde merkezinden ±42.5 mm) ve temas
+        anında sensör düzlemi zeminden 60 mm yukarıda.
+      * Ayrıca zincir KOPUKTU: görev yalnız `tof_dist_mm` (merkez) yayınlıyor,
+        status_server ise `tof_distances` anahtarını arıyordu — o anahtarı
+        KİMSE doldurmuyordu. Panel hiç veri almıyordu.
+
+    Artık görev 5 slotun tamamını + geometri sabitlerini gönderiyor; panel
+    kendi kopyasını TUTMAZ (renk bantlarında yaşanan "üç kopya tuzağı"
+    burada tekrarlanmasın diye eşikler telden gelir).
+
+    OKUMA SEMANTİĞİ: sensör yükü görüyorsa okuma ZEMİNDEN yük yüksekliği
+    kadar KISADIR (basamak ≈ 23 mm). Yani "kısa okuyan kenar" yükün olduğu
+    yönü gösterir ve araç O YÖNE gitmelidir.
     """
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -27,8 +42,13 @@ class TofWidget(QFrame):
         self.setFrameShadow(QFrame.Shadow.Raised)
         self.setObjectName("tofWidget")
 
-        self.target_expected = 240.0
-        self.tolerance = 15.0
+        # Geometri TELDEN gelir (görev yayınlar); bunlar yalnız ilk kare
+        # için makul varsayılanlar — tuning.py ile aynı değerler.
+        self.temas_mm = 60.0        # temasta sensör düzleminin zeminden yüksekliği
+        self.basamak_mm = 23.0      # yük kalınlığı = zemin/yük okuma farkı
+        self.gecerli_min_mm = 40.0  # VL53L1X ölü bölgesi
+        self.gecerli_maks_mm = 4000.0
+        self.halka_acik = True
         # Son durum metni/token'ı — tema değişince aynı durum yeniden boyanır.
         self._status_token = "accent"
 
@@ -69,11 +89,13 @@ class TofWidget(QFrame):
                 self.grid.addWidget(lbl, row, col)
                 self.labels[(row, col)] = lbl
 
-        # Sabit Köşe İsimleri
-        self._set_cell(0, 0, "SOL ÜST\n(L5)\nBekleniyor...", None)
-        self._set_cell(0, 2, "SAĞ ÜST\n(L1)\nBekleniyor...", None)
-        self._set_cell(2, 0, "SOL ALT\n(L4)\nBekleniyor...", None)
-        self._set_cell(2, 2, "SAĞ ALT\n(L2)\nBekleniyor...", None)
+        # ARTI düzeni: merkez + ön/arka/sağ/sol (gövde çerçevesi).
+        # ÖN = aracın burnu yönü; ızgarada yukarı.
+        self._set_cell(0, 1, "ÖN\nBekleniyor...", None)
+        self._set_cell(1, 0, "SOL\nBekleniyor...", None)
+        self._set_cell(1, 1, "MERKEZ\nBekleniyor...", None)
+        self._set_cell(1, 2, "SAĞ\nBekleniyor...", None)
+        self._set_cell(2, 1, "ARKA\nBekleniyor...", None)
 
         main_layout.addLayout(self.grid)
 
@@ -124,74 +146,113 @@ class TofWidget(QFrame):
 
     @pyqtSlot(dict)
     def update_tof_data(self, data: dict):
-        """
-        Gelen data formatı:
-        {
-            "L1": 240.5, # SAĞ ÜST
-            "L2": 241.0, # SAĞ ALT
-            "L5": 239.5, # SOL ÜST
-            "L4": 255.0  # SOL ALT
-        }
-        """
-        d_L1 = data.get("L1", 0)
-        d_L2 = data.get("L2", 0)
-        d_L5 = data.get("L5", 0)
-        d_L4 = data.get("L4", 0)
+        """5 slotlu TOF halkasını çiz.
 
-        # Hata durumu kontrolü (Tümü -1 ise)
-        if d_L1 == -1 and d_L2 == -1 and d_L5 == -1 and d_L4 == -1:
-            self._set_status("HATA!\nSENSÖR OKUNAMIYOR", "danger")
+        Beklenen veri (görev yayınlar — teknofest_task2.live_status):
+            {"merkez","on","arka","sag","sol": mm | None,
+             "temas_mm","basamak_mm","gecerli_min_mm","gecerli_maks_mm",
+             "halka_acik"}
+
+        RENK SEMANTİĞİ:
+          beyaz : sensör YÜKÜ görüyor (okuma zeminden ≥ yarım basamak kısa)
+          mavi  : sensör ZEMİNİ görüyor (yük o yönde değil)
+          sarı  : okuma menzil dışı — ölü bölge (<40 mm) ya da >4 m
+          gri   : veri yok
+
+        Kısa okuyan kenar yükün YÖNÜNÜ gösterir; araç o yöne kaymalıdır.
+        """
+        if not isinstance(data, dict) or not data:
+            self._set_status("VERİ YOK\nGörev 3 çalışmıyor olabilir", "text_muted")
             return
 
-        h_L1 = abs(d_L1 - self.target_expected) <= self.tolerance
-        h_L2 = abs(d_L2 - self.target_expected) <= self.tolerance
-        h_L5 = abs(d_L5 - self.target_expected) <= self.tolerance
-        h_L4 = abs(d_L4 - self.target_expected) <= self.tolerance
+        # Geometri TELDEN gelir — panel kendi kopyasını tutmaz (renk
+        # bantlarında yaşanan "üç kopya tuzağı" burada tekrarlanmasın).
+        # dict.get(k, varsayılan) anahtar VARSA ama değeri None ise varsayılanı
+        # KULLANMAZ → float(None) TypeError. Firmware bugün hep float
+        # gönderiyor (teknofest_task2.live_status), ama bu bir EKRAN yolu:
+        # kısmi/bozuk bir mesaj paneli Qt slot'unun içinde düşürmemeli —
+        # üstelik tam da halka arızalıyken, yani operatörün panele en çok
+        # ihtiyaç duyduğu anda. Sayıya çevrilemeyen değer = "gelmedi".
+        def _sayi(anahtar, mevcut):
+            v = data.get(anahtar)
+            try:
+                return float(v) if v is not None else float(mevcut)
+            except (TypeError, ValueError):
+                return float(mevcut)
 
-        # Siyah zemin
-        for row in range(3):
-            for col in range(3):
-                self._set_cell(row, col, "", self.C_BLACK)
+        self.temas_mm = _sayi("temas_mm", self.temas_mm)
+        self.basamak_mm = _sayi("basamak_mm", self.basamak_mm)
+        self.gecerli_min_mm = _sayi("gecerli_min_mm", self.gecerli_min_mm)
+        self.gecerli_maks_mm = _sayi("gecerli_maks_mm", self.gecerli_maks_mm)
+        self.halka_acik = bool(data.get("halka_acik", self.halka_acik))
 
-        # Hücre güncellemeleri
-        c_L5 = self.C_WHITE if h_L5 else self.C_RED
-        self._set_cell(0, 0, f"SOL ÜST\n{d_L5:.1f} mm", c_L5)
+        yerler = {"on": (0, 1, "ÖN"), "sol": (1, 0, "SOL"),
+                  "merkez": (1, 1, "MERKEZ"), "sag": (1, 2, "SAĞ"),
+                  "arka": (2, 1, "ARKA")}
+        okuma = {k: data.get(k) for k in yerler}
 
-        c_L1 = self.C_WHITE if h_L1 else self.C_GREEN
-        self._set_cell(0, 2, f"SAĞ ÜST\n{d_L1:.1f} mm", c_L1)
+        def _gecerli(v):
+            return (isinstance(v, (int, float)) and v
+                    and self.gecerli_min_mm <= float(v) <= self.gecerli_maks_mm)
 
-        c_L4 = self.C_WHITE if h_L4 else self.C_BLUE
-        self._set_cell(2, 0, f"SOL ALT\n{d_L4:.1f} mm", c_L4)
+        # Zemin referansı: KENARLARIN EN BÜYÜĞÜ. Yükü gören sensör KISA okur,
+        # dolayısıyla en uzun geçerli kenar okuması zemini temsil eder
+        # (firmware'de tof_ring._zemin_referansi ile AYNI kural).
+        kenar = [okuma[k] for k in ("on", "arka", "sag", "sol")]
+        gec = [float(v) for v in kenar if _gecerli(v)]
+        zemin = max(gec) if gec else None
+        esik = (zemin - self.basamak_mm * 0.5) if zemin is not None else None
 
-        c_L2 = self.C_WHITE if h_L2 else self.C_YELLOW
-        self._set_cell(2, 2, f"SAĞ ALT\n{d_L2:.1f} mm", c_L2)
+        for r in range(3):
+            for c in range(3):
+                self._set_cell(r, c, "", self.C_BLACK)
 
-        # Durum Kararı
-        durum_metni = ""
-        durum_renk = "accent"
+        goren = []
+        for ad, (r, c, etiket) in yerler.items():
+            v = okuma[ad]
+            if not isinstance(v, (int, float)) or not v:
+                self._set_cell(r, c, f"{etiket}\nveri yok", None)
+                continue
+            v = float(v)
+            if not _gecerli(v):
+                self._set_cell(r, c, f"{etiket}\n{v:.0f} mm\nmenzil dışı",
+                               self.C_YELLOW)
+                continue
+            yuk = esik is not None and v < esik
+            if yuk and ad != "merkez":
+                goren.append(etiket)
+            self._set_cell(r, c, f"{etiket}\n{v:.0f} mm",
+                           self.C_WHITE if yuk else self.C_BLUE)
 
-        if h_L1 and h_L2 and h_L5 and h_L4:
-            durum_metni = "[ KİLİTLENDİ ]\nHedef Tam Merkezde!"
-            durum_renk = "success"
-            self._set_cell(1, 1, "HEDEF\nMERKEZ", self.C_WHITE)
-        elif not h_L1 and not h_L2 and not h_L5 and not h_L4:
-            durum_metni = "[ ARAMA MODU ]\nHedef Bulunamadı"
-            durum_renk = "text_muted"
+        if not self.halka_acik:
+            self._set_status("HALKA KAPALI\nsalt gözlem — kamera yolu sürüyor",
+                             "text_muted")
+            return
+        if zemin is None:
+            self._set_status("GEÇERLİ OKUMA YOK\nsensör/menzil kontrolü", "danger")
+            return
+
+        yukseklik = zemin - self.temas_mm
+        mv = okuma["merkez"]
+        merkez_yuk = (_gecerli(mv) and esik is not None and float(mv) < esik)
+        # TEMAS ANI: zemin temas yüksekliğine yaklaşınca yük ÜSTÜ sensörün
+        # ölü bölgesine (<40 mm) düşer. Firmware bunu ARIZA değil YÜK DELİLİ
+        # sayar (tof_ring: kor_yuk_say). Panel de aynı semantiği kullanmalı,
+        # yoksa en kritik anda "yük görünmüyor" yazıp operatörü yanıltır.
+        _kor_beklenen = (zemin - self.basamak_mm) < self.gecerli_min_mm
+        merkez_kor = (_kor_beklenen and isinstance(mv, (int, float)) and mv
+                      and float(mv) < self.gecerli_min_mm)
+        if merkez_kor:
+            self._set_status(
+                f"TEMAS\nmerkez ölü bölgede — yük altta ({float(mv):.0f} mm)",
+                "success")
+            return
+        if goren:
+            self._set_status("KAYDIR → " + "+".join(goren)
+                             + f"\nzeminden {yukseklik:+.0f} mm", "accent")
+        elif merkez_yuk:
+            self._set_status(f"MERKEZDE\nyük altta · zeminden {yukseklik:+.0f} mm",
+                             "success")
         else:
-            yon_y = ""
-            yon_x = ""
-            if (not h_L5 and not h_L1) and (h_L4 or h_L2): yon_y = "YUKARI"
-            elif (not h_L4 and not h_L2) and (h_L5 or h_L1): yon_y = "AŞAĞI"
-            
-            if (not h_L5 and not h_L4) and (h_L1 or h_L2): yon_x = "SOLA"
-            elif (not h_L1 and not h_L2) and (h_L5 or h_L4): yon_x = "SAĞA"
-            
-            if yon_y or yon_x:
-                hedef_yon = f"{yon_y} {yon_x}".strip()
-                durum_metni = f"[ DÜZELTME YAPIYOR ]\n--> {hedef_yon} GİT"
-                durum_renk = "info"
-            else:
-                durum_metni = "[ KARARSIZLIK ]\nHizalama Bekleniyor"
-                durum_renk = "warning"
-
-        self._set_status(durum_metni, durum_renk)
+            self._set_status(f"YÜK GÖRÜNMÜYOR\nzeminden {yukseklik:+.0f} mm",
+                             "warning")
