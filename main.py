@@ -118,6 +118,12 @@ def main() -> None:
     theme.apply(app, _cfg.ui_theme)
 
     # ── 2. SQLite Başlat ──────────────────────────────────────────────────────
+    try:
+        from core import acilis_izleme
+        acilis_izleme.sifirla_baslangic()
+    except Exception:
+        pass
+
     logger.info("SQLite başlatılıyor...")
     db_conn = local_storage.get_connection()
     local_storage.init_schema(db_conn)
@@ -139,6 +145,18 @@ def main() -> None:
             main_window.showFullScreen()
         else:
             main_window.show()
+        # ── AÇILIŞ EKRANINA "HAZIRIM" DE (2026-09-03) ──────────────────────
+        # NEDEN: kiosk açılışında Plymouth 133 ms'de bitiyor ve YKİ penceresi
+        # gelene kadar Raspberry masaüstü görünüyor. tools/acilis_ekrani.py o
+        # boşluğu kapatıyor ve BU işareti bekliyor. İşaret pencere GÖSTERİLDİKTEN
+        # sonra yazılır — "süreç başladı" değil, "operatör ekranı görebiliyor".
+        # Ayrıca ölçülen süre geçmişe eklenir; yüzde göstergesi onun ortancasını
+        # kullanıyor, yani tahmin değil ÖLÇÜM.
+        try:
+            from core import acilis_izleme
+            acilis_izleme.hazir_bildir()
+        except Exception as _exc:
+            logger.warning("Açılış işareti yazılamadı: %s", _exc)
 
     if kiosk_mode:
         logger.info("Kiosk modu aktif — giriş ekranı atlanıyor, admin olarak otomatik giriş.")
