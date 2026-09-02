@@ -13,6 +13,7 @@ import os
 import sys
 import signal
 import logging
+from logging.handlers import RotatingFileHandler
 import multiprocessing
 from pathlib import Path
 
@@ -48,7 +49,16 @@ def setup_logging() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler(str(log_path), encoding="utf-8"),
+            # DÖNDÜRMELİ günlük (2026-09-02). ÖNCESİ düz FileHandler idi ve
+            # dosya SINIRSIZ büyüyordu — YKİ Pi'sinde 52.723 satır / 7.1 MB
+            # ölçüldü. Kiosk aylarca açık kalabilir ve tek bir kopuk NTRIP
+            # bağlantısı saniyede ~2 satır üretiyor; sınırsız büyüme diski
+            # doldurup uygulamayı düşürebilir.
+            # 5 MB × 3 yedek = en fazla 20 MB. Dönen dosyalar saha sonrası
+            # inceleme için KORUNUR (yalnız en yenisini tutmak, bir arızanın
+            # başlangıcını silmek demek olurdu).
+            RotatingFileHandler(str(log_path), maxBytes=5 * 1024 * 1024,
+                                backupCount=3, encoding="utf-8"),
         ],
     )
 
