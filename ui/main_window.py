@@ -298,6 +298,12 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._flight_analysis_view, "Kayıtlar")
         self._tabs.addTab(self._settings_view,  "Ayarlar")
 
+        # GÜVENLİK: Kalibrasyon sekmesinden çıkılırken motor testi DURDURULUR.
+        # CalibrationView.hideEvent zaten bunu yapıyor; bu bağlantı ikinci
+        # emniyettir — gizleme olayının gelmediği bir durumda bile (ör. sekme
+        # RBAC ile devre dışı bırakılıp zorla değiştirildiğinde) motorlar durur.
+        self._tabs.currentChanged.connect(self._on_sekme_degisti)
+
         root.addWidget(self._tabs, stretch=1)
 
         # Durum çubuğu
@@ -446,6 +452,16 @@ class MainWindow(QMainWindow):
         w.error_occurred.connect(self._on_error)
         w.mag_cal_progress.connect(self._calib_view.on_mag_cal_progress)
         w.mag_cal_report.connect(self._calib_view.on_mag_cal_report)
+        # Kalibrasyon sekmesinin YENİ alt panelleri (Uçuş Modları / Uçuş Öncesi
+        # Kontrol / Motor Test) FC'deki GERÇEK parametre değerlerini görmek
+        # zorunda: uçuş modu slotlarını okumak, fc_params_expected'i doğrulamak
+        # ve yazma sonrası GERİ OKUMAYLA teyit etmek için. PARAM_SET'in MAVLink
+        # ACK'i yoktur; tek doğrulama kanalı budur.
+        w.param_received.connect(self._calib_view.on_param_received)
+        # Bağlantı durumu: "bağlantı yoksa buton KAPALI ve nedeni YAZILI"
+        # kuralı için alt panellerin link durumunu bilmesi gerekir. Ayrıca
+        # link koparsa süren motor testinin durumu artık DOĞRULANAMAZ.
+        w.connection_changed.connect(self._calib_view.on_connection_changed)
         w.status_text_received.connect(self._dashboard.add_status_message)
         w.status_text_received.connect(self._syslog_view.on_status_text)
         # İvmeölçer kalibrasyonu FC'nin STATUSTEXT yanıtına ("Place vehicle…",
@@ -466,6 +482,10 @@ class MainWindow(QMainWindow):
         # bağlantı olmadan "Kaydet" hiçbir şey kaydetmez (panel bunu algılayıp
         # kırmızı "KAYDEDİLMEDİ" gösterir, ama asıl çözüm bağlantının olması).
         self._calib_view.set_param.connect(w.set_param)
+        # Kalibrasyon alt panellerinin "FC'den OKU" düğmesi. mavlink_worker'da
+        # TEK parametre okuyan bir slot yok (yalnız tam liste) — bu yüzden
+        # istek de tam liste isteğidir; paneller bunu kullanıcıya yazıyor.
+        self._calib_view.request_params.connect(w.request_parameters)
         self._tuning_view.send_command.connect(w.send_command)
         self._tuning_view.set_param.connect(w.set_param)
         self._advanced_view.set_param.connect(w.set_param)
@@ -523,6 +543,24 @@ class MainWindow(QMainWindow):
         fn = getattr(cur, "update_telemetry", None)
         if callable(fn):
             fn(data)
+
+    @pyqtSlot(int)
+    def _on_sekme_degisti(self, _index: int) -> None:
+        """Kalibrasyon sekmesi terk edilince motor testini durdurur.
+
+        NEDEN: Motor testi paneli motorları GERÇEKTEN döndürür. Operatör başka
+        bir sekmeye geçtiğinde paneli göremez; dönen bir motoru fark edemez ve
+        ACİL DUR düğmesine ulaşamaz. Şartname gereği panelden çıkışta motorlar
+        durdurulmak zorunda.
+        """
+        if self._tabs.currentWidget() is self._calib_view:
+            return
+        fn = getattr(self._calib_view, "acil_motor_durdur", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                logger.exception("Sekme değişiminde motor durdurma hatası")
 
     # ── RBAC Erişim Kontrolü ─────────────────────────────────────────────────
     def _apply_rbac(self) -> None:
@@ -1477,6 +1515,14 @@ class MainWindow(QMainWindow):
     # ── Kapatma ──────────────────────────────────────────────────────────────
     def closeEvent(self, event) -> None:
         logger.info("Uygulama kapatılıyor — tüm worker'lar durduruluyor")
+        # GÜVENLİK: worker'lar durmadan ÖNCE motor testi durdurulur. Sıra
+        # önemli — mavlink_worker durduktan sonra DUR komutu gönderilemez.
+        try:
+            fn = getattr(self._calib_view, "acil_motor_durdur", None)
+            if callable(fn):
+                fn()
+        except Exception:
+            logger.exception("Kapanışta motor durdurma hatası")
         self._watchdog.stop()
         # Uçuş kaydı ÖNCE kapatılmalı: worker'lar durunca telemetri kesilir ve
         # kayıt yalnız armed→disarmed geçişinde yazıldığı için uçuş kaybolurdu.

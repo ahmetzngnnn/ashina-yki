@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core import theme
+from core import batarya
 
 try:
     import serial.tools.list_ports as _list_ports
@@ -211,7 +212,8 @@ class TopBar(QWidget):
         self._rpi_addr = QComboBox()
         self._rpi_addr.setEditable(True)
         self._rpi_addr.addItems([
-            "192.168.1.229:5602",    # Companion (RPi) — kanonik (bkz. gcs_config)
+            "ashina-iha.local:5602",  # Companion — mDNS adı (adres değişse de çalışır)
+            "192.168.1.229:5602",    # dongle (AC1200) — bilinen adres, yedek
             "127.0.0.1:5602",        # Localhost (sim)
         ])
         self._rpi_addr.setMinimumWidth(180)
@@ -297,11 +299,20 @@ class TopBar(QWidget):
         # ── Durum göstergeleri (batarya / EKF / mod / GPS) ───────────────────
         self._bat_label = QLabel("BAT")
         self._bat_bar = QProgressBar()
-        self._bat_bar.setFixedWidth(90)
+        # NEDEN 90 → 118 px: çubuğun yazısı artık yüzde YANINDA gerilimi de
+        # taşıyor ("%73  23.9V"). 90 px'te bu metin kırpılıyordu; kırpılan
+        # gerilim, doğrusal yüzdeye güvenmemesi gereken operatörün tam da
+        # bakması gereken ham ölçüm.
+        self._bat_bar.setFixedWidth(118)
         self._bat_bar.setFixedHeight(16)
         self._bat_bar.setRange(0, 100)
         self._bat_bar.setValue(0)
         self._bat_bar.setTextVisible(True)
+        # NEDEN: Açılışta hiç telemetri yokken çubuk "0%" yazıyordu — operatör
+        # bunu "pil boş" diye okuyabilir. Başlangıç durumu BİLİNMİYOR'dur.
+        self._bat_bar.setFormat("veri yok")
+        self._bat_bar.setToolTip("Henüz pil verisi gelmedi.")
+        self._apply_battery_style()
 
         # Durum etiketleri: ilk kurulumdaki font, update_telemetry'nin bastığı
         # inline stille AYNI (11px bold) — bağlantı öncesi/sonrası zıplamasın.
@@ -373,16 +384,27 @@ class TopBar(QWidget):
             self.setStyleSheet(self._base_style)
 
     def _apply_battery_style(self) -> None:
-        """Batarya çubuğu: <=%20 danger, <=%50 warning, üstü success."""
-        if self._bat_percent is None:
-            return   # hiç telemetri gelmedi → QSS varsayılan chunk rengi kalsın
-        if self._bat_percent <= 20:
-            color = theme.c("danger")
-        elif self._bat_percent <= 50:
-            color = theme.c("warning")
-        else:
-            color = theme.c("success")
-        self._bat_bar.setStyleSheet(f"QProgressBar::chunk {{ background: {color}; }}")
+        """Batarya çubuğu rengi — eşikler core/batarya.py'de (tek kaynak).
+
+        NEDEN eşikler burada YAZILI DEĞİL: %20/%50 sayıları hem bu renk
+        mantığında hem test panelinin uçuş öncesi kapısında geçiyordu. Ölçek
+        gerilim tabanlısına geçince (25.2 V=%100, 21.0 V=%0) iki kopyadan
+        birini güncelleyip diğerini unutmak, operatöre kırmızı göstermeyen bir
+        gösterge bırakırdı. Eşikler ve karşılık geldikleri gerilimler
+        core/batarya.py'de belgelenir (%20 ≈ 21.84 V, %50 ≈ 23.10 V).
+        """
+        token = batarya.renk_tokeni(self._bat_percent)
+        if token is None:
+            # NEDEN: Yüzde BİLİNMİYOR. Kırmızı (boş) ya da yeşil (dolu)
+            # göstermek, veri yokluğunu bir ölçüm gibi sunardı. Nötr "idle"
+            # rengi + "veri yok" yazısı operatöre durumu dürüstçe söyler.
+            self._bat_bar.setStyleSheet(
+                f"QProgressBar::chunk {{ background: {theme.c('idle')}; }}"
+            )
+            return
+        self._bat_bar.setStyleSheet(
+            f"QProgressBar::chunk {{ background: {theme.c(token)}; }}"
+        )
 
     def _apply_mode_style(self) -> None:
         """Mod etiketi: ARM ise danger, DSM ise success (durum bilinmiyorsa renksiz)."""
@@ -437,9 +459,28 @@ class TopBar(QWidget):
     # ── Slot: Telemetri ───────────────────────────────────────────────────────
     @pyqtSlot(dict)
     def update_telemetry(self, data: dict) -> None:
-        bat = int(data.get("battery_remaining", 0))
-        self._bat_bar.setValue(max(0, min(100, bat)))
+        # ── PİL YÜZDESİ — GERİLİM TABANLI ──────────────────────────────────
+        # NEDEN değişti: burada eskiden `battery_remaining` (ArduPilot'un
+        # BATT_CAPACITY + tüketilen mAh sayımı) gösteriliyordu. Kullanıcı
+        # kararı (2026-09-02): yüzde GERİLİMDEN türetilecek —
+        # 25.2 V = %100, 21.0 V = %0. Hesap tek yerde: core/batarya.py.
+        bat = batarya.yuzde_telemetriden(data)
         self._bat_percent = bat
+        if bat is None:
+            # Gerilim yok → yüzde BİLİNMİYOR. Çubuk %0'a çekilmez; "veri yok"
+            # yazılır. (Boş pil ile telemetri sessizliği aynı görüntüye
+            # indirgenmemeli — depo ilkesi: kanıt yokluğu ≠ olumsuz kanıt.)
+            self._bat_bar.setValue(0)
+            self._bat_bar.setFormat("veri yok")
+        else:
+            self._bat_bar.setValue(bat)
+            # Yüzdenin yanında GERİLİMİ de göster: doğrusal eşlemenin yük
+            # altında yanıltabildiği yerde (bkz. core/batarya.py FİZİK NOTU)
+            # operatörün başvuracağı ham ölçüm gerilimdir.
+            volt = batarya.gerilim_telemetriden(data)
+            self._bat_bar.setFormat("%p%" if volt is None
+                                    else f"%p%  {volt:.1f}V")
+        self._bat_bar.setToolTip(batarya.ipucu_metni(data))
         self._apply_battery_style()
 
         # GPS
@@ -489,7 +530,13 @@ class TopBar(QWidget):
             self._btn_connect.setText("Kes")
         else:
             self._btn_connect.setText("Bağlan")
+            # NEDEN "veri yok": bağlantı kesilince pil hakkında bilgimiz
+            # KALMADI — %0 yazmak "pil bitti" demektir ve yanlıştır.
             self._bat_bar.setValue(0)
+            self._bat_bar.setFormat("veri yok")
+            self._bat_percent = None
+            self._apply_battery_style()
+            self._bat_bar.setToolTip("Bağlantı yok — pil verisi gelmiyor.")
             self._mode_label.setText("MODU: —")
             self._gps_label.setText("GPS: —")
 
@@ -718,7 +765,8 @@ class TopBar(QWidget):
         elif typ == "tcp":
             # Otomatik önerilen portlar
             self._conn_addr.addItems([
-                "192.168.1.229:5763",    # RPi MAVLink — kanonik (bkz. gcs_config)
+                "ashina-iha.local:5763",  # RPi MAVLink — mDNS adı
+                "192.168.1.229:5763",    # dongle — bilinen adres, yedek
                 "127.0.0.1:5763",        # SITL / laptop sim (tcpin:5763)
                 "127.0.0.1:5762",
             ])

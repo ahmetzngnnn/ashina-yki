@@ -31,7 +31,12 @@ DEFAULTS: dict = {
     # bayrağı override eder. Uçtan-uca sim (SITL+IHA-sim) için "real" + 127.0.0.1 host.
     "mode":                   "real",
     "ui_theme":               "dark",        # Arayüz teması: "dark" | "light"
-    "companion_host":         "192.168.1.229",  # İHA RPi — yardımcı bilgisayar + video (8080/8081)
+    # NEDEN İSİM, IP DEĞİL (2026-09-03): aracın adresi tek günde iki kez değişti
+    # (dahili WiFi .109 → AC1200 dongle .229) ve sahada DHCP her açılışta farklı
+    # verebilir. Araçta hostname `ashina-iha` + avahi çalışıyor, bu ad hangi
+    # arayüzden bağlanılırsa bağlansın çözülür. Çözülemezse core/iha_bul.py
+    # bilinen adreslere ve alt ağ taramasına düşer (Ayarlar → "Bul ve Sına").
+    "companion_host":         "ashina-iha.local",  # İHA RPi — mDNS adı (IP değil)
     "companion_mission_port": 5601,
     # GÜVENLİK (2026-08-25): companion'daki config.json gcs_server.auth_token
     # ile BİREBİR AYNI olmalı. Boş ("") = kimlik doğrulama KAPALI — port 5601

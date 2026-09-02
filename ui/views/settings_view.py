@@ -145,6 +145,23 @@ class SettingsView(QWidget):
         _auth_note.setWordWrap(True)
         comp_layout.addWidget(_auth_note, 5, 0, 1, 2)
 
+        # ── ARACI BUL (2026-09-03) ────────────────────────────────────
+        # NEDEN: aracın adresi tek günde iki kez değişti (dahili WiFi .109 →
+        # AC1200 dongle .229) ve sahada DHCP her açılışta farklı verebilir.
+        # Operatörün IP ezberlemesi/yazması hem hata kaynağı hem de 8 dakikalık
+        # uçuşa-hazırlık saatinden yiyen bir iş (şartname satır 1011).
+        # Bu düğme sırayla dener: mevcut ayar → mDNS adı → bilinen adresler →
+        # alt ağ taraması; bulduğunu alana YAZAR.
+        self._btn_bul = QPushButton("Aracı Bul ve Sına")
+        self._btn_bul.setToolTip(
+            "Aracı ağda arar ve bulduğu adresi yukarıdaki alana yazar.\n"
+            "Sıra: mevcut ayar → ashina-iha.local (mDNS) → bilinen adresler → tarama.")
+        self._btn_bul.clicked.connect(self._on_araci_bul)
+        comp_layout.addWidget(self._btn_bul, 6, 0)
+        self._bul_sonuc = QLabel("")
+        self._bul_sonuc.setWordWrap(True)
+        comp_layout.addWidget(self._bul_sonuc, 6, 1)
+
         root.addWidget(comp_grp)
 
         # ── MAVLink ───────────────────────────────────────────────────
@@ -206,6 +223,40 @@ class SettingsView(QWidget):
         btn_row.addWidget(btn_save)
 
         root.addLayout(btn_row)
+
+    def _on_araci_bul(self) -> None:
+        """Aracı ağda ara, bulunanı IP alanına yaz.
+
+        NEDEN arayüzü kilitliyor: tam tarama birkaç saniye sürebilir ve bu
+        işlem operatörün BİLEREK bastığı tek seferlik bir eylem. Yine de
+        önce ağ trafiği üretmeyen hızlı yollar (mevcut ayar, mDNS, bilinen
+        adresler) deneniyor; canlı araçta ölçüldü: 0.02 s.
+        """
+        from core import iha_bul
+
+        alan = self._fields.get("companion_host")
+        mevcut = alan.text().strip() if alan is not None else ""
+        self._bul_sonuc.setText("Aranıyor…")
+        self._btn_bul.setEnabled(False)
+        try:
+            from PyQt6.QtWidgets import QApplication
+            QApplication.processEvents()          # "Aranıyor…" ekrana çıksın
+            adres, aciklama = iha_bul.bul(mevcut, port=config.companion_status_port)
+        except Exception as exc:
+            adres, aciklama = None, f"Arama hatası: {exc}"
+        finally:
+            self._btn_bul.setEnabled(True)
+
+        if adres:
+            if alan is not None:
+                alan.setText(adres)
+            self._bul_sonuc.setText(f"✓ {aciklama}")
+            self._bul_sonuc.setStyleSheet(f"color:{theme.c('success')};")
+            logger.info("Araç bulundu: %s (%s)", adres, aciklama)
+        else:
+            self._bul_sonuc.setText(f"✗ {aciklama}")
+            self._bul_sonuc.setStyleSheet(f"color:{theme.c('danger')};")
+            logger.warning("Araç bulunamadı: %s", aciklama)
 
     def _add_field(self, layout: QGridLayout, row: int, label: str,
                    key: str, is_spin: bool, placeholder: str = "",

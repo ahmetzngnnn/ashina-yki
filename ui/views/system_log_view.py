@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
 )
 from ui.auth_manager import hash_password
 from core import local_storage, theme
+from core import batarya
 from core.global_state import state
 
 logger = logging.getLogger(__name__)
@@ -612,7 +613,13 @@ class SystemLogView(QWidget):
         yaw_deg   = math.degrees(float(data.get("yaw",   0.0)))
         alt       = float(data.get("alt", 0.0))
         spd       = float(data.get("groundspeed", 0.0))
-        bat       = float(data.get("battery_remaining", 0))
+        # ── PİL YÜZDESİ — GERİLİM TABANLI (core/batarya.py, tek kaynak) ────
+        # NEDEN değişti: eskiden FC'nin `battery_remaining` (mAh sayımı)
+        # alanı okunuyordu ve alan yoksa 0.0 varsayılıyordu — yani veri
+        # yokluğu "pil %0" olarak GRAFİĞE ÇİZİLİYOR ve aşağıdaki uyarı
+        # mantığına giriyordu. Kullanıcı kararı (2026-09-02) yüzdeyi
+        # gerilimden türetir (25.2 V=%100, 21.0 V=%0); bilinmiyorsa None.
+        bat = batarya.yuzde_telemetriden(data)
 
         # Grafiklere veri ekle
         self._chart_roll.push(roll_deg)
@@ -620,7 +627,11 @@ class SystemLogView(QWidget):
         self._chart_yaw.push(yaw_deg)
         self._chart_alt.push(alt)
         self._chart_spd.push(spd)
-        self._chart_bat.push(bat)
+        # NEDEN koşullu: yüzde bilinmiyorsa grafiğe SAHTE 0 basmak, düz bir
+        # "pil boş" çizgisi üretir ve sonradan logu okuyan bunu gerçek bir
+        # boşalma sanır. Bilinmeyen örnek hiç eklenmez (grafik o an durur).
+        if bat is not None:
+            self._chart_bat.push(float(bat))
 
         # Anormallik tespiti — satır renkleri aktif temadan (ham hex YOK)
         _WARN  = f'<span style="color:{theme.c("warning")}">'
@@ -678,11 +689,18 @@ class SystemLogView(QWidget):
         # NEDEN: Asıl kaçak buradaydı — batarya %30'un altına indiğinde uçuşun
         # KALANI boyunca her telemetri karesinde satır ekleniyordu. Artık seviye
         # DEĞİŞTİĞİNDE tek satır yazılır.
-        if bat <= 0:
-            new_level = ""          # geçersiz/veri yok
-        elif bat <= 20:
+        # NEDEN eşikler core/batarya.py'den: renk/uyarı sınırları ile bu
+        # analiz uyarıları AYNI ölçeğe oturmalı. Yeni ölçekte
+        # %20 ≈ 21.84 V (3.64 V/hücre) — paketin dik iniş bölgesi;
+        # "düşük" için ise kritik eşiğin 10 puan üstü kullanılır (≈22.26 V),
+        # eski %30 sabiti gerilim tabanlı ölçekte bir şeye karşılık gelmiyordu.
+        _KRITIK = batarya.RENK_KRITIK_YUZDE          # 20
+        _DUSUK  = batarya.RENK_KRITIK_YUZDE + 10     # 30
+        if bat is None:
+            new_level = ""          # veri yok → uyarı ÜRETME (%0 sanma)
+        elif bat <= _KRITIK:
             new_level = "kritik"
-        elif bat <= 30:
+        elif bat <= _DUSUK:
             new_level = "dusuk"
         else:
             new_level = "normal"

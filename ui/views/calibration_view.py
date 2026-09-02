@@ -1,10 +1,35 @@
 """
-calibration_view.py — Modül 3
+calibration_view.py — Kalibrasyon & Kurulum (Modül 3)
 Yalnızca ADMIN yetkisiyle erişilebilir.
-- İvmeölçer: 3D wizard (6 adım, DroneViz ile görselleştirme)
-- Pusula: dönen animasyon + ilerleme
-- Radyo: 8 kanal PWM barı (sınır yakalama)
-- Motor Test: X-config görsel, dönüş yönü, throttle, tahmini RPM
+
+Bu sınıf artık bir KAPSAYICIDIR: kendi içinde 3 klasik kalibrasyon sihirbazını
+barındırır, geri kalan panelleri ayrı dosyalardan kurar ve hepsinin FC ile
+haberleşmesini TEK bir kanal üzerinden yürütür.
+
+Sekmeler:
+  • İvmeölçer         — 6 pozisyonlu 3B sihirbaz (bu dosya)
+  • Pusula            — dönen animasyon + MAG_CAL_PROGRESS/REPORT (bu dosya)
+  • Radyo Kalibrasyon — 8 kanal uç yakalama → RCn_MIN/MAX yazma (bu dosya)
+  • Sensör & Seviye   — ui/views/sensor_cal_view.py
+  • Motor Test        — ui/views/motor_test_view.py   (⚠ motor döndürür)
+  • Uçuş Modları      — ui/views/flight_modes_view.py
+  • Uçuş Öncesi Kontrol — ui/views/preflight_check_view.py
+
+MİMARİ — NEDEN alt paneller AYRI DOSYADA ama AYNI SEKMEDE:
+(a) Bu dosya zaten 1500 satırdı; motor/mod/parametre panellerini de buraya
+    koymak bakımı imkânsız hale getirirdi.
+(b) main_window'un sekme çubuğu 12 sekmeyle DOLU ve kaydırma okları kapalı
+    (setUsesScrollButtons(False)) — üç yeni ana sekme çubuğu taşırırdı.
+(c) RBAC: main_window bu görünümü ADMIN'e kilitliyor (_apply_rbac). Alt
+    paneller aynı kilidin ARKASINDA kaldığı için ayrıca yetkilendirme
+    kurgusu gerekmedi — motor testi ve parametre yazma zaten ADMIN işi.
+
+MİMARİ — NEDEN alt paneller kendi pyqtSignal'ini TANIMLAMIYOR:
+Alt panel kendi `send_command` sinyalini tanımlayıp buradakine zincirleseydi,
+"sinyal gerçekten bir alıcıya bağlı mı" denetimi (bu dosyadaki ölü-kontrol
+hatalarının çözümü) HER ZAMAN doğru dönerdi — zincirin kendisi bir alıcıdır.
+Bunun yerine alt paneller `ui/widgets/panel_ortak.MavKanal` alır; denetim
+gerçekten uçtaki mavlink_worker bağlantısına bakar.
 """
 import logging
 import math
@@ -15,13 +40,14 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QTabWidget, QPushButton, QSpinBox, QProgressBar,
+    QTabWidget, QPushButton, QProgressBar,
     QGroupBox, QTextEdit, QMessageBox, QSplitter, QSizePolicy,
     QAbstractSpinBox, QComboBox,
 )
 from pymavlink import mavutil
 
 from core import theme
+from ui.widgets.panel_ortak import MavKanal, ParamDeposu, ParamYazici
 
 logger = logging.getLogger(__name__)
 
@@ -475,6 +501,11 @@ class CalibrationView(QWidget):
     # kanalı gerekliydi; tuning_view/advanced_view ile AYNI imza kullanıldı
     # (str, float) → mavlink_worker.set_param.
     set_param = pyqtSignal(str, float)
+    # NEDEN: Uçuş modları ve uçuş öncesi parametre denetimi panelleri FC'deki
+    # GERÇEK değerleri görmek zorunda. mavlink_worker'da tek parametre okuyan
+    # bir slot YOK (yalnız request_parameters = TÜM liste), bu yüzden istek de
+    # tam liste isteğidir. main_window bunu w.request_parameters'a bağlar.
+    request_params = pyqtSignal()
 
     # FC STATUSTEXT anahtar kelimeleri (ArduPilot ivmeölçer kalibrasyon akışı)
     _ST_PROMPT = ("place vehicle", "press any key", "place aircraft")
@@ -492,7 +523,6 @@ class CalibrationView(QWidget):
         self._rc_min_labels = {}
         self._rc_max_labels = {}
         self._capturing_rc = False
-        self._motor_timers = {}
         self._compass_active = False
         # NEDEN: İvmeölçer akışı artık FC onayına (STATUSTEXT) dayanıyor;
         # bu durum bayrakları olmadan "tamamlandı" iddiası doğrulanamıyordu.
@@ -511,8 +541,45 @@ class CalibrationView(QWidget):
         self._compass_bold = False
         self._rc_token = "text_muted"
         self._rc_bold = False
-        self._motor_token = "text_muted"
         self._wheel_guard = _WheelGuard(self)   # referans tutulmazsa GC'ye gider
+        # Pusula: FC'den ilk MAG_CAL_PROGRESS gelmezse kullanıcıyı uyaran sayaç.
+        # NEDEN: eski kod "FC ilerleme raporu bekleniyor" yazıp SONSUZA DEK
+        # öyle kalıyordu; komut hiç uygulanmasa bile (ki uygulanmıyordu) panel
+        # bunu asla söylemiyordu.
+        self._compass_ilk_rapor_timer = QTimer(self)
+        self._compass_ilk_rapor_timer.setSingleShot(True)
+        self._compass_ilk_rapor_timer.timeout.connect(self._on_compass_rapor_yok)
+
+        # ── Alt panellerin FC'ye giden ORTAK yolu ──
+        # Emit'i ve "gerçekten bağlı mı" denetimini bu sınıf sağlar; alt paneller
+        # kendi sinyalini tanımlamaz (bkz. modül başlığındaki MİMARİ notu).
+        self._kanal = MavKanal(
+            komut_gonder=self.send_command.emit,
+            param_yaz=self.set_param.emit,
+            komut_yolu_denetle=lambda: self._signal_connected(self.send_command),
+            param_yolu_denetle=lambda: self._signal_connected(self.set_param),
+        )
+        # Parametre önbelleği — üç panel de aynı indirmeyi kullanır
+        self._depo = ParamDeposu(
+            istek_gonder=self.request_params.emit,
+            istek_yolu_denetle=lambda: self._signal_connected(self.request_params),
+            parent=self,
+        )
+        # Radyo kalibrasyonu yazmalarını GERİ OKUYARAK doğrulayan yazıcı.
+        # NEDEN: PARAM_SET'in MAVLink'te ACK'i yoktur; eski kod RCn_MIN/MAX'i
+        # emit edip koşulsuz "Kaydedildi" diyordu. Artık FC'nin PARAM_VALUE
+        # yanıtı beklenir ve gelmezse AÇIKÇA "doğrulanamadı" denir.
+        self._rc_yazici = ParamYazici(self._kanal, self)
+        self._rc_yazici.bitti.connect(self._on_rc_yazma_bitti)
+        # "Kaydet / Bitir" ile FC'ye YAZILAN aralık — TRIM denetimi bunu kullanır
+        self._rc_yazilan: dict = {}
+
+        # Alt paneller _build_ui içinde kurulur; kurulmazsa None kalır
+        self._sensor_view = None
+        self._motor_view = None
+        self._modes_view = None
+        self._preflight_view = None
+
         self._build_ui()
         self._install_wheel_guards()
         # Tema değişince satır-içi renkler son duruma göre yeniden yazılır
@@ -573,13 +640,12 @@ class CalibrationView(QWidget):
         self._accel_step_style(self._accel_lbl_token)
         self._apply_compass_status_style()
         self._apply_rc_status_style()
-        self._motor_status.setStyleSheet(
-            f"color:{theme.c(self._motor_token)};font-size:11px;"
-        )
         self._accel_log.setStyleSheet(self._log_style())
         self._compass_log.setStyleSheet(self._log_style())
-        # QPainter alet widget'ları renkleri paint sırasında okur → yeniden çiz
-        for wdg in (self._accel_drone, self._compass_drone, self._motor_drone):
+        # QPainter alet widget'ları renkleri paint sırasında okur → yeniden çiz.
+        # NEDEN motor widget'ı burada YOK: motor görselleştirmesi artık
+        # MotorTestView'a ait ve kendi tema aboneliğiyle yeniliyor.
+        for wdg in (self._accel_drone, self._compass_drone):
             wdg.update()
 
     # ──────────────────────────────────────────────────────────────
@@ -623,8 +689,140 @@ class CalibrationView(QWidget):
         self._tabs.addTab(self._accel_tab(), "İvmeölçer")
         self._tabs.addTab(self._compass_tab(), "Pusula")
         self._tabs.addTab(self._radio_tab(), "Radyo Kalibrasyon")
-        self._tabs.addTab(self._motor_tab(), "Motor Test")
+        self._alt_panelleri_kur()
+        # NEDEN sekme değişimini dinliyoruz: Motor Test sekmesinden çıkılırken
+        # motorlar DURDURULMAK ZORUNDA. MotorTestView.hideEvent bunu zaten
+        # yapıyor; buradaki bağlantı ikinci emniyet — Qt'nin bir sürümünde/
+        # platformunda gizleme olayı gelmezse bile durdurma çalışır.
+        self._tabs.currentChanged.connect(self._on_alt_sekme_degisti)
         layout.addWidget(self._tabs)
+
+    def _alt_panelleri_kur(self) -> None:
+        """Ayrı dosyalardaki panelleri kurar ve sekme olarak ekler.
+
+        NEDEN geç (fonksiyon içi) import: motor_test_view, bu dosyadaki
+        DroneVizWidget'i kullanıyor. Modül seviyesinde karşılıklı import
+        dairesel olurdu; kurulum anında (modüller tam yüklendikten sonra)
+        yapılan import bu döngüyü kırar.
+
+        NEDEN her panel AYRI try: birinin (ör. eksik bir bağımlılık yüzünden)
+        kurulamaması diğerlerini ve KLASİK kalibrasyon sekmelerini götürmemeli
+        — kalibrasyon paneli sahada tek başına kritik bir araçtır.
+        """
+        def _hata_sekmesi(ad: str, exc: Exception) -> QLabel:
+            """Kurulamayan panelin yerine, nedeni YAZAN bir sekme koyar.
+
+            NEDEN boş sekme değil: sessizce eksik bir sekme, operatörün
+            "panel neden yok?" diye aramasına yol açar. Hata metni ekranda.
+            """
+            lbl = QLabel(
+                f"{ad} paneli KURULAMADI.\n\nHata: {exc}\n\n"
+                "Diğer kalibrasyon sekmeleri etkilenmedi. "
+                "Ayrıntı için uygulama günlüğüne bakın."
+            )
+            lbl.setWordWrap(True)
+            lbl.setObjectName("dangerText")
+            return lbl
+
+        try:
+            from ui.views.sensor_cal_view import SensorCalView
+            self._sensor_view = SensorCalView(self._kanal, self._depo)
+            self._tabs.addTab(self._sensor_view, "Sensör & Seviye")
+        except Exception as exc:
+            logger.exception("Sensör/Seviye paneli kurulamadı")
+            self._tabs.addTab(_hata_sekmesi("Sensör & Seviye", exc), "Sensör & Seviye")
+
+        try:
+            from ui.views.motor_test_view import MotorTestView
+            self._motor_view = MotorTestView(self._kanal)
+            self._tabs.addTab(self._motor_view, "⚠ Motor Test")
+        except Exception as exc:
+            logger.exception("Motor test paneli kurulamadı")
+            self._tabs.addTab(_hata_sekmesi("Motor Test", exc), "⚠ Motor Test")
+
+        try:
+            from ui.views.flight_modes_view import FlightModesView
+            self._modes_view = FlightModesView(self._kanal, self._depo)
+            self._tabs.addTab(self._modes_view, "Uçuş Modları")
+        except Exception as exc:
+            logger.exception("Uçuş modları paneli kurulamadı")
+            self._tabs.addTab(_hata_sekmesi("Uçuş Modları", exc), "Uçuş Modları")
+
+        try:
+            from ui.views.preflight_check_view import PreflightCheckView
+            self._preflight_view = PreflightCheckView(self._kanal, self._depo)
+            self._tabs.addTab(self._preflight_view, "Uçuş Öncesi Kontrol")
+        except Exception as exc:
+            logger.exception("Uçuş öncesi kontrol paneli kurulamadı")
+            self._tabs.addTab(_hata_sekmesi("Uçuş Öncesi Kontrol", exc),
+                              "Uçuş Öncesi Kontrol")
+
+    def _on_alt_sekme_degisti(self, _index: int) -> None:
+        """Motor Test sekmesi AKTİF DEĞİLSE motorları durdurur."""
+        if self._motor_view is None:
+            return
+        if self._tabs.currentWidget() is not self._motor_view:
+            try:
+                self._motor_view.panel_terk_edildi()
+            except Exception:
+                logger.exception("Motor paneli durdurulurken hata")
+
+    # ──────────────────────────────────────────────────────────────
+    # ALT PANELLERE DAĞITIM — main_window yalnızca bu sınıfa bağlanır
+    # ──────────────────────────────────────────────────────────────
+    @pyqtSlot(str, float)
+    def on_param_received(self, ad: str, deger: float) -> None:
+        """mavlink_worker.param_received → paylaşılan parametre deposu.
+
+        Depo, `degisti` sinyaliyle tüm alt panelleri besler; ayrıca yazma
+        doğrulaması (ParamYazici) da bu akıştan gelen PARAM_VALUE'yu kullanır.
+        """
+        self._depo.param_geldi(ad, deger)
+        self._rc_yazici.param_geldi(ad, deger)
+        if ad.startswith("RC") and ad.endswith("_TRIM"):
+            self._rc_trim_denetle()
+        if self._motor_view is not None:
+            self._motor_view.on_param(ad, deger)
+
+    @pyqtSlot(bool)
+    def on_connection_changed(self, bagli: bool) -> None:
+        """FC linki kurulunca/kopunca tüm alt panelleri günceller.
+
+        NEDEN gerekli: "bağlantı yoksa buton KAPALI ve nedeni YAZILI" kuralı,
+        panellerin link durumunu bilmesini gerektiriyor. Sinyal bağlantısının
+        varlığı (receivers>0) linkin varlığını KANITLAMAZ — worker bağlı ama
+        telemetri kopuk olabilir.
+        """
+        self._kanal.link_ayarla(bagli)
+        if not bagli:
+            # Link koptuysa motor testine devam edilemez; panel kendi
+            # durumunu da temizler.
+            self._compass_active = False
+        for panel in (self._sensor_view, self._motor_view,
+                      self._modes_view, self._preflight_view):
+            fn = getattr(panel, "on_connection_changed", None)
+            if callable(fn):
+                try:
+                    fn(bagli)
+                except Exception:
+                    logger.exception("Alt panel bağlantı bildirimi hatası")
+
+    def acil_motor_durdur(self) -> None:
+        """Dışarıdan (main_window sekme değişimi / kapanış) çağrılır."""
+        if self._motor_view is not None:
+            try:
+                self._motor_view.panel_terk_edildi()
+            except Exception:
+                logger.exception("Acil motor durdurma hatası")
+
+    def hideEvent(self, event):  # noqa: N802 (Qt API)
+        # Kalibrasyon sekmesinden çıkıldığında (QTabWidget sayfayı gizler)
+        # motorlar durdurulur — panelden çıkınca motor dönmeye devam edemez.
+        try:
+            self.acil_motor_durdur()
+        except Exception:
+            logger.exception("Kalibrasyon görünümü gizlenirken hata")
+        super().hideEvent(event)
 
     # ──────────────────────────────────────────────────────────────
     # İVMEÖLÇER
@@ -847,6 +1045,19 @@ class CalibrationView(QWidget):
             return
         low = text.strip().lower()
 
+        # ── Alt panellere DAĞIT ──
+        # NEDEN buradan: main_window w.status_text_received'i YALNIZCA bu
+        # görünüme bağlıyor. Motor testi ve seviye/baro/jiroskop kalibrasyonu
+        # sonuçlarını da SADECE STATUSTEXT'ten öğrenebiliyoruz (mavlink_worker
+        # COMMAND_ACK yaymıyor) — dağıtım yapılmazsa o paneller kör kalır.
+        for panel in (self._motor_view, self._sensor_view):
+            fn = getattr(panel, "on_status_text", None)
+            if callable(fn):
+                try:
+                    fn(text, severity)
+                except Exception:
+                    logger.exception("Alt panel STATUSTEXT işleme hatası")
+
         # ── Pusula mesajları (bilgi amaçlı log) ──
         if "compass" in low or "mag cal" in low:
             self._compass_log.append(f"[FC] {text.strip()}")
@@ -957,9 +1168,45 @@ class CalibrationView(QWidget):
         lay.addWidget(split)
         return w
 
+    # ── Pusula kalibrasyonu komut sabitleri ──
+    # MAV_CMD_DO_START_MAG_CAL (42424) param şeması — ArduPilot kaynağından
+    # DOĞRULANDI (libraries/AP_Compass/AP_Compass_Calibration.cpp):
+    #   param1 = pusula bit maskesi (0 = kullanılan TÜM pusulalar)
+    #   param2 = başarısızlıkta otomatik tekrar (0 = hayır)
+    #   param3 = otomatik kaydet (1 = evet)
+    #   param4 = başlama gecikmesi (s)
+    #   param5 = otomatik yeniden başlat (0 = hayır)
+    _MAG_CAL_MASK = 0        # tüm pusulalar
+    _MAG_CAL_RETRY = 0
+    # NEDEN autosave = 1: autosave 0 olsaydı başarılı kalibrasyondan sonra
+    # ofsetlerin KAYDEDİLMESİ için GCS'in ayrıca MAV_CMD_DO_ACCEPT_MAG_CAL
+    # (42425) göndermesi gerekirdi. Bu panelde "Kabul Et" adımı YOK; autosave=0
+    # bırakmak, kullanıcının başarılı gördüğü kalibrasyonun FC'ye hiç
+    # yazılmaması demekti (sessiz veri kaybı).
+    _MAG_CAL_AUTOSAVE = 1
+    _MAG_CAL_DELAY_S = 0
+    _MAG_CAL_AUTOREBOOT = 0
+    # FC ilerleme raporu bu süre içinde gelmezse kullanıcı uyarılır.
+    _MAG_CAL_ILK_RAPOR_S = 8
+
     def _start_compass(self):
-        # MAV_CMD_PREFLIGHT_CALIBRATION: param2=1 → pusula kalibrasyonu
+        """Onboard (uçuş içi) pusula kalibrasyonunu BAŞLATIR.
+
+        NEDEN DEĞİŞTİ (ÖLÜ BUTON DÜZELTMESİ): Bu buton eskiden
+        MAV_CMD_PREFLIGHT_CALIBRATION'ı param2=1 ile gönderiyordu. MAVLink
+        şemasında param2 gerçekten "magnetometer calibration"dır, AMA ArduPilot
+        bu dalı UYGULAMIYOR: GCS_Common.cpp::_handle_command_preflight_calibration
+        yalnızca param1 (jiro), param3 (baro), param5 (ivmeölçer 1/2/4/…) ve
+        param2 == 76 (mevcut kalibrasyonu ZORLA KAYDET) durumlarını ele alıyor;
+        geri kalan her şey için MAV_RESULT_UNSUPPORTED dönüyor. Yani bu düğme
+        gerçek FC'de HİÇBİR ŞEY YAPMIYORDU — animasyon dönüyor, ilerleme çubuğu
+        hiç ilerlemiyordu. (Aynı dosyadaki İPTAL düğmesi ZATEN doğru API'yi —
+        DO_CANCEL_MAG_CAL — kullanıyordu; başlat/iptal çifti tutarsızdı.)
+        Doğrulama: /home/ash/ardupilot @27b35986e9 kaynak kodundan okundu.
+        Doğru komut MAV_CMD_DO_START_MAG_CAL'dir (42424).
+        """
         ml = self._get_mavlink()
+        cmd = getattr(ml, "MAV_CMD_DO_START_MAG_CAL", 42424)
         # NEDEN: Komut kimseye gitmiyorsa "başladı" demek yanıltıcı olur.
         if not self._signal_connected(self.send_command):
             self._compass_status_set(
@@ -968,10 +1215,14 @@ class CalibrationView(QWidget):
             self._compass_log.append("[HATA] send_command sinyali bağlı değil")
             return
 
-        self.send_command.emit(
-            ml.MAV_CMD_PREFLIGHT_CALIBRATION, [0, 1, 0, 0, 0, 0, 0]
-        )
+        self.send_command.emit(cmd, [
+            self._MAG_CAL_MASK, self._MAG_CAL_RETRY, self._MAG_CAL_AUTOSAVE,
+            self._MAG_CAL_DELAY_S, self._MAG_CAL_AUTOREBOOT, 0, 0,
+        ])
         self._compass_active = True
+        # FC hiç ilerleme raporu göndermezse kullanıcı sonsuza dek "bekleniyor"
+        # görmesin — bu, düğmenin ölü olduğu dönemde tam olarak yaşanan durumdu.
+        self._compass_ilk_rapor_timer.start(self._MAG_CAL_ILK_RAPOR_S * 1000)
         self._compass_drone.start_spin()
         if self._compass_model3d is not None:
             self._compass_model3d.rotation_demo(True)
@@ -987,7 +1238,24 @@ class CalibrationView(QWidget):
             "(drone'u tüm eksenlerde döndürün)",
             "warning", bold=True,
         )
-        self._compass_log.append("[GÖNDER] PREFLIGHT_CALIBRATION param2=1 (pusula)")
+        self._compass_log.append(
+            f"[GÖNDER] DO_START_MAG_CAL ({cmd}) mask=0(tümü) retry=0 autosave=1"
+        )
+
+    def _on_compass_rapor_yok(self):
+        """FC belirlenen sürede hiç MAG_CAL_PROGRESS göndermedi."""
+        if not self._compass_active:
+            return
+        self._compass_status_set(
+            f"⚠ {self._MAG_CAL_ILK_RAPOR_S} s içinde FC'den ilerleme raporu GELMEDİ. "
+            "Kalibrasyon BAŞLAMAMIŞ olabilir. Kontrol edin: araç DISARM mı, "
+            "FC pusula kalibrasyonunu destekliyor mu, telemetri linki sağlam mı?",
+            "danger", bold=True,
+        )
+        self._compass_log.append(
+            "[UYARI] MAG_CAL_PROGRESS alınamadı — kalibrasyonun başladığı "
+            "DOĞRULANAMADI"
+        )
 
     def _cancel_compass(self):
         """Devam eden mag-cal'i GERÇEKTEN iptal eder.
@@ -1010,6 +1278,7 @@ class CalibrationView(QWidget):
 
         self.send_command.emit(cmd, [0, 0, 0, 0, 0, 0, 0])
         self._compass_active = False
+        self._compass_ilk_rapor_timer.stop()
         self._compass_drone.stop_spin()
         if self._compass_model3d is not None:
             self._compass_model3d.rotation_demo(False)
@@ -1021,6 +1290,13 @@ class CalibrationView(QWidget):
     @pyqtSlot(int, int, float)
     def on_mag_cal_progress(self, compass_id: int, pct: int, fitness: float) -> None:
         """MAVLink MAG_CAL_PROGRESS mesajı geldiğinde çağrılır."""
+        # İlk rapor geldi → "FC yanıt vermiyor" uyarısına gerek yok
+        self._compass_ilk_rapor_timer.stop()
+        if self._compass_active:
+            self._compass_status_set(
+                "Kalibrasyon SÜRÜYOR — aracı tüm eksenlerde yavaşça çevirin",
+                "warning", bold=True,
+            )
         if compass_id == 0:
             self._compass_progress.setValue(pct)
             self._compass_progress.setFormat(f"Pusula 1: {pct}%")
@@ -1048,6 +1324,7 @@ class CalibrationView(QWidget):
         self._compass_log.append(
             f"[RAPOR] Pusula {compass_id + 1}: {label}  fitness={fitness:.3f}"
         )
+        self._compass_ilk_rapor_timer.stop()
         # Tüm pusulalar tamamlandıysa animasyonu durdur
         if self._compass_progress.value() == 100 and self._compass_progress2.value() == 100:
             self._compass_drone.stop_spin()
@@ -1126,19 +1403,165 @@ class CalibrationView(QWidget):
         btn_save.setObjectName("successButton")
         btn_save.setMinimumHeight(30)
         btn_save.clicked.connect(self._stop_rc_capture)
+        btn_trim = QPushButton("Nötr Konumları (RCn_TRIM) Yaz")
+        btn_trim.setObjectName("warningButton")
+        btn_trim.setMinimumHeight(30)
+        btn_trim.setToolTip(
+            "Çubuklar ORTADA ve gaz EN ALTTA iken basın — o anki PWM'ler "
+            "RC1/2/3/4_TRIM olarak yazılır."
+        )
+        btn_trim.clicked.connect(self._write_rc_trims)
         btn_reset = QPushButton("Sıfırla")
         btn_reset.setMinimumHeight(30)
         btn_reset.clicked.connect(self._reset_rc)
         btn_row.addWidget(btn_cap)
         btn_row.addWidget(btn_save)
+        btn_row.addWidget(btn_trim)
         btn_row.addWidget(btn_reset)
         layout.addLayout(btn_row)
 
         self._rc_status = QLabel("Durum: Pasif")
         self._apply_rc_status_style()
         layout.addWidget(self._rc_status)
+
+        # ── TRIM denetimi ──
+        # NEDEN bu uyarı var: ArduPilot ön-arm denetimi
+        # (AP_Arming::rc_calibration_checks) RCn_TRIM'in RCn_MIN..RCn_MAX
+        # ARALIĞINDA olmasını ŞART koşuyor; değilse "RC1_MIN is greater than
+        # RC1_TRIM" gibi bir hata verip ARM ETMİYOR. Eski panel MIN/MAX yazıp
+        # TRIM'e hiç bakmıyordu — dar aralıklı yeni bir kalibrasyondan sonra
+        # araç sahada ARM OLMAYABİLİRDİ ve nedeni bu panelde görünmezdi.
+        self._rc_trim_lbl = QLabel(
+            "RCn_TRIM durumu: FC'den parametre okunmadı "
+            "(Uçuş Öncesi Kontrol sekmesindeki 'FC'den OKU' bunu da getirir)."
+        )
+        self._rc_trim_lbl.setWordWrap(True)
+        self._rc_trim_lbl.setObjectName("mutedLabel")
+        layout.addWidget(self._rc_trim_lbl)
         layout.addStretch()
         return w
+
+    # ── TRIM denetimi / yazımı ───────────────────────────────────────────
+    # Ana kumanda kanalları: roll, pitch, gaz, yaw
+    _RC_ANA_KANALLAR = (1, 2, 3, 4)
+
+    def _rc_trim_denetle(self) -> None:
+        """FC'deki RCn_TRIM değerlerinin MIN..MAX aralığında olup olmadığını yazar."""
+        sorunlar = []
+        okunan = 0
+        for ch in self._RC_ANA_KANALLAR:
+            trim = self._depo.get(f"RC{ch}_TRIM")
+            lo = self._depo.get(f"RC{ch}_MIN")
+            hi = self._depo.get(f"RC{ch}_MAX")
+            # Yeni yazdığımız aralık varsa ONU esas al (FC henüz geri okunmamış olabilir)
+            if ch in self._rc_yazilan:
+                lo, hi = self._rc_yazilan[ch]
+            if trim is None or lo is None or hi is None:
+                continue
+            okunan += 1
+            if trim < lo:
+                sorunlar.append(f"CH{ch}: TRIM {trim:.0f} < MIN {lo:.0f}")
+            elif trim > hi:
+                sorunlar.append(f"CH{ch}: TRIM {trim:.0f} > MAX {hi:.0f}")
+        if okunan == 0:
+            self._rc_trim_lbl.setText(
+                "RCn_TRIM durumu: FC'den parametre okunmadı "
+                "(Uçuş Öncesi Kontrol sekmesindeki 'FC'den OKU' bunu da getirir)."
+            )
+            self._rc_trim_lbl.setStyleSheet("")
+        elif sorunlar:
+            self._rc_trim_lbl.setText(
+                "⛔ RCn_TRIM aralık DIŞINDA — ArduPilot bu hâlde ARM ETMEZ "
+                "('RCn_MIN is greater than RCn_TRIM'):\n   " + "\n   ".join(sorunlar)
+                + "\nÇubukları ortalayıp gazı en alta alın ve "
+                "'Nötr Konumları (RCn_TRIM) Yaz'a basın."
+            )
+            self._rc_trim_lbl.setStyleSheet(f"color:{theme.c('danger')};font-weight:bold;")
+        else:
+            self._rc_trim_lbl.setText(
+                f"✓ RCn_TRIM ({okunan} kanal) MIN..MAX aralığında — ön-arm RC "
+                "denetimi bu yönden geçer."
+            )
+            self._rc_trim_lbl.setStyleSheet(f"color:{theme.c('success')};")
+
+    def _write_rc_trims(self) -> None:
+        """O anki çubuk konumlarını RC1..RC4_TRIM olarak FC'ye yazar.
+
+        NEDEN ayrı düğme (otomatik değil): TRIM, çubuğun NÖTR konumudur.
+        'Kaydet / Bitir'in içinde otomatik yazılsaydı, kullanıcı uçları
+        gezdirdikten sonra çubuğu nereye bıraktıysa orası nötr sayılırdı ve
+        araç uçuşta o yöne sürekli kayardı. Bu yüzden kullanıcıdan çubukları
+        ORTALAMASI açıkça isteniyor ve yazma ayrı bir eylem.
+        """
+        if not self._signal_connected(self.set_param):
+            self._rc_fail("Durum: TRIM YAZILMADI — parametre kanalı bağlı değil")
+            return
+        cevap = QMessageBox.question(
+            self, "Nötr konumları yazılacak",
+            "Şu anda:\n"
+            "  • Roll / Pitch / Yaw çubukları TAM ORTADA,\n"
+            "  • Gaz çubuğu EN ALTTA\n"
+            "olmalı. O anki PWM değerleri RC1/2/3/4_TRIM olarak FC'ye yazılacak "
+            "ve geri okunarak doğrulanacak.\n\nDevam edilsin mi?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if cevap != QMessageBox.StandardButton.Yes:
+            self._rc_status_set("Durum: TRIM yazımı iptal edildi")
+            return
+
+        istekler = {}
+        sorunlar = []
+        for ch in self._RC_ANA_KANALLAR:
+            bar = self._rc_bars.get(ch)
+            if bar is None:
+                continue
+            val = bar.value()
+            lo, hi = self._rc_yazilan.get(
+                ch, (self._depo.get(f"RC{ch}_MIN"), self._depo.get(f"RC{ch}_MAX"))
+            )
+            # NEDEN kelepçelemiyoruz, REDDEDİYORUZ: aralık dışındaki bir değeri
+            # sessizce kırpmak, yanlış bir nötr noktasını "düzeltilmiş" gibi
+            # göstermek olurdu. Aralık dışıysa gerçekten bir sorun vardır.
+            if lo is not None and hi is not None and not (lo <= val <= hi):
+                sorunlar.append(f"CH{ch}: {val} µs, aralık {lo:.0f}-{hi:.0f} DIŞINDA")
+                continue
+            istekler[f"RC{ch}_TRIM"] = float(val)
+
+        if sorunlar:
+            QMessageBox.warning(
+                self, "TRIM yazılamadı",
+                "Aşağıdaki kanalların o anki PWM'i kendi MIN..MAX aralığının "
+                "dışında — hiçbir TRIM yazılmadı:\n\n" + "\n".join(sorunlar)
+                + "\n\nÖnce uç yakalamayı ('Yakalamayı Başlat' → uçlar → "
+                "'Kaydet / Bitir') tamamlayın.",
+            )
+            self._rc_fail("Durum: TRIM YAZILMADI — değerler aralık dışında")
+            return
+        if not istekler:
+            self._rc_fail("Durum: TRIM YAZILMADI — RC verisi yok (alıcı bağlı mı?)")
+            return
+        if not self._rc_yazici.yaz(istekler):
+            self._rc_fail("Durum: TRIM YAZILMADI — yazma kanalı meşgul/bağlı değil")
+            return
+        self._rc_status_set(
+            f"{len(istekler)} TRIM yazıldı — FC'den geri okuma bekleniyor…",
+            "warning", bold=True,
+        )
+
+    def _on_rc_yazma_bitti(self, basarili: int, toplam: int) -> None:
+        """ParamYazici bitti — kullanıcıya DOĞRULANMIŞ sonucu söyler."""
+        if basarili == toplam:
+            self._rc_status_set(
+                f"✓ {basarili}/{toplam} parametre FC'den GERİ OKUNARAK doğrulandı",
+                "success", bold=True,
+            )
+        else:
+            self._rc_status_set(
+                f"✗ {basarili}/{toplam} doğrulandı — kalanların FC'ye yazıldığı "
+                "KANITLANAMADI (paket kaybı ya da FC reddi)",
+                "danger", bold=True,
+            )
+        self._rc_trim_denetle()
 
     # Yakalama başlangıç sentinel'leri: ilk gelen PWM örneği hem min hem max olur
     _RC_SENT_MIN = 3000
@@ -1229,22 +1652,34 @@ class CalibrationView(QWidget):
             )
             return
 
-        written = 0
+        # NEDEN ParamYazici: eski kod set_param.emit edip HEMEN "Kaydedildi"
+        # diyordu. PARAM_SET'in MAVLink'te ACK'i olmadığı için bu iddia
+        # kanıtsızdı — paket kaybında kullanıcı kalibrasyonun yazıldığını
+        # sanıyordu. Artık her parametre FC'den GERİ OKUNARAK doğrulanıyor,
+        # yanıt gelmezse tekrarlanıyor ve sonuç _on_rc_yazma_bitti'de
+        # DÜRÜSTÇE raporlanıyor.
+        istekler = {}
+        self._rc_yazilan = {}
         for ch, (lo, hi) in sorted(valid.items()):
-            self.set_param.emit(f"RC{ch}_MIN", float(lo))
-            self.set_param.emit(f"RC{ch}_MAX", float(hi))
-            written += 2
+            istekler[f"RC{ch}_MIN"] = float(lo)
+            istekler[f"RC{ch}_MAX"] = float(hi)
+            self._rc_yazilan[ch] = (float(lo), float(hi))
             logger.info("RC kalibrasyon: RC%d_MIN=%d RC%d_MAX=%d", ch, lo, ch, hi)
+
+        if not self._rc_yazici.yaz(istekler):
+            self._rc_fail("Durum: KAYDEDİLMEDİ — yazma kanalı meşgul/bağlı değil")
+            return
 
         self._rc_capture_started = False
         self._rc_status_set(
-            f"Durum: Kaydedildi — {len(valid)} kanal, {written} parametre yazıldı",
-            "success", bold=True,
+            f"{len(valid)} kanal / {len(istekler)} parametre yazıldı — "
+            "FC'den geri okuma bekleniyor…",
+            "warning", bold=True,
         )
         if problems:
             QMessageBox.information(
                 self, "Kısmi kayıt",
-                f"CH1-CH4 yazıldı. Aşağıdaki yardımcı kanallar ATLANDI:\n\n"
+                "CH1-CH4 yazıldı. Aşağıdaki yardımcı kanallar ATLANDI:\n\n"
                 + "\n".join(problems),
             )
 
@@ -1255,6 +1690,7 @@ class CalibrationView(QWidget):
     def _reset_rc(self):
         self._capturing_rc = False
         self._rc_capture_started = False
+        self._rc_yazilan = {}
         for ch in range(1, 9):
             self._rc_min[ch] = 1000
             self._rc_max[ch] = 2000
@@ -1270,6 +1706,18 @@ class CalibrationView(QWidget):
 
     @pyqtSlot(dict)
     def update_telemetry(self, data: dict):
+        # Alt panellere dağıt. NEDEN: main_window telemetriyi YALNIZCA GÖRÜNÜR
+        # sekmeye veriyor (_dispatch_telemetry) ve gördüğü widget bu sınıftır;
+        # alt paneller aksi hâlde canlı veri (armed durumu, RC PWM'i, titreşim)
+        # HİÇ almazdı — motor kapısı "araç ARM'lı" durumunu göremezdi.
+        for panel in (self._sensor_view, self._motor_view, self._modes_view):
+            fn = getattr(panel, "update_telemetry", None)
+            if callable(fn):
+                try:
+                    fn(data)
+                except Exception:
+                    logger.exception("Alt panel telemetri işleme hatası")
+
         for ch, _ in _RC_CHANNELS:
             key = f"rc_{ch}"
             val = data.get(key)
@@ -1290,118 +1738,6 @@ class CalibrationView(QWidget):
                     if ch in self._rc_max_labels:
                         self._rc_max_labels[ch].setText(f"max: {val}")
 
-    # ──────────────────────────────────────────────────────────────
-    # MOTOR TEST
-    # ──────────────────────────────────────────────────────────────
-    def _motor_tab(self):
-        w = QWidget()
-        split = QSplitter(Qt.Orientation.Horizontal)
-
-        # Sol: X-config görsel
-        left = QWidget()
-        ll = QVBoxLayout(left)
-        ll.setContentsMargins(6, 6, 6, 6)
-        self._motor_drone = DroneVizWidget()
-        ll.addWidget(self._motor_drone)
-
-        # Açıklama
-        info_lbl = QLabel("M1/M2=CCW (kırmızı)  M3/M4=CW (yeşil)\n"
-                           "RPM = tahmini (gaz × 80)")
-        info_lbl.setObjectName("mutedLabel")
-        info_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        ll.addWidget(info_lbl)
-        split.addWidget(left)
-
-        # Sağ: Motor kontrol
-        right = QWidget()
-        rl = QVBoxLayout(right)
-        rl.setContentsMargins(8, 8, 8, 8)
-
-        warning = QLabel("⚠  UYARI: Pervaneler takılıysa motor testi YAPMAYIN!")
-        warning.setObjectName("dangerText")
-        warning.setWordWrap(True)
-        rl.addWidget(warning)
-
-        # Yerel QGroupBox override'ı SİLİNDİ — global QSS yönetir
-        grp = QGroupBox("Motor Gaz Kontrol")
-        gl = QVBoxLayout(grp)
-
-        self._motor_spins = []
-        self._motor_rpm_labels = []
-        motor_positions = ["M1 (Ön-Sağ, CCW)", "M2 (Arka-Sol, CCW)",
-                           "M3 (Ön-Sol, CW)", "M4 (Arka-Sağ, CW)"]
-        for i in range(4):
-            row = QHBoxLayout()
-            lbl = QLabel(motor_positions[i])
-            lbl.setFixedWidth(160)
-
-            spin = QSpinBox()
-            spin.setRange(0, 100)
-            spin.setValue(0)
-            spin.setSuffix(" %")
-            spin.setFixedWidth(80)
-            # Yerel spin stili SİLİNDİ — global QSS kenar/renk/dolguyu veriyor
-            idx = i
-            spin.valueChanged.connect(lambda v, n=idx: self._on_throttle_change(n, v))
-            self._motor_spins.append(spin)
-
-            rpm_lbl = QLabel("0 rpm")
-            rpm_lbl.setObjectName("warningText")   # tahmini RPM okuması
-            rpm_lbl.setMinimumWidth(60)
-            self._motor_rpm_labels.append(rpm_lbl)
-
-            row.addWidget(lbl)
-            row.addWidget(spin)
-            row.addWidget(rpm_lbl)
-            gl.addLayout(row)
-
-        rl.addWidget(grp)
-
-        btn_row = QHBoxLayout()
-        btn_test = QPushButton("Seçili Motorları Test Et")
-        btn_test.setObjectName("warningButton")
-        btn_test.setMinimumHeight(32)
-        btn_test.clicked.connect(self._on_motor_test)
-        btn_all = QPushButton("Hepsini Test Et")
-        btn_all.setObjectName("warningButton")
-        btn_all.setMinimumHeight(32)
-        btn_all.clicked.connect(self._on_test_all)
-        btn_stop = QPushButton("DURDUR")
-        btn_stop.setObjectName("dangerButton")
-        btn_stop.setMinimumHeight(32)
-        btn_stop.clicked.connect(self._on_motor_stop)
-        btn_row.addWidget(btn_test)
-        btn_row.addWidget(btn_all)
-        btn_row.addWidget(btn_stop)
-        rl.addLayout(btn_row)
-
-        # NEDEN: Motor testinin hiçbir geri bildirimi yoktu — kullanıcı komutun
-        # gönderilip gönderilmediğini göremiyordu. Metinler kasıtlı olarak
-        # "gönderildi" der; FC'nin motoru gerçekten döndürdüğü doğrulanamaz.
-        self._motor_status = QLabel("Durum: Beklemede")
-        self._motor_status.setWordWrap(True)
-        self._motor_status.setStyleSheet(
-            f"color:{theme.c(self._motor_token)};font-size:11px;"
-        )
-        rl.addWidget(self._motor_status)
-        rl.addStretch()
-
-        split.addWidget(right)
-        split.setSizes([300, 400])
-
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(split)
-        return w
-
-    def _on_throttle_change(self, idx: int, val: int):
-        self._motor_drone.set_throttle(idx, val)
-        est_rpm = val * 80
-        self._motor_rpm_labels[idx].setText(f"{est_rpm} rpm")
-        if val > 0:
-            self._motor_drone.set_highlight(idx + 1)
-        else:
-            self._motor_drone.set_highlight(-1)
 
     @staticmethod
     def _get_mavlink():
@@ -1410,89 +1746,3 @@ class CalibrationView(QWidget):
         if getattr(mavutil, "mavlink", None) is None:
             mavutil.set_dialect("ardupilotmega")
         return mavutil.mavlink
-
-    def _motor_status_set(self, text: str, token: str = "text_muted"):
-        """Motor durum metnini yazar. İkinci argüman artık ham hex değil TEMA
-        TOKEN'ıdır; son token saklanır ki tema değişince yeniden çözülebilsin."""
-        self._motor_token = token
-        self._motor_status.setText(text)
-        self._motor_status.setStyleSheet(f"color:{theme.c(token)};font-size:11px;")
-
-    def _on_motor_test(self):
-        reply = QMessageBox.question(
-            self, "Onay",
-            "Motor testi başlatılacak.\nPervaneler çıkarılmış olmalı!\nDevam edilsin mi?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            self._motor_status_set("Durum: İptal edildi — komut gönderilmedi")
-            return
-        ml = self._get_mavlink()
-        # NEDEN: Komut kanalı bağlı değilse hiçbir şey olmaz; bunu gizlememeliyiz.
-        if not self._signal_connected(self.send_command):
-            self._motor_status_set("✗ Komut kanalı bağlı değil — komut GÖNDERİLMEDİ", "danger")
-            return
-        sent = []
-        for i, spin in enumerate(self._motor_spins):
-            thr = spin.value()
-            if thr > 0:
-                self.send_command.emit(
-                    ml.MAV_CMD_DO_MOTOR_TEST,
-                    [i + 1, 0, thr, 3, 0, 0, 0],
-                )
-                sent.append(f"M{i + 1}=%{thr}")
-        # NEDEN: Tüm gazlar 0 iken eskiden hiçbir komut gitmiyordu ama kullanıcıya
-        # da hiçbir şey söylenmiyordu — buton "ölü" görünüyordu.
-        if not sent:
-            self._motor_status_set(
-                "Hiçbir motora gaz verilmedi (hepsi %0) — komut gönderilmedi", "warning"
-            )
-            return
-        self._motor_status_set(
-            "Test komutu gönderildi (" + ", ".join(sent) + ", 3 sn) — FC yanıtı doğrulanmıyor",
-            "warning",
-        )
-
-    def _on_test_all(self):
-        reply = QMessageBox.question(
-            self, "Onay",
-            "TÜM motorlar %20 gaz ile 3 saniye test edilecek.\nPervaneler çıkarılmış olmalı!",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            self._motor_status_set("Durum: İptal edildi — komut gönderilmedi")
-            return
-        ml = self._get_mavlink()
-        if not self._signal_connected(self.send_command):
-            self._motor_status_set("✗ Komut kanalı bağlı değil — komut GÖNDERİLMEDİ", "danger")
-            return
-        for i in range(4):
-            self._motor_spins[i].setValue(20)
-            self.send_command.emit(
-                ml.MAV_CMD_DO_MOTOR_TEST,
-                [i + 1, 0, 20, 3, 0, 0, 0],
-            )
-        self._motor_status_set(
-            "4 motor için %20 / 3 sn test komutu gönderildi — FC yanıtı doğrulanmıyor",
-            "warning",
-        )
-
-    def _on_motor_stop(self):
-        ml = self._get_mavlink()
-        # NEDEN: DURDUR kritik bir güvenlik kontrolü — komut gitmediyse kullanıcı
-        # bunu MUTLAKA görmeli, "durduruldu" izlenimi verilmemeli.
-        if not self._signal_connected(self.send_command):
-            self._motor_status_set(
-                "✗ DUR komutu GÖNDERİLEMEDİ — komut kanalı bağlı değil! Bataryayı ayırın.",
-                "danger",
-            )
-            self._motor_drone.set_highlight(-1)
-            return
-        for i in range(4):
-            self._motor_spins[i].setValue(0)
-            self.send_command.emit(
-                ml.MAV_CMD_DO_MOTOR_TEST,
-                [i + 1, 0, 0, 0, 0, 0, 0],
-            )
-        self._motor_drone.set_highlight(-1)
-        self._motor_status_set("DUR komutu gönderildi (4 motor, gaz %0)", "success")

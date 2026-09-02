@@ -11,6 +11,7 @@ from typing import Any, Optional
 from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot
 from pymavlink import mavutil
 from core import local_storage
+from core import batarya
 
 logger = logging.getLogger(__name__)
 
@@ -610,6 +611,20 @@ class MavlinkWorker(QThread):
                 self._last_telemetry_emit = now
                 data = dict(self._telemetry_accumulator)
                 data["last_heartbeat_age"] = now - self._last_heartbeat_time
+                # ── PİL YÜZDESİ — GERİLİM TABANLI (tek kaynak: core/batarya.py) ──
+                # NEDEN burada, tek noktada: yüzde SYS_STATUS ve BATTERY_STATUS
+                # dallarının İKİSİNDE de üretilebilirdi; o zaman aynı formül iki
+                # kez yazılmış olurdu. Yayın anında birikmiş sözlükteki NİHAİ
+                # `battery_voltage` üzerinden bir kez hesaplanır — hangi mesaj
+                # gerilimi son yazdıysa o kullanılır.
+                # NOT: FC'nin kendi `battery_remaining` alanı (mAh sayımı)
+                # SİLİNMEZ; kayıt ve karşılaştırma için sözlükte kalır. Arayüz
+                # artık aşağıdaki gerilim tabanlı yüzdeyi gösterir
+                # (kullanıcı kararı 2026-09-02: 25.2 V=%100, 21.0 V=%0).
+                # Gerilim yoksa değer None'dır — arayüz "veri yok" gösterir,
+                # %0 GÖSTERMEZ.
+                data[batarya.TELEMETRI_ANAHTARI] = batarya.yuzde_gerilimden(
+                    data.get("battery_voltage", None))
                 self.telemetry_updated.emit(data)
 
     def _request_streams(self) -> None:

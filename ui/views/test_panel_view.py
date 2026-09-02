@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core import local_storage, theme
+from core import batarya
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +74,11 @@ _MANUAL_STEPS = {
 _CHECKLIST = [
     ("GPS Fix",            "3D GPS kilidi gerekli (en az 6 uydu)",     "gps_fix"),
     ("EKF Durumu",         "EKF hatası yok",                           "ekf_ok"),
-    ("Batarya > %50",      "Batarya seviyesi yeterli",                  "battery_ok"),
+    # NEDEN başlık f-string: eşik core/batarya.py'de tanımlı. Metne 50'yi
+    # elle yazmak, eşik değişince listenin YALAN söylemesi demekti.
+    (f"Batarya > %{batarya.UCUS_ONCESI_ASGARI_YUZDE}",
+     f"Pil gerilimi yeterli (≥ {batarya.yuzdeden_gerilim(batarya.UCUS_ONCESI_ASGARI_YUZDE):.1f} V)",
+     "battery_ok"),
     ("RC Bağlantısı",      "RC alıcı sinyali aktif",                   "rc_ok"),
     ("Pusula Kalibrasyonu","Pusula kalibre edilmiş",                   "compass_ok"),
     ("İvmeölçer Kalibr.",  "İvmeölçer kalibre edilmiş",               "accel_ok"),
@@ -464,11 +469,18 @@ class TestPanelView(QWidget):
         ekf_ok = (ekf & 0x1F) == 0x1F  # tüm temel bitler set
         self._h_ekf.set_status(ekf_ok, f"0x{ekf:04X}")
 
-        # Batarya
-        bat_rem = d.get("battery_remaining", -1)
-        bat_v   = d.get("battery_voltage", 0)
-        bat_ok  = bat_rem >= 50 if bat_rem >= 0 else None
-        self._h_bat.set_status(bat_ok, f"%{bat_rem}  {bat_v:.1f}V" if bat_rem >= 0 else "—")
+        # ── Batarya — GERİLİM TABANLI YÜZDE ────────────────────────────────
+        # NEDEN değişti: burada eskiden FC'nin `battery_remaining` (mAh sayımı)
+        # alanı kullanılıyordu. Kullanıcı kararı (2026-09-02): yüzde gerilimden
+        # türetilir (25.2 V=%100, 21.0 V=%0). Hesap core/batarya.py'de, TEK yerde.
+        # Yüzde bilinmiyorsa durum None ("bilinmiyor") — False (BAŞARISIZ)
+        # DEĞİL: veri gelmemesi ile pilin zayıf olması aynı şey değildir ve
+        # sahte kırmızı, operatörü sağlam bir paketi değiştirmeye iter.
+        bat_pct = batarya.yuzde_telemetriden(d)
+        bat_ok  = (bat_pct >= batarya.UCUS_ONCESI_ASGARI_YUZDE
+                   if bat_pct is not None else None)
+        self._h_bat.set_status(bat_ok, batarya.ozet_metni(d))
+        self._h_bat.setToolTip(batarya.ipucu_metni(d))
 
         # RC
         rc_rssi = d.get("rc_rssi", -1)
@@ -497,10 +509,18 @@ class TestPanelView(QWidget):
         # durum "bilinmiyor" (None) → _CheckRow.set_state(None) ⬜ gösterir ve
         # geçti sayısına dahil edilmez.
         _pre_arm = d.get("pre_arm_fail", None)
+        # Pil kapısı: gerilim tabanlı yüzde (core/batarya.py) — bilinmiyorsa None.
+        _bat_pct = batarya.yuzde_telemetriden(d)
+        _battery_ok = (_bat_pct >= batarya.UCUS_ONCESI_ASGARI_YUZDE
+                       if _bat_pct is not None else None)
         states: dict[str, bool | None] = {
             "gps_fix":    d.get("gps_fix_type", 0) >= 3,
             "ekf_ok":     (d.get("ekf_flags", 0) & 0x1F) == 0x1F,
-            "battery_ok": d.get("battery_remaining", -1) >= 50,
+            # NEDEN None olabilir: gerilim yoksa yüzde BİLİNMİYOR. Eski kod
+            # `battery_remaining` yoksa -1 alıp `-1 >= 50` → False üretiyordu,
+            # yani "ölçemedim"i "başarısız" diye sayıyordu. Artık bilinmeyen
+            # madde ⬜ gösterilir ve geçti sayısına girmez.
+            "battery_ok": _battery_ok,
             "rc_ok":      d.get("rc_rssi", -1) > 50,
             "compass_ok": d.get("compass_cal_done", False),
             "accel_ok":   d.get("accel_cal_done", False),
@@ -582,7 +602,9 @@ class TestPanelView(QWidget):
         title = self._TEST_CONFIGS[idx][0]
         self._log_line(f"▶  TEST {idx + 1}: {title} — BAŞLADI")
         self._log_line(f"   Telemetri: GPS={self._telemetry_snap.get('gps_fix_type', '?')}, "
-                       f"Bat=%{self._telemetry_snap.get('battery_remaining', '?')}, "
+                       # Pil: gerilim tabanlı yüzde + ham gerilim (core/batarya.py).
+                       # "veri yok" ile "%0" log'da da ayrışır.
+                       f"Bat={batarya.ozet_metni(self._telemetry_snap)}, "
                        # NEDEN (M8): worker "flight_mode" gönderiyor; "mode" eski
                        # anahtar. İkisi de desteklenir, aksi halde log'da hep "?" çıkıyordu.
                        f"Mode={self._telemetry_snap.get('flight_mode', self._telemetry_snap.get('mode', '?'))}")
@@ -822,7 +844,10 @@ class TestPanelView(QWidget):
                 lines.append(
                     f"TEST {i + 1}: {cfg[0]}{manual_note}\n"
                     f"  Sonuç: {r.get('result','?')}  Süre: {r.get('duration_s','?')}s\n"
-                    f"  GPS: {r.get('gps_fix_type','?')}  Bat: %{r.get('battery_remaining','?')}"
+                    # NEDEN batarya.ozet_metni: rapor, testin çalıştığı ANDAKİ
+                    # pil durumunu gerilim tabanlı ölçekle yazar; veri yoksa
+                    # "veri yok" der, "%0" ya da "%?" demez.
+                    f"  GPS: {r.get('gps_fix_type','?')}  Bat: {batarya.ozet_metni(r)}"
                 )
             else:
                 lines.append(f"TEST {i + 1}: {cfg[0]}\n  Sonuç: YÜRÜTÜLMEDİ")
