@@ -1429,17 +1429,17 @@ class DashboardView(QWidget):
         self.lbl_blue_drop_pwm_val = QLabel("1500 µs")
         self.lbl_blue_drop_pwm_val.setStyleSheet(self._gimbal_val_css())
 
-        # 3b. Minimal tutma torku seçeneği — kavrayıcı sürekli-dönüş servosu
-        # limit switch'e ulaştıktan sonra nötr (pwm_stop) bırakılırsa hiçbir
-        # tutma kuvveti kalmaz; gözlemlenen kullanıcı arızası: kapak açıkken
-        # kendiliğinden yavaşça kapalı konuma sürüklendi. İşaretlenirse hem
-        # açık hem kapalı uçta çok küçük bir PWM sapması (config.json
-        # grabber_switches.hold_torque_pwm_delta) limit switch'e karşı
-        # sürdürülür — varsayılan KAPALI (opt-in, sürekli enerjilenmiş motor
-        # istenmeyen bir durumdur, operatör bilerek açmalı).
-        lbl_hold = QLabel("Tutma Torku:")
-        lbl_hold.setObjectName("mutedLabel")
-        self.chk_grab_hold_torque = QCheckBox("Minimal tutma torku (açık/kapalı)")
+        # 3b. TUTMA TORKU SEÇENEĞİ KALDIRILDI (2026-09-02).
+        # Buradaki "Minimal tutma torku" checkbox'ı operatör tercihiydi ve
+        # varsayılan KAPALI idi. Artık tutma torku bir tercih DEĞİL, DONANIM
+        # GEREĞİ: gerçek araçta ölçüldü ki torksuz bırakılan SOL kapak açık
+        # limit switch'inden ~30 saniyede ayrılıyor (iki bağımsız açılışta).
+        # Firmware'in TÜM yolları (açılış homing'i, görev başlangıcı, Görev 3
+        # açma/kavrama/teslim) hold_torque=True geçiyor ve IHA/comms/
+        # gcs_server.py'deki varsayılan da True yapıldı — yani bu panelden
+        # gönderilen elle komutlar da torklu gidiyor. Kutucuk kalsaydı
+        # operatör onu farkında olmadan kapalı bırakıp kaymayı geri
+        # getirebilirdi.
 
         # 4. Gimbal
         # NEDEN 15-90/varsayılan 90 (2026-08-27, saha testiyle güncellendi):
@@ -1475,11 +1475,11 @@ class DashboardView(QWidget):
 
         btn_grab_open.clicked.connect(
             lambda: self._confirm_and_emit_servo(
-                "grabber", "open", 0, "Yük Kapak", self.chk_grab_hold_torque.isChecked())
+                "grabber", "open", 0, "Yük Kapak", True)
         )
         btn_grab_close.clicked.connect(
             lambda: self.send_servo_action.emit(
-                "grabber", "close", 0, self.chk_grab_hold_torque.isChecked())
+                "grabber", "close", 0, True)
         )
 
         # Kırmızı/mavi manuel PWM slider'ları — gimbal ile AYNI debounce deseni
@@ -1521,8 +1521,6 @@ class DashboardView(QWidget):
         servo_lay.addWidget(btn_grab_open, 2, 1)
         servo_lay.addWidget(btn_grab_close, 2, 2)
 
-        servo_lay.addWidget(lbl_hold, 3, 0)
-        servo_lay.addWidget(self.chk_grab_hold_torque, 3, 1, 1, 2)
 
 
         servo_lay.addWidget(lbl_red_manual, 5, 0)
