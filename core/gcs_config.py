@@ -50,7 +50,10 @@ DEFAULTS: dict = {
     # tools/human_guided_bench.py'nin MJPEG portu (--port, varsayılan 8090) —
     # normal uçuş kamerasından (8080/8081) AYRI, saha testi paneli bunu kullanır.
     "companion_bench_port":  8090,
-    "mavlink_host":           "192.168.1.229",  # MAVLink de aynı RPi üzerinden (port 5763)
+    # companion_host ile AYNI makine — o da mDNS adı olmalı, yoksa araç adres
+    # değiştirdiğinde MAVLink kaynağı eski IP'de kalır (2026-09-03'te tam bu oldu:
+    # dahili WiFi kapatılınca settings.json'daki 192.168.1.109 ölü adrese döndü).
+    "mavlink_host":           "ashina-iha.local",  # MAVLink de aynı RPi (port 5763)
     "mavlink_port":           5763,
     # FIX P1-4: Timeout değerleri artık configurable
     "ai_connect_timeout":     5.0,           # AISocketWorker TCP bağlantı timeout (s)

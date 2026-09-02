@@ -111,6 +111,20 @@ class AcilisEkrani(QWidget):
     def _tik(self) -> None:
         gecen = time.monotonic() - self._t0
         self._aci = (self._aci + 4.2) % 360.0
+        # ASHINA_SPLASH_DEBUG=1 → her ~2 s'de bir durum bas. Kalıcı teşhis:
+        # açılış ekranı kapanmazsa (yaşandı) sorunun timer'da mı, işaret
+        # algısında mı olduğunu ayırt etmenin tek yolu bu.
+        self._tik_say = getattr(self, "_tik_say", 0) + 1
+        if os.environ.get("ASHINA_SPLASH_DEBUG") == "1" and self._tik_say % 50 == 0:
+            m = -1.0
+            try:
+                m = self._izleme.HAZIR_DOSYA.stat().st_mtime if self._izleme else -2.0
+            except Exception as _e:
+                m = -3.0
+            print(f"[splash] tik={self._tik_say} gecen={gecen:.1f} yuzde={self._yuzde:.0f} "
+                  f"hazir={self._hazir} izleme={'VAR' if self._izleme else 'YOK'} "
+                  f"baslangic={self._baslangic_epoch:.3f} isaret_mtime={m:.3f}",
+                  file=sys.stderr, flush=True)
 
         if not self._hazir and self._izleme is not None:
             if self._izleme.hazir_mi(self._baslangic_epoch):
@@ -120,15 +134,33 @@ class AcilisEkrani(QWidget):
             self._yuzde = min(100.0, self._yuzde + 3.5)     # %100'e yumuşak koş
             if self._yuzde >= 100.0 and not self._kapaniyor:
                 self._kapaniyor = True
-                QTimer.singleShot(450, self.close)          # bir an "tamam" göster
+                QTimer.singleShot(450, self._kapat)         # bir an "tamam" göster
         else:
             hedef = min(TAVAN_YUZDE, 100.0 * gecen / self._beklenen)
             self._yuzde = max(self._yuzde, hedef)           # ASLA geri gitme
 
         if gecen > AZAMI_BEKLEME_S and not self._kapaniyor:
             self._kapaniyor = True
-            self.close()
+            self._kapat()
         self.update()
+
+    def _kapat(self) -> None:
+        """Pencereyi kapat VE uygulamadan çık.
+
+        NEDEN quit() ŞART (2026-09-03, teşhisle bulundu): pencere
+        Qt.WindowType.Tool ile oluşturuluyor ve Qt, Tool pencerelerini
+        "birincil pencere" SAYMIYOR. Dolayısıyla quitOnLastWindowClosed
+        tetiklenmiyor: close() pencereyi gizliyor ama app.exec() hiç dönmüyor
+        ve süreç sonsuza kadar yaşıyor. Ölçüldü — hazir=True, yuzde=100
+        olmasına rağmen splash süreci ayakta kalıyordu ve masaüstünü
+        kapatmaya devam ediyordu.
+        """
+        try:
+            self.close()
+        finally:
+            app = QApplication.instance()
+            if app is not None:
+                app.quit()
 
     # ── çizim ──────────────────────────────────────────────────────────────
     def paintEvent(self, _evt) -> None:  # noqa: N802
@@ -195,7 +227,7 @@ class AcilisEkrani(QWidget):
     def keyPressEvent(self, e) -> None:  # noqa: N802
         # Kaçış kapısı: takılırsa operatör ESC ile geçebilsin.
         if e.key() == Qt.Key.Key_Escape:
-            self.close()
+            self._kapat()
 
 
 def main() -> int:

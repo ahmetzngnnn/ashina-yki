@@ -250,6 +250,13 @@ class SettingsView(QWidget):
         if adres:
             if alan is not None:
                 alan.setText(adres)
+            # MAVLink de AYNI makinede (port 5763). Ayrı bırakılırsa araç adres
+            # değiştirdiğinde telemetri eski IP'de kalıyor — 2026-09-03'te tam
+            # bu yaşandı: dahili WiFi kapatılınca mavlink_host ölü adrese döndü.
+            mav_alan = self._fields.get("mavlink_host")
+            if mav_alan is not None:
+                mav_alan.setText(adres)
+                aciklama += " · MAVLink kaynağı da güncellendi"
             self._bul_sonuc.setText(f"✓ {aciklama}")
             self._bul_sonuc.setStyleSheet(f"color:{theme.c('success')};")
             logger.info("Araç bulundu: %s (%s)", adres, aciklama)
