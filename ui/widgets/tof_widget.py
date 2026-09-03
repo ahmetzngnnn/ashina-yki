@@ -7,13 +7,38 @@ from core import theme
 
 logger = logging.getLogger(__name__)
 
-# Sensör köşe renkleri — SENSÖR SEMANTİĞİ (her köşe kendi rengiyle anılır,
-# sahada kablo/etiket rengiyle eşleşir): temadan bağımsız sabit kalır.
-C_WHITE  = "rgb(255, 255, 255)"
-C_RED    = "rgb(204, 25, 25)"
-C_GREEN  = "rgb(25, 204, 25)"
-C_BLUE   = "rgb(51, 102, 230)"
-C_YELLOW = "rgb(204, 204, 25)"
+# TOF hücrelerinin DURUM renkleri. Anlam sabittir, RENK TEMAYA GÖRE çözülür.
+#
+# NEDEN temaya göre (2026-09-03, ölçüldü): renkler eskiden temadan bağımsız
+# sabitti ve AÇIK temada boş hücre zeminine (well = #faf8f5) karşı fiilen
+# görünmüyordu — "yükü görüyor" (beyaz) 1.06:1, "menzil dışı" (sarı) 1.62:1.
+# Yani Görev 3'te yük alma anında en çok bakılan iki durum, theme.py'nin
+# kendi notuyla "güneş altında okunan asıl tema" olan açık temada boş
+# hücreden ayırt edilemiyordu. Koyu temada aynı değerler 17.36 ve 10.10 idi;
+# sorun YALNIZ açık temadaydı, o yüzden koyu tema değerlerine dokunulmadı.
+#
+# ÖLÇÜLEN (dolgu ↔ boş hücre / dolgu ↔ üstündeki metin):
+#   KOYU   yuk 17.36/18.88   zemin 3.46/5.02   menzil_disi 10.10/10.99
+#   AÇIK   yuk 13.40/14.20   zemin 6.04/6.41   menzil_disi  5.23/5.54
+#
+# Açık temada mavi ile kehribarın PARLAKLIKLARI yakın (1.16) ama ikisi
+# mavi–sarı ekseninde ayrışıyor; kırmızı-yeşil renk körlüğünün KORUDUĞU
+# eksen budur, dolayısıyla ayrım güvenli.
+_DURUM_RENK: dict[str, dict[str, str]] = {
+    #  durum          koyu tema    açık tema
+    "yuk":         {"dark": "#ffffff", "light": "#2f2a25"},
+    "zemin":       {"dark": "#3366e6", "light": "#2b56c9"},
+    "menzil_disi": {"dark": "#cccc19", "light": "#8a6100"},
+}
+
+
+def _parlaklik(hexrenk: str) -> float:
+    """WCAG göreli parlaklık — metin rengini dolgudan TÜRETMEK için."""
+    h = hexrenk.lstrip("#")
+    kanal = [int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+    kanal = [k / 12.92 if k <= 0.04045 else ((k + 0.055) / 1.055) ** 2.4
+             for k in kanal]
+    return 0.2126 * kanal[0] + 0.7152 * kanal[1] + 0.0722 * kanal[2]
 
 class TofWidget(QFrame):
     """
@@ -69,16 +94,14 @@ class TofWidget(QFrame):
         self.grid = QGridLayout()
         self.grid.setSpacing(5)
 
-        # Sensör renkleri modül düzeyinde (semantik sabit); boş hücre zemini
-        # temadan gelir — koyu temada koyu, açık temada açık olmalı.
-        self.C_WHITE = C_WHITE
-        self.C_RED = C_RED
-        self.C_GREEN = C_GREEN
-        self.C_BLUE = C_BLUE
-        self.C_YELLOW = C_YELLOW
+        # Hücre renkleri artık _DURUM_RENK'ten TEMAYA GÖRE çözülüyor;
+        # burada saklanan sabit YOK (tema değişince bayat kalırdı).
 
         self.labels = {}
         # Hücrelerin son (metin, renk) durumu — tema değişince yeniden çizilir.
+        # Hücrelerin son (metin, DURUM) hâli — tema değişince yeniden çizilir.
+        # NEDEN renk değil DURUM: renk saklansaydı tema değiştiğinde eski
+        # temanın rengi geri boyanır, _apply_theme_colors işe yaramazdı.
         self._cell_state: dict = {}
         for row in range(3):
             for col in range(3):
@@ -99,29 +122,33 @@ class TofWidget(QFrame):
 
         main_layout.addLayout(self.grid)
 
-    @property
-    def C_BLACK(self) -> str:
-        """Boş hücre zemini — 'siyah' değil, aktif temanın kuyu rengi.
+    def _durum_rengi(self, durum) -> str | None:
+        """Durum adını AKTİF temanın dolgu rengine çevirir; boş hücrede None."""
+        if not durum:
+            return None
+        secim = _DURUM_RENK.get(durum)
+        if not secim:
+            return None
+        return secim["dark" if theme.is_dark() else "light"]
 
-        Eski sabit koyu ton açık temada kara delik gibi duruyordu; çağıran
-        kod (`_set_cell(..., self.C_BLACK)`) değişmeden temaya uyar."""
-        return theme.c("well")
-
-    def _set_cell(self, row, col, text, bg_color, is_target=False):
+    def _set_cell(self, row, col, text, durum, is_target=False):
+        """`durum`: "yuk" | "zemin" | "menzil_disi" | None (boş/nötr hücre)."""
         lbl = self.labels[(row, col)]
         lbl.setText(text)
-        # bg_color None → boş/nötr hücre (tema zemini, tema metni)
-        self._cell_state[(row, col)] = (text, bg_color)
-        if bg_color is None or bg_color == self.C_BLACK:
+        # DURUM saklanır (renk değil) — tema değişince doğru renge çözülsün.
+        self._cell_state[(row, col)] = (text, durum)
+        dolgu = self._durum_rengi(durum)
+        if dolgu is None:
             lbl.setStyleSheet(
                 f"background-color:{theme.c('well')}; color:{theme.c('text_muted')};"
                 f"font-weight:bold; font-size:10px; border:1px solid {theme.c('border')};"
             )
             return
-        # Sensör renkleri doygun ve koyu — üzerinde beyaz metin her iki temada okunur.
-        text_color = "black" if bg_color == self.C_WHITE else "white"
+        # Metin rengi dolgudan TÜRETİLİR — dolgu temaya göre açık ya da koyu
+        # olabiliyor, sabit "beyaz metin" varsayımı açık temada kırılırdı.
+        text_color = "#111111" if _parlaklik(dolgu) > 0.35 else "#ffffff"
         lbl.setStyleSheet(
-            f"background-color:{bg_color}; color:{text_color};"
+            f"background-color:{dolgu}; color:{text_color};"
             f"font-weight:bold; font-size:10px; border:1px solid {theme.c('border_strong')};"
         )
 
@@ -134,8 +161,8 @@ class TofWidget(QFrame):
         self.lbl_status.setStyleSheet(
             f"color:{theme.c(self._status_token)}; font-size:14px; font-weight:bold;"
         )
-        for (row, col), (text, bg) in list(self._cell_state.items()):
-            self._set_cell(row, col, text, bg)
+        for (row, col), (text, durum) in list(self._cell_state.items()):
+            self._set_cell(row, col, text, durum)
 
     def _set_status(self, text: str, token: str) -> None:
         self._status_token = token
@@ -153,11 +180,13 @@ class TofWidget(QFrame):
              "temas_mm","basamak_mm","gecerli_min_mm","gecerli_maks_mm",
              "halka_acik"}
 
-        RENK SEMANTİĞİ:
-          beyaz : sensör YÜKÜ görüyor (okuma zeminden ≥ yarım basamak kısa)
-          mavi  : sensör ZEMİNİ görüyor (yük o yönde değil)
-          sarı  : okuma menzil dışı — ölü bölge (<40 mm) ya da >4 m
-          gri   : veri yok
+        RENK SEMANTİĞİ (anlam sabit, renk TEMAYA göre çözülür — _DURUM_RENK):
+          yükü görüyor   : koyu temada BEYAZ, açık temada KOYU GRAFİT
+                           (okuma zeminden ≥ yarım basamak kısa) — en güçlü işaret
+          zemini görüyor : MAVİ (iki temada da; açık temada koyulaştırılmış)
+          menzil dışı    : koyu temada SARI, açık temada KEHRİBAR
+                           — ölü bölge (<40 mm) ya da >4 m
+          veri yok       : boş/nötr hücre (tema kuyu rengi)
 
         Kısa okuyan kenar yükün YÖNÜNÜ gösterir; araç o yöne kaymalıdır.
         """
@@ -205,7 +234,7 @@ class TofWidget(QFrame):
 
         for r in range(3):
             for c in range(3):
-                self._set_cell(r, c, "", self.C_BLACK)
+                self._set_cell(r, c, "", None)
 
         goren = []
         for ad, (r, c, etiket) in yerler.items():
@@ -216,13 +245,13 @@ class TofWidget(QFrame):
             v = float(v)
             if not _gecerli(v):
                 self._set_cell(r, c, f"{etiket}\n{v:.0f} mm\nmenzil dışı",
-                               self.C_YELLOW)
+                               "menzil_disi")
                 continue
             yuk = esik is not None and v < esik
             if yuk and ad != "merkez":
                 goren.append(etiket)
             self._set_cell(r, c, f"{etiket}\n{v:.0f} mm",
-                           self.C_WHITE if yuk else self.C_BLUE)
+                           "yuk" if yuk else "zemin")
 
         if not self.halka_acik:
             self._set_status("HALKA KAPALI\nsalt gözlem — kamera yolu sürüyor",

@@ -1591,17 +1591,17 @@ class DashboardView(QWidget):
         right_tabs.addTab(esc_tab, "Motor")
 
         # 3. Yapay Zekâ Tespit Geçmişi Sekmesi
-        # NEDEN parent=self + hide(): bu sekme de HİÇBİR yere eklenmiyor
-        # ("Hedefler" sekmesi 3B İzleme ile değiştirildi, aşağıya bak) —
-        # road_tab ile AYNI hata. Ebeveynsiz bırakılınca _build_ui biter bitmez
-        # ai_tab çöp toplanıyor, çocukları (_ai_scroll → _ai_container →
+        # GEÇMİŞ HATA (2026-09-03 düzeltildi): "Hedefler" sekmesi 3B İzleme ile
+        # değiştirilirken ai_tab ebeveynsiz bırakılmış ve hiçbir yere
+        # EKLENMEMİŞTİ — road_tab ile aynı hata. _build_ui biter bitmez ai_tab
+        # çöp toplanıyor, çocukları (_ai_scroll → _ai_container →
         # _ai_container_lay) C++ tarafında siliniyordu; add_ai_detection her
-        # çağrıldığında "wrapped C/C++ object of type QVBoxLayout has been
-        # deleted" atıp yarıda kesiliyor, tespit kaydı KALICI OLARAK BOŞ
-        # kalıyordu (uygulama çökmüyor: PyQt6'da slot istisnası ölümcül değil,
-        # deneyle doğrulandı — sadece özellik sessizce ölü).
-        ai_tab = QWidget(self)
-        ai_tab.hide()
+        # çağrıldığında "wrapped C/C++ object ... has been deleted" atıp yarıda
+        # kesiliyor, tespit kaydı KALICI OLARAK BOŞ kalıyordu. (Uygulama
+        # çökmüyordu: PyQt6'da slot istisnasının ölümcül OLMADIĞI deneyle
+        # doğrulandı — özellik sessizce ölüydü.)
+        # Sekme aşağıda right_tabs'a EKLENİYOR; sahiplik oradan gelir.
+        ai_tab = QWidget()
         ai_lay = QVBoxLayout(ai_tab)
         ai_lay.setContentsMargins(8, 8, 8, 8)
         
@@ -1621,14 +1621,13 @@ class DashboardView(QWidget):
         
         self._ai_scroll.setWidget(self._ai_container)
         ai_lay.addWidget(self._ai_scroll)
-        # NOT: "Hedefler" sekmesi 3B izleme ile değiştirildi. Tespit kaydı
-        # widget'ları YAŞIYOR ve add_ai_detection onları besliyor, ama şu an
-        # HİÇBİR SEKMEDE GÖRÜNMÜYOR — operatör tespit geçmişini göremez.
-        # (Eski yorum "update_detection_history hâlâ besliyor" diyordu; öyle
-        #  bir metot depoda YOK.) Görünür yeri operatör kararı: geri sekme
-        # olarak eklenebilir ya da kayıt tamamen kaldırılabilir.
-        # _last_detection_time yine de yazılıyor ve görev yol haritası onu
-        # okuyor — bu yüzden widget'lar canlı tutuluyor, silinmiyor.
+        # NEDEN kendi sekmesi: kayıt add_ai_detection ile besleniyor ve
+        # _last_detection_time'ı görev yol haritası da okuyor, ama görünür bir
+        # yeri yoktu — çalışan ama hiçbir yerde gösterilmeyen özellik, ölü
+        # özellikten daha kötüdür (operatör hedef geçmişini göremiyor,
+        # geliştirici çalıştığını sanıyor). "Hedefler" 3B İzleme ile
+        # değiştirilmişti; ikisi ayrı iş, ikisi de duruyor.
+        right_tabs.addTab(ai_tab, "Tespitler")
         right_tabs.addTab(self._build_track3d_tab(), "3B İzleme")
 
         # 4. Sinyal & Donanım Sekmesi
