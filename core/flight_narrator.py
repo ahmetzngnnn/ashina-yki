@@ -40,6 +40,8 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
+from core import batarya
+
 # ── Yön adları (meteorolojik: rüzgârın GELDİĞİ yön) ─────────────────────────
 _YONLER = ("kuzeyden", "kuzeydoğudan", "doğudan", "güneydoğudan",
            "güneyden", "güneybatıdan", "batıdan", "kuzeybatıdan")
@@ -180,7 +182,12 @@ class FlightNarrator:
         yaw = float(t.get("yaw_deg", math.degrees(float(t.get("yaw", 0.0) or 0.0))))
         roll = float(t.get("roll_deg", math.degrees(float(t.get("roll", 0.0) or 0.0))))
         pitch = float(t.get("pitch_deg", math.degrees(float(t.get("pitch", 0.0) or 0.0))))
-        bat = float(t.get("battery_remaining", 100.0) or 100.0)
+        # NEDEN gerilimden (2026-09-03/04, operatör bildirdi): battery_remaining
+        # FC'nin mAh sayımıdır ve akım sensörü kalibresizken yanıltıyor
+        # (23 V'ta ~%49 yerine %10 diyordu) — sesli anlatıcı "batarya düşük"
+        # uyarısını FAZLA ERKEN, hâlâ yarı dolu paketle seslendirirdi.
+        _byz = batarya.yuzde_gerilimden(t.get("battery_voltage"))
+        bat = float(_byz) if _byz is not None else 100.0
         sats = int(t.get("gps_sats", 0) or 0)
         ekf = t.get("ekf_flags")
 

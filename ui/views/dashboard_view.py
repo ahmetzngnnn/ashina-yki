@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core import theme
+from core import batarya
 from core.gcs_config import config
 
 
@@ -503,7 +504,14 @@ class HUDWidget(QWidget):
         self._throttle    = int(  data.get("throttle",    0  ))
         self._batt_v      = float(data.get("battery_voltage",   0.0))
         self._batt_a      = float(data.get("battery_current",   0.0))
-        self._batt_r      = int(  data.get("battery_remaining", 0  ))
+        # NEDEN battery_remaining DEĞİL (2026-09-03/04, operatör bildirdi):
+        # FC'nin bildirdiği kalan yüzde harcanan mAh sayımıdır ve akım
+        # sensörü (BATT_AMP_PERVLT) kalibre edilmediği için 23 V'ta (gerilimden
+        # ~%49) FC %10 diyordu. HUD üst çubukla (core/batarya.py, tek kaynak)
+        # AYNI gerilim eşlemesini (25.2 V=%100, 21.0 V=%0) kullanmalı, yoksa
+        # ekranın iki yerinde birbirini yalanlayan iki yüzde görünür.
+        _byz = batarya.yuzde_gerilimden(self._batt_v if self._batt_v > 0 else None)
+        self._batt_r      = _byz if _byz is not None else 0
         self._cell_voltages = list(data.get("battery_cell_voltages", []))
         self._gps_name    = str(  data.get("gps_fix_name", "---"))
         self._gps_sats    = int(  data.get("gps_sats",     0  ))
