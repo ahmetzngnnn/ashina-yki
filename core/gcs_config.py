@@ -47,6 +47,16 @@ DEFAULTS: dict = {
     "companion_status_port":  5602,
     "companion_video_port":   8081,          # İşlenmiş video (görev sırasında, vision annotated)
     "companion_video_raw_port": 8080,        # Ham kamera (her zaman açık)
+    # VİDEO TAŞIYICISI (2026-09-03) — "udp" | "http"
+    # NEDEN UDP varsayılan: canlı görüntüde TCP kayıpta sıra başı tıkanması
+    # yapıyor, ESKİ kareyi yeniden gönderiyor ve kablosuz kaybını tıkanıklık
+    # sanıp hız kısıyor. GERÇEK LİNKTE ÖLÇÜLDÜ (ham akış, 12 s):
+    #     HTTP  29.9 fps, kare arası en kötü 77 ms
+    #     UDP   29.8 fps, kare arası en kötü 41 ms   ← jitter neredeyse yarı
+    # Sorun çıkarsa "http" yazıp eski davranışa dönülebilir; İHA her iki
+    # sunucuyu da açık tutuyor.
+    "video_transport":        "udp",
+    "companion_video_udp_port": 5600,
     # tools/human_guided_bench.py'nin MJPEG portu (--port, varsayılan 8090) —
     # normal uçuş kamerasından (8080/8081) AYRI, saha testi paneli bunu kullanır.
     "companion_bench_port":  8090,
@@ -261,6 +271,15 @@ class GCSConfig:
     @property
     def mavlink_address(self) -> str:
         return f"{self.mavlink_host}:{self.mavlink_port}"
+
+    @property
+    def video_transport(self) -> str:
+        v = str(self._data.get("video_transport", "udp")).strip().lower()
+        return v if v in ("udp", "http") else "udp"
+
+    @property
+    def companion_video_udp_port(self) -> int:
+        return int(self._data.get("companion_video_udp_port", 5600))
 
     @property
     def companion_status_address(self) -> str:

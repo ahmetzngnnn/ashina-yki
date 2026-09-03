@@ -54,6 +54,21 @@ WATCHDOG_INTERVAL_MS = 5000
 HANG_CONFIRM_TICKS = 3
 
 
+
+def _video_urlleri(cfg, host: str) -> tuple:
+    """(ham_url, islenmis_url) — taşıyıcıya göre.
+
+    NEDEN seçenek: UDP canlı görüntü için doğru taşıyıcı (gerçek linkte
+    ölçüldü: ham akışta kare arası en kötü gecikme HTTP'de 77 ms, UDP'de
+    41 ms). Ama İHA her iki sunucuyu da açık tutuyor; sahada UDP'de bir
+    sorun çıkarsa ayarlardan "http" yazıp anında geri dönülebilir.
+    """
+    if getattr(cfg, "video_transport", "udp") == "udp":
+        p = cfg.companion_video_udp_port
+        return (f"udp://{host}:{p}/0", f"udp://{host}:{p}/1")
+    return (f"http://{host}:{cfg.companion_video_raw_port}/video",
+            f"http://{host}:{cfg.companion_video_port}/video")
+
 class MainWindow(QMainWindow):
     def __init__(self, db_conn, auth_manager: AuthManager, parent=None):
         super().__init__(parent)
@@ -188,8 +203,7 @@ class MainWindow(QMainWindow):
         self._last_gps_fix: tuple[float, float, float] | None = None
         # İki video kaynağı: ham (görev yokken) ve işlenmiş (görev sırasında).
         # Kamera YALNIZCA Yardımcı Bilgisayar'a bağlanınca açılır (otomatik denemez).
-        self._video_url_raw = f"http://{config.companion_host}:{config.companion_video_raw_port}/video"
-        self._video_url_processed = f"http://{config.companion_host}:{config.companion_video_port}/video"
+        self._video_url_raw, self._video_url_processed = _video_urlleri(config, config.companion_host)
         self._current_video_source = "none"
         # Kullanıcı diyalogdan Ham/İşlenmiş seçerse görev-bazlı otomatik geçiş durur.
         # "Otomatik" seçilince tekrar açılır.
@@ -969,21 +983,24 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         # Video kaynak URL'lerini yeni host'a göre tazele
-        self._video_url_raw       = f"http://{host}:{cfg.companion_video_raw_port}/video"
-        self._video_url_processed = f"http://{host}:{cfg.companion_video_port}/video"
+        self._video_url_raw, self._video_url_processed = _video_urlleri(cfg, host)
         logger.info("Ayarlar değişti — companion adresleri güncellendi: komut %s:%d, "
                     "durum %s:%d", host, cfg.companion_mission_port,
                     host, cfg.companion_status_port)
 
         # ── 4b. Video URL'lerini yeni host'a güncelle ─────────────────────
-        self._video_url_raw = f"http://{host}:{cfg.companion_video_raw_port}/video"
-        self._video_url_processed = f"http://{host}:{cfg.companion_video_port}/video"
+        self._video_url_raw, self._video_url_processed = _video_urlleri(cfg, host)
         # Aktif video kaynağı eski host'u gösteriyorsa yeni host'a taşı
         # (override durumunu değiştirme — sadece adresi güncelle)
         if self._current_video_source not in ("none", ""):
-            new_src = (self._video_url_processed
-                       if self._current_video_source.endswith(f":{cfg.companion_video_port}/video")
-                       else self._video_url_raw)
+            # Hangi akıştaydık? HTTP'de port, UDP'de adres sonundaki /1 ayırıyor.
+            # NEDEN böyle: eski kod yalnız ":8081/video" sonekine bakıyordu ve
+            # UDP adreslerinde (udp://konak:5600/1) HER ZAMAN "ham"a düşerdi —
+            # host değişince operatör sessizce işlenmiş akışı kaybederdi.
+            _onceki = self._current_video_source
+            _islenmisti = (_onceki.endswith(f":{cfg.companion_video_port}/video")
+                           or _onceki.endswith("/1"))
+            new_src = self._video_url_processed if _islenmisti else self._video_url_raw
             self._apply_video_source(new_src)
 
         # ── 5. RPi durum worker'ını güncelle ─────────────────────────────
