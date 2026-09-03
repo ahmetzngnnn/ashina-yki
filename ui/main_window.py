@@ -510,6 +510,9 @@ class MainWindow(QMainWindow):
         self.rpi_worker.rpi_connected.connect(self.top_bar.set_rpi_connection_status)
         self.rpi_worker.rpi_connected.connect(self._on_rpi_connection_changed)
         self.rpi_worker.rpi_status_updated.connect(self._on_rpi_status)
+        self.rpi_worker.rpi_connected.connect(
+            self._saha_testi_view.on_companion_changed)
+        self.rpi_worker.health_alert.connect(self._saha_testi_view.on_health_alert)
         self.rpi_worker.health_alert.connect(self._on_health_alert)
         self.rpi_worker.mission_notification.connect(self._on_mission_notification)
         self._iha_test_panel.run_test_requested.connect(self.ai_worker.send_run_test)
@@ -580,6 +583,12 @@ class MainWindow(QMainWindow):
         # komutundan sonra STATUSTEXT istemi göndermeyi bırakır (snoop kapanır)
         # ve konumu/sonucu COMMAND_LONG(42429) ile 1 Hz tekrarlar.
         w.accelcal_pos_received.connect(self._calib_view.on_accelcal_pos)
+        # SAHA TESTİ paneli: pervanesiz ama GERÇEK senaryo koşucusu. Canlı
+        # durum tahtası ve olay günlüğü bu akışlardan beslenir; ACİL DISARM
+        # ise send_command üzerinden FC'ye gider.
+        w.connection_changed.connect(self._saha_testi_view.on_connection_changed)
+        w.status_text_received.connect(self._saha_testi_view.on_status_text)
+        self._saha_testi_view.send_command.connect(w.send_command)
         # AutoTune paneli: eksen maskesi/agresiflik FC'ye YAZILIR ve FC'nin
         # gerçek değerleri geri okunur; AUTOTUNE ilerlemesi STATUSTEXT'ten gelir.
         w.connection_changed.connect(self._autotune_view.on_connection_changed)
@@ -696,6 +705,16 @@ class MainWindow(QMainWindow):
                 fn()
             except Exception:
                 logger.exception("Sekme değişiminde motor durdurma hatası")
+        # Saha testi panelinden çıkınca PERVANE ONAYI da düşer: onay,
+        # aracın O ANKİ fiziksel durumuna dair bir beyandır; açık kalması
+        # kutunun hiç olmamasından tehlikelidir.
+        if self._tabs.currentWidget() is not self._saha_testi_view:
+            fn2 = getattr(self._saha_testi_view, "panel_terk_edildi", None)
+            if callable(fn2):
+                try:
+                    fn2()
+                except Exception:
+                    logger.exception("Saha testi paneli sıfırlanamadı")
 
     # ── RBAC Erişim Kontrolü ─────────────────────────────────────────────────
     def _apply_rbac(self) -> None:
