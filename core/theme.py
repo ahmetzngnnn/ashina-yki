@@ -30,114 +30,148 @@ LIGHT = "light"
 
 # ── Palet ────────────────────────────────────────────────────────────────────
 # İki temada AYNI anahtar kümesi bulunmak ZORUNDA (doğrulama: _validate).
-# Açık tema renkleri WCAG AA (>=4.5:1 metin kontrastı) gözetilerek seçildi;
-# koyu temanın "parlak" aksanları beyaz zeminde okunmaz, bu yüzden açık temada
-# aynı rolün daha koyu tonu kullanılır (accent teal #2dd4bf → #0f766e).
+#
+# ── v4 PALET KARARLARI: "sıcak grafit + çelik mavisi" ───────────────────────
+# NEDEN nötrler SICAK: v3'te tüm zeminler 207-210° mavi-arduvaz ve %25-32
+#   doygunluktaydı; ekran soğuk ve "hazır şablon" duruyordu. Yeni nötrler 30-40°
+#   (sıcak grafit) ve %6-10 doygunluk — renk eğilimi kasıtlı ama gürültüsüz.
+#   Sıcak zemin + soğuk aksan, karanlık kokpit + soğuk gösterge ışığı etkisidir;
+#   ikisi birbirini iterek panel sınırlarını renk yardımıyla da ayırır.
+# NEDEN TEK aksan: v3'te aksan (turkuaz), info (mavi), success (yeşil) ve
+#   warning (amber) hepsi %53-83 doygunlukta yarışıyordu. Artık aksan tek ve
+#   orta-düşük doygunlukta (%44) çelik mavisi; `info` aksanın AYNISI —
+#   birbirine bu kadar yakın iki maviyi operatör ayıramaz, palet gürültüsü olur.
+# NEDEN aksan mavi ailesinden: kırmızı/amber/yeşil alarm renkleridir; aksan
+#   onlardan uzak bir hue'da kalmalı ki dolgu/başlık rengi alarmla karışmasın.
+# NEDEN durum renkleri KADEMELİ: tehlike en doygun (S%74) ve en dikkat çeken,
+#   uyarı orta (S%62), başarı en sakin (S%30) — "her şey aynı sesle bağırmasın";
+#   yeşil sürekli görünen normal durumdur, kırmızı istisnadır.
+# NEDEN hover yönü temaya göre değişir: dolgulu buton hover'da zeminden UZAKLAŞIR
+#   (koyuda açılır, AÇIKTA KOYULAŞIR) — açık temada hover'ı açmak, üstündeki
+#   beyaz metnin kontrastını 7.0'dan 5.2'ye düşürüyordu.
+#
+# ÖLÇÜLEN KONTRAST (WCAG 2.x göreli parlaklık; hedef: gövde ≥7, ikincil ≥4.5)
+#   KOYU   text/bg 15.19  text/panel 13.02  text/panel_alt 11.31
+#          text_muted/bg 7.60  text_muted/panel_alt 5.65 (en kötü)
+#          accent/bg 7.48  success/bg 7.35  warning/bg 8.67  danger/bg 6.40
+#          on_accent/accent 7.17
+#   AÇIK   text/bg 14.23  text/panel 16.38  text/statusbar 12.38 (en kötü)
+#          text_muted/bg 6.43  text_muted/statusbar 5.59 (en kötü)
+#          accent/bg 5.93  success/bg 5.75  warning/bg 5.57  danger/bg 5.32
+#          on_accent/accent 7.01
+# Açık tema güneş altında okunan asıl temadır; koyu temanın parlak aksanları
+# beyaz zeminde okunmaz, bu yüzden açık temada aynı rolün koyu tonu kullanılır
+# (accent #7ba9cc → #2a5d84).
 _PALETTES: dict[str, dict[str, str]] = {
     DARK: {
-        # Zeminler
-        "bg":             "#0d1318",
-        "panel":          "#151d25",
-        "panel_alt":      "#1b242d",
-        "well":           "#0f161c",   # girdi/tablo kuyusu
-        "toolbar":        "#10181f",
-        "statusbar":      "#0a0f13",
-        "row_alt":        "#121a21",
-        "overlay":        "#151d25",   # menü/açılır liste zemini
-        # Kenarlıklar
-        "border":         "#29333d",
-        "border_strong":  "#35424d",
-        "border_soft":    "#232c34",
-        # Metin
-        "text":           "#e4ebf1",
-        "text_muted":     "#8996a3",
-        "text_disabled":  "#55626d",
+        # Zeminler — sıcak grafit rampası (30-40°, S %6-10).
+        # Basamaklar: bg → panel 1.17×, panel → panel_alt 1.15× (net ama yumuşak)
+        "bg":             "#131210",
+        "panel":          "#23211f",
+        "panel_alt":      "#2e2c28",
+        "well":           "#1c1a17",   # girdi/tablo kuyusu — panelden ÇUKUR
+        "toolbar":        "#191715",
+        "statusbar":      "#0b0a09",
+        "row_alt":        "#211f1c",
+        "overlay":        "#2e2c28",   # menü/açılır liste zemini (en yüksek yüzey)
+        # Kenarlıklar — zeminle aynı sıcak hue'da, üç kademe
+        "border":         "#44403b",
+        "border_strong":  "#5b554d",
+        "border_soft":    "#37332f",
+        # Metin — kağıt beyazı (hafif sıcak); nötrlerle aynı sıcaklık ailesinde
+        "text":           "#ebe7e0",
+        "text_muted":     "#aba49c",
+        "text_disabled":  "#787168",
         # Aksan / semantik
-        "accent":         "#2dd4bf",
-        "accent_hover":   "#45e0cf",
-        "accent_press":   "#23b3a1",
-        "accent_soft":    "#123a35",   # aksanın soluk zemini (hover/checked)
-        "on_accent":      "#06231f",   # aksan zemini üzerindeki metin
-        "info":           "#4aa3e0",
-        "success":        "#40c463",
-        "warning":        "#e0a83e",
-        "danger":         "#ef5a55",
-        # Nötr buton
-        "btn_bg":         "#1f2a33",
-        "btn_hover":      "#27343e",
-        "btn_press":      "#18222a",
-        "btn_border":     "#35424d",
-        "btn_border_hover": "#46545f",
-        "btn_disabled_bg":  "#141b21",
-        # Semantik butonlar (zemin / metin / kenar)
-        "success_bg":     "#1c3a2a", "success_fg": "#6ee7a0", "success_border": "#2f6b48",
-        "success_hover":  "#244d38", "success_press": "#16301f",
-        "danger_bg":      "#3a1f22", "danger_fg":  "#ff8a85", "danger_border":  "#7a3b3b",
-        "danger_hover":   "#4d2629", "danger_press":  "#2e181a",
-        "warning_bg":     "#3a2f18", "warning_fg": "#f0c060", "warning_border": "#7a6330",
-        "warning_hover":  "#4b3d20",
+        "accent":         "#7ba9cc",   # çelik mavisi, S%44 — neon DEĞİL
+        "accent_hover":   "#94bcdb",
+        "accent_press":   "#5a8db5",
+        "accent_soft":    "#222f3a",   # aksanın soluk zemini (hover/checked)
+        "on_accent":      "#0e1820",   # aksan zemini üzerindeki metin (7.17:1)
+        "info":           "#7ba9cc",   # NEDEN: aksanla aynı — ikinci mavi yok
+        "success":        "#6db08d",   # en sakin (S%30) — normal durum
+        "warning":        "#d6aa51",   # orta (S%62)
+        "danger":         "#e87568",   # en doygun (S%74) — istisna durum
+        # Nötr buton — panelin bir üstünde duran yüzey
+        "btn_bg":         "#2e2c28",
+        "btn_hover":      "#393632",
+        "btn_press":      "#23211f",
+        "btn_border":     "#4a4540",
+        "btn_border_hover": "#5f5a53",
+        "btn_disabled_bg":  "#1e1c1a",
+        # Semantik butonlar (zemin / metin / kenar). NEDEN dolgular panelden
+        # belirgin ayrılıyor: koyu zeminde soluk tint "arızalı buton" gibi
+        # duruyordu; tehlike dolgusu en açık/doygun, başarı en sakin.
+        "success_bg":     "#21362b", "success_fg": "#92d3b0", "success_border": "#3d6c54",
+        "success_hover":  "#2b4638", "success_press": "#192921",
+        "danger_bg":      "#482723", "danger_fg":  "#f2968c", "danger_border":  "#8a4038",
+        "danger_hover":   "#59302c", "danger_press":  "#371e1b",
+        "warning_bg":     "#3f3522", "warning_fg": "#e3c382", "warning_border": "#766137",
+        "warning_hover":  "#50432b",
         # Seçim / vurgular
-        "selection_bg":   "#1f2a33",
-        "selection_fg":   "#2dd4bf",
-        "scroll_handle":  "#35424d",
-        "scroll_hover":   "#46545f",
-        "grid":           "#1f2932",
+        "selection_bg":   "#222f3a",
+        "selection_fg":   "#7ba9cc",
+        "scroll_handle":  "#47433e",
+        "scroll_hover":   "#5d5851",
+        "grid":           "#312e2b",
         # Grafik (pyqtgraph) — QSS dışı
-        "chart_bg":       "#0f161c",
-        "chart_fg":       "#d4d4d4",
+        "chart_bg":       "#1c1a17",
+        "chart_fg":       "#cec8c0",
         # Durum ışığı "sönük" hali
-        "idle":           "#55626d",
+        "idle":           "#68625a",
         # İkon seti klasörü (QSS url() için)
         "iconset":        "dark",
     },
     LIGHT: {
-        "bg":             "#eef1f5",
-        "panel":          "#ffffff",
-        "panel_alt":      "#f7f9fb",
-        "well":           "#ffffff",
-        "toolbar":        "#e6ebf1",
-        "statusbar":      "#e0e6ed",
-        "row_alt":        "#f5f7fa",
-        "overlay":        "#ffffff",
-        "border":         "#ccd5df",
-        "border_strong":  "#aab6c2",
-        "border_soft":    "#dde4ea",
-        "text":           "#16202a",
-        "text_muted":     "#55636f",
-        "text_disabled":  "#9aa6b2",
-        "accent":         "#0f766e",
-        "accent_hover":   "#0d9488",
-        "accent_press":   "#115e59",
-        "accent_soft":    "#d7f0ec",
+        # Zeminler — sıcak kağıt rampası. NEDEN: v3'te panel/well/overlay üçü de
+        # saf #ffffff idi, kart ile zemin ayrışmıyordu. Artık kart en parlak,
+        # kuyu bir kademe çukur, gövde zemini kağıt tonunda.
+        "bg":             "#eeece7",
+        "panel":          "#fdfcfa",
+        "panel_alt":      "#f6f4f1",
+        "well":           "#faf8f5",
+        "toolbar":        "#e7e4df",
+        "statusbar":      "#e0ddd6",
+        "row_alt":        "#f4f2ee",
+        "overlay":        "#fdfcfa",
+        "border":         "#cec9c0",
+        "border_strong":  "#ada699",
+        "border_soft":    "#e1ddd6",
+        "text":           "#201d18",
+        "text_muted":     "#5a5349",   # güneş altı için v3'ten koyulaştırıldı
+        "text_disabled":  "#9c968b",
+        "accent":         "#2a5d84",
+        "accent_hover":   "#1e4a6b",   # NEDEN: açık temada hover KOYULAŞIR
+        "accent_press":   "#153a56",
+        "accent_soft":    "#dae7f1",
         "on_accent":      "#ffffff",
-        "info":           "#1a6ba8",
-        "success":        "#15803d",
-        "warning":        "#a25a06",
-        "danger":         "#c0281f",
-        "btn_bg":         "#ffffff",
-        "btn_hover":      "#eef2f7",
-        "btn_press":      "#e0e6ed",
-        "btn_border":     "#c2ccd7",
-        "btn_border_hover": "#9aa8b6",
-        "btn_disabled_bg":  "#f0f3f6",
-        "success_bg":     "#dcf5e4", "success_fg": "#12652f", "success_border": "#8dcfa4",
-        "success_hover":  "#c9eed6", "success_press": "#b6e4c7",
-        "danger_bg":      "#fde4e2", "danger_fg":  "#a81f17", "danger_border":  "#eda9a3",
-        "danger_hover":   "#fbd3d0", "danger_press":  "#f7c1bd",
-        "warning_bg":     "#fdefd6", "warning_fg": "#8a4c05", "warning_border": "#e5bb79",
-        "warning_hover":  "#fae4bd",
-        "selection_bg":   "#d7f0ec",
-        "selection_fg":   "#0f766e",
-        "scroll_handle":  "#b6c2ce",
-        "scroll_hover":   "#96a5b3",
-        "grid":           "#e2e8ee",
-        "chart_bg":       "#ffffff",
-        "chart_fg":       "#33414f",
-        "idle":           "#9aa6b2",
+        "info":           "#2a5d84",   # NEDEN: aksanla aynı — ikinci mavi yok
+        "success":        "#226745",
+        "warning":        "#8b4e09",
+        "danger":         "#b62a20",
+        "btn_bg":         "#fdfcfa",
+        "btn_hover":      "#f6f4f1",
+        "btn_press":      "#ece9e4",
+        "btn_border":     "#d4cec4",
+        "btn_border_hover": "#b3ab9e",
+        "btn_disabled_bg":  "#f2f0ed",
+        "success_bg":     "#daf1e6", "success_fg": "#1a5b3b", "success_border": "#9acbb2",
+        "success_hover":  "#c9e9d9", "success_press": "#b9dfcc",
+        "danger_bg":      "#fae3e0", "danger_fg":  "#9a2219", "danger_border":  "#e3a7a0",
+        "danger_hover":   "#f7d3cf", "danger_press":  "#f2c5c0",
+        "warning_bg":     "#f9ecd2", "warning_fg": "#784308", "warning_border": "#deba7c",
+        "warning_hover":  "#f5e2bc",
+        "selection_bg":   "#dae7f1",
+        "selection_fg":   "#2a5d84",
+        "scroll_handle":  "#bfbab0",
+        "scroll_hover":   "#9f9789",
+        "grid":           "#eae7e1",
+        "chart_bg":       "#faf8f5",
+        "chart_fg":       "#4f4940",
+        "idle":           "#9c968b",
         "iconset":        "light",
     },
 }
-
 
 def _validate() -> None:
     """İki paletin anahtar kümesi birebir aynı olmalı — eksik anahtar, tema

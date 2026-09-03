@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QPushButton, QTextEdit, QSpinBox, QDoubleSpinBox,
     QGroupBox, QGridLayout, QDialog, QComboBox, QLineEdit,
     QDialogButtonBox, QFormLayout, QMenu, QTabWidget, QSlider, QScrollArea, QProgressBar,
-    QCheckBox
+    QCheckBox, QSplitter
 )
 
 from core import theme
@@ -57,6 +57,16 @@ try:
     from ui.widgets.tof_widget import TofWidget
 except ImportError:
     TofWidget = None
+
+# Görev detayı + TOF durumu paneli (sağ sütunun alt yarısı).
+# NEDEN korumalı import: bu bileşen ayrı bir ekipte yazılıyor ve depoda henüz
+# olmayabilir. Ana ekran YKİ'nin TEK uçuş öncesi ekranıdır — eksik bir yan
+# panel yüzünden açılışta ImportError ile çökmesi kabul edilemez; dosya yoksa
+# aynı yere sebebini yazan bir yer tutucu kutu konur (bkz. _build_ui).
+try:
+    from ui.widgets.gorev_tof_panel import GorevTofPanel
+except ImportError:
+    GorevTofPanel = None
 
 try:
     from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -1059,6 +1069,11 @@ class DashboardView(QWidget):
         # Tema değişince İHA durum etiketini aynı veriyle yeniden kurmak için
         self._last_rpi_status: dict | None = None
         self._health_bars: list = []
+        # Sağ sütun alt paneli (Görev & TOF): besleme TEK yerden yapılır
+        # (update_rpi_status), biriktirme YOK — gerekçesi orada.
+        #  - _sag_split_elle : operatör bölücüyü elle sürükledi mi?
+        self._sag_split_elle = False
+        self._road_step_names: list[str] = []
         self._build_ui()
         # Kurulumda yazılan satır-içi renkler tema değişince bayat kalır —
         # sinyale bağlanıp hepsini son duruma göre yeniden yazıyoruz.
@@ -1316,7 +1331,10 @@ class DashboardView(QWidget):
         self._hud = HUDWidget()
         cl.addWidget(self._hud, stretch=2)
 
-        # Video — HUD ile eşit yükseklik (her ikisi stretch=1)
+        # Video — merkez sütunun EN ALT panelidir (operatör talebi 2026-09-02).
+        # NEDEN aşağıda kurulup en sonda eklenir: yerleşim sırası HUD → servo
+        # düğmeleri → KAMERA olacak; widget burada kurulup cl'ye servo grubundan
+        # SONRA ekleniyor (kod bloklarını yerinden oynatmadan sırayı değiştirir).
         vframe = QFrame()
         vframe.setObjectName("videoFrame")
         vframe.setMinimumHeight(140)
@@ -1341,8 +1359,8 @@ class DashboardView(QWidget):
         self._video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._video_label.setObjectName("mutedLabel")   # statik renk → QSS class
         vfl.addWidget(self._video_label, stretch=1)
-        # Video HUD'dan daha büyük olacak ve dikey alanı dolduracak
-        cl.addWidget(vframe, stretch=3)
+        # (cl.addWidget(vframe, ...) BİLEREK burada değil — servo grubundan
+        #  sonra, merkez sütunun en altında yapılır.)
 
         # ── Otonom Yük & Servo (Sonsuz Derece Premium Grid Düzen) ──────────────────────
         servo_grp = QFrame()
@@ -1535,7 +1553,16 @@ class DashboardView(QWidget):
         servo_lay.setColumnStretch(1, 4)
         servo_lay.setColumnStretch(2, 4)
         
+        # ── Merkez sütun dizilimi: HUD → servo düğmeleri → KAMERA ──────────
+        # NEDEN servo ufkun hemen altında: yük bırakma/grabber düğmeleri
+        # operatörün ufka bakarken göz kaydırmadan ulaşacağı yerde olmalı;
+        # kamera ise görev sırasında sürekli izlenen büyük alan olarak en altta
+        # panelleşir (operatör talebi 2026-09-02).
+        # NEDEN stretch 2/3 korundu: servo grubu zaten sabit yükseklikte
+        # (stretch=0), esnek alanın paylaşımı değişmedi — kamera hâlâ en büyük
+        # bölge (%60), HUD okunabilir kalıyor. Sıra değişti, oran değişmedi.
         cl.addWidget(servo_grp, stretch=0)
+        cl.addWidget(vframe, stretch=3)
 
         # Kolon oranı: GÖREV İZLEME (PFD + video + yük paneli) haritadan belirgin
         # şekilde geniş olmalı — operatör uçuşu buradan takip eder. Minimum genişlik
@@ -1564,7 +1591,17 @@ class DashboardView(QWidget):
         right_tabs.addTab(esc_tab, "Motor")
 
         # 3. Yapay Zekâ Tespit Geçmişi Sekmesi
-        ai_tab = QWidget()
+        # NEDEN parent=self + hide(): bu sekme de HİÇBİR yere eklenmiyor
+        # ("Hedefler" sekmesi 3B İzleme ile değiştirildi, aşağıya bak) —
+        # road_tab ile AYNI hata. Ebeveynsiz bırakılınca _build_ui biter bitmez
+        # ai_tab çöp toplanıyor, çocukları (_ai_scroll → _ai_container →
+        # _ai_container_lay) C++ tarafında siliniyordu; add_ai_detection her
+        # çağrıldığında "wrapped C/C++ object of type QVBoxLayout has been
+        # deleted" atıp yarıda kesiliyor, tespit kaydı KALICI OLARAK BOŞ
+        # kalıyordu (uygulama çökmüyor: PyQt6'da slot istisnası ölümcül değil,
+        # deneyle doğrulandı — sadece özellik sessizce ölü).
+        ai_tab = QWidget(self)
+        ai_tab.hide()
         ai_lay = QVBoxLayout(ai_tab)
         ai_lay.setContentsMargins(8, 8, 8, 8)
         
@@ -1584,9 +1621,14 @@ class DashboardView(QWidget):
         
         self._ai_scroll.setWidget(self._ai_container)
         ai_lay.addWidget(self._ai_scroll)
-        # NOT: "Hedefler" sekmesi 3B izleme ile değiştirildi; tespit kaydı
-        # widget'ları korunuyor (update_detection_history hâlâ besliyor),
-        # ileride başka bir yere taşınabilir.
+        # NOT: "Hedefler" sekmesi 3B izleme ile değiştirildi. Tespit kaydı
+        # widget'ları YAŞIYOR ve add_ai_detection onları besliyor, ama şu an
+        # HİÇBİR SEKMEDE GÖRÜNMÜYOR — operatör tespit geçmişini göremez.
+        # (Eski yorum "update_detection_history hâlâ besliyor" diyordu; öyle
+        #  bir metot depoda YOK.) Görünür yeri operatör kararı: geri sekme
+        # olarak eklenebilir ya da kayıt tamamen kaldırılabilir.
+        # _last_detection_time yine de yazılıyor ve görev yol haritası onu
+        # okuyor — bu yüzden widget'lar canlı tutuluyor, silinmiyor.
         right_tabs.addTab(self._build_track3d_tab(), "3B İzleme")
 
         # 4. Sinyal & Donanım Sekmesi
@@ -1688,7 +1730,16 @@ class DashboardView(QWidget):
 
         # 5. Görev Yol Haritası (artık sekme olarak eklenmiyor; adım
         #    durumlarını güncelleyen mevcut mantık korunuyor)
-        road_tab = QWidget()
+        # NEDEN parent=self + hide(): bu sekme HİÇBİR yere eklenmiyor (yukarıdaki
+        # nota bak). Ebeveynsiz bırakılınca _build_ui biter bitmez C++ nesnesi
+        # yok oluyor, self._road_steps'teki etiketler dangling kalıyordu ve tema
+        # DEĞİŞİNCE _apply_theme_colors → _apply_roadmap_styles
+        # "wrapped C/C++ object has been deleted" ile patlayıp geri kalan tema
+        # tazelemesini (tespit kartları, İHA durum etiketi) yarıda kesiyordu.
+        # Görünmez ama YAŞAYAN bir çocuk olarak tutuluyor; adım durumu mantığı
+        # (ve onu okuyan görev özeti) olduğu gibi çalışmaya devam ediyor.
+        road_tab = QWidget(self)
+        road_tab.hide()
         road_lay = QVBoxLayout(road_tab)
         road_lay.setContentsMargins(12, 12, 12, 12)
         road_lay.setSpacing(10)
@@ -1708,6 +1759,9 @@ class DashboardView(QWidget):
             ("YERDEN YÜK ALMA (Bonus)", "Görev 3: Barometre+ToF ile temas ve alım"),
             ("EVE DÖNÜŞ (RTL / LAND)", "Otonom güvenli iniş ve görevin tamamlanması")
         ]
+        # Adım adları görev sözlüğüne (gorev_guncelle) da gidiyor — tek kaynak
+        # burası kalsın diye saklanır, alt panelde İKİNCİ bir kopya olmasın.
+        self._road_step_names = [ad for ad, _ in steps_data]
         
         for idx, (name, desc) in enumerate(steps_data):
             step_box = QFrame()
@@ -1752,11 +1806,110 @@ class DashboardView(QWidget):
         # taşımıyordu. Burası anlık akışı METİN olarak yazar ve sesli anlatır.
         right_tabs.addTab(self._build_mission_monitor(), "Görev İzleme")
 
+        # ── Sağ sütun ikiye bölünür: üstte sekmeler, altta Görev & TOF ─────
+        # NEDEN QSplitter: operatör harita ile görev/TOF alanı arasındaki oranı
+        # göreve göre kendisi kaydırabilsin (arama safhasında harita, yük alma
+        # safhasında TOF baskın olsun). Durum saklanabilir olsun diye kolun
+        # objectName'i sabit — main_window ileride saveState/restoreState ile
+        # tercihi diske yazabilir.
+        self._right_split = QSplitter(Qt.Orientation.Vertical)
+        self._right_split.setObjectName("sagSutunBolucu")
+        self._right_split.setChildrenCollapsible(False)   # panel kazara yok olmasın
+        self._right_split.addWidget(right_tabs)
+
+        # Alt bölüm: Görev Detayı + TOF Durumu (ayrı ekip yazıyor).
+        if GorevTofPanel is not None:
+            self._gorev_tof = GorevTofPanel(self)
+        else:
+            # NEDEN yer tutucu: bileşen yoksa BOŞ delik bırakmak operatöre
+            # "panel bozuldu mu?" dedirtir. Sebebi yazan bir kutu koyuyoruz;
+            # rengi QSS class'ından gelir (satır-içi sabit renk YOK).
+            self._gorev_tof = QGroupBox("Görev Detayı & TOF")
+            _gt_lay = QVBoxLayout(self._gorev_tof)
+            _gt_lay.setContentsMargins(12, 12, 12, 12)
+            _gt_lbl = QLabel("Görev/TOF paneli bu kurulumda yüklü değil.")
+            _gt_lbl.setObjectName("mutedLabel")
+            _gt_lbl.setWordWrap(True)
+            _gt_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            _gt_lay.addWidget(_gt_lbl)
+        self._gorev_tof.setMinimumHeight(140)
+        self._right_split.addWidget(self._gorev_tof)
+
+        # Üst bölüm (harita) büyümeyi alsın, alt bölüm ölçülen yüksekliğini
+        # korusun — asıl oran _sag_bolum_yuksekligini_hizala()'da kurulur.
+        self._right_split.setStretchFactor(0, 1)
+        self._right_split.setStretchFactor(1, 0)
+        # Operatör kolu bir kez sürüklerse oran ARTIK onundur
+        # (bkz. _sag_bolum_yuksekligini_hizala; bayrak __init__'te kurulur).
+        self._right_split.splitterMoved.connect(self._on_sag_split_tasindi)
+
         # Harita/yan sekmeler: okunur kalsın ama görev izleme alanını yutmasın.
         # Üst sınır olmadan QWebEngineView'in boyut ipucu tüm artan alanı çekiyordu.
-        right_tabs.setMinimumWidth(340)
-        right_tabs.setMaximumWidth(760)
-        root.addWidget(right_tabs, stretch=2)
+        # NEDEN kısıt artık SÜTUNUN kendisinde: genişlik sınırı tek bir sekme
+        # widget'ına değil, sekmeler + görev/TOF panelinden oluşan sağ sütunun
+        # tamamına ait — kısıt sekmede kalsaydı alt panel sütunu genişletebilirdi.
+        self._right_split.setMinimumWidth(340)
+        self._right_split.setMaximumWidth(760)
+        root.addWidget(self._right_split, stretch=2)
+
+        # İlk hizalama: kurulum anında widget'ların gerçek yüksekliği daha
+        # bilinmiyor (hepsi 0). Olay döngüsü ilk yerleşimi yaptıktan sonra
+        # ölçüp oranı kuruyoruz.
+        QTimer.singleShot(0, self._sag_bolum_yuksekligini_hizala)
+
+    # ── Sağ sütun bölücüsü: alt bölüm kamera yüksekliğiyle hizalı ─────────
+    def _on_sag_split_tasindi(self, _pos: int, _index: int) -> None:
+        """Operatör bölücüyü sürükledi — bundan sonra oranı biz bozmayız."""
+        self._sag_split_elle = True
+
+    def _sag_bolum_yuksekligini_hizala(self) -> None:
+        """Sağ sütunun ALT bölümünü kamera panelinin yüksekliğine eşitler.
+
+        NEDEN sabit piksel değil: operatör alt bölümü "kameranın yüksekliğinde"
+        istedi ve YKİ yalnız 1920×1080 kiosk'ta değil, farklı çözünürlüklü
+        ekranlarda da açılıyor. Kamera zaten esnek stretch ile boyutlanıyor;
+        alt bölümü ONUN ÖLÇÜLEN yüksekliğinden türetince hiza her çözünürlükte
+        kendiliğinden tutar.
+        NEDEN üst sınır toplamın yarısı: kamera çok büyüdüğünde harita bir
+        şerit hâline gelmemeli — harita sağ sütunun en az yarısını korur."""
+        split = getattr(self, "_right_split", None)
+        if split is None or self._sag_split_elle:
+            return
+        toplam = split.height() - split.handleWidth()
+        kamera_h = self._video_frame.height()
+        if toplam <= 0 or kamera_h <= 0:
+            return
+        alt = max(140, min(kamera_h, toplam // 2))
+        ust = toplam - alt
+        if ust <= 0:
+            return
+        # Gereksiz yeniden yerleşimi önle: oran zaten doğruysa dokunma
+        # (resizeEvent sürükleme sırasında saniyede onlarca kez gelir).
+        mevcut = split.sizes()
+        if len(mevcut) == 2 and abs(mevcut[1] - alt) <= 2:
+            return
+        split.setSizes([ust, alt])
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        # NEDEN: pencere/ekran boyutu değişince kamera paneli de büyüyüp
+        # küçülüyor — sağ alt bölüm onunla hizalı kalsın.
+        super().resizeEvent(event)
+        self._sag_bolum_yuksekligini_hizala()
+
+    # ── Görev & TOF alt paneli — güvenli besleme ──────────────────────────
+    def _gorev_tof_cagir(self, ad: str, veri: dict) -> None:
+        """Alt paneldeki `ad` metodunu VARSA çağırır; hatasını günlüğe yazıp yutar.
+
+        NEDEN: panel ayrı bir ekipte yazılıyor ve yer tutucu hâlinde bu
+        metotlar YOK. Ana telemetri dağıtımı (~15 Hz; HUD, harita, ESC, sağlık)
+        yan bir panelin eksikliği ya da hatası yüzünden KESİLMEMELİ."""
+        fn = getattr(getattr(self, "_gorev_tof", None), ad, None)
+        if fn is None:
+            return
+        try:
+            fn(veri)
+        except Exception:
+            logger.debug("GorevTofPanel.%s hatası", ad, exc_info=True)
 
     # ── Sağlık göstergeleri: "veri yok" → gerçek değer geçişi ──────────────
     def _hw_set(self, bar, key: str, value: int, fmt: str) -> None:
@@ -1959,6 +2112,18 @@ class DashboardView(QWidget):
             self.update_mission_roadmap(data)
         except Exception:
             pass
+
+        # ── Sağ alt panel (Görev Detayı & TOF) ─────────────────────────────
+        # NEDEN birleşik sözlük: alt panel HEM uçuş telemetrisini (irtifa, mod)
+        # HEM TOF'u gösteriyor, ama bu ikisi YKİ'ye AYRI akışlardan geliyor —
+        # NOT (2026-09-03, denetimde bulundu): burada sağ alt panele telemetri
+        # GÖNDERİLMEZ. Önceden FC telemetrisi ~15 Hz'de, biriktirilmiş bir
+        # sözlükle panele yollanıyordu; companion akışı KESİLSE bile sözlükte
+        # kalan ESKİ TOF her tıkta yeniden gönderildiği için panelin bayatlık
+        # koruması fiilen ÖLÜYDÜ — bayat veri canlı görünüyordu.
+        # Panelin okuduğu anahtarların HEPSİ companion durum akışında
+        # (tof_distances / mission / payload_loaded / servo_state /
+        # vision_status); dolayısıyla besleme TEK yerden, update_rpi_status'tan.
 
     def add_ai_detection(self, data: dict) -> None:
         """Yeni bir yapay zekâ hedef tespit kartı ekler."""
@@ -2223,6 +2388,17 @@ class DashboardView(QWidget):
             if alt < 0.3 and not is_armed:
                 statuses[6] = "completed"
                 
+        # ── Sağ alt paneldeki görev özeti ──────────────────────────────────
+        # NEDEN burada: görev safhası ZATEN burada hesaplanıyor; alt panelde
+        # ikinci kez türetmek iki kopya (ve iki farklı doğru) demektir.
+        # NEDEN kısıtlı: bu metot ~15 Hz çağrılıyor — özet ancak safha
+        # DEĞİŞTİĞİNDE ya da en fazla yarım saniyede bir gönderilir.
+        # NOT (2026-09-03, denetimde bulundu): buradan panele gorev_guncelle
+        # GÖNDERİLMEZ. Gönderilen 9 anahtarın (adimlar/durumlar/mod/irtifa_m…)
+        # HİÇBİRİNİ panel okumuyor; panel mission/payload_loaded/servo_state/
+        # vision_status bekliyor ve bunlar companion durum sözlüğünde.
+        # Ölü yükü 15 Hz'de dolaştırmak yerine besleme update_rpi_status'a alındı.
+
         # NEDEN: update_telemetry ~15 Hz çağrılıyor ve bu döngü her seferinde
         # 7 adım × 4 setStyleSheet = 28 stylesheet parse + yeniden stil hesabı
         # yapıyordu (sürekli CPU yükü, görsel değişiklik olmasa bile). Durum
@@ -2327,6 +2503,15 @@ class DashboardView(QWidget):
                 self._tof_widget.update_tof_data(tof)
             except Exception:
                 pass
+
+        # ── SAĞ ALT PANEL — TEK BESLEME NOKTASI ──────────────────────────
+        # Panelin okuduğu anahtarların hepsi bu sözlükte: tof_distances
+        # (telemetri_guncelle) ve mission/payload_loaded/servo_state/
+        # vision_status (gorev_guncelle). TAZE `data` veriliyor, biriktirilmiş
+        # sözlük DEĞİL — panelin bayatlık saati ancak böyle doğru işler:
+        # companion susarsa buraya çağrı GELMEZ ve panel "veri bayat" der.
+        self._gorev_tof_cagir("telemetri_guncelle", data)
+        self._gorev_tof_cagir("gorev_guncelle", data)
 
         # ── Hedef tespit / yük / servo özeti ────────────────────────────────
         vis     = data.get("vision_status", {}) or {}
