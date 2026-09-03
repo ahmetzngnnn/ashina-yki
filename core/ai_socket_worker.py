@@ -240,6 +240,17 @@ class AISocketWorker(QThread):
         self._enqueue({"action": "abort"}, high_priority=True)
 
     @pyqtSlot()
+    def send_pilot_devir_onay(self) -> None:
+        """Operatörün PİLOTA DEVİR onayını araca iletir — yüksek öncelik.
+
+        NEDEN AYRI ONAY: devir hedefi LOITER'dır ve ArduCopter'da LOITER
+        PİLOT kipidir — gaz kolu doğrudan alçalma hızını sürer. Onay gelene
+        kadar araç GUIDED'da (çubuklar yok sayılır) pozisyonunu tutar; bu
+        adım pilotun bilgilendirilip gaz kolunu ORTALAMASI için vardır.
+        """
+        self._enqueue({"action": "pilot_devir_onay"}, high_priority=True)
+
+    @pyqtSlot()
     def send_drop_now(self) -> None:
         """Manuel yük bırakma (Görev 2/3 manuel mod) — yüksek öncelik."""
         self._enqueue({"action": "drop_now"}, high_priority=True)

@@ -1327,6 +1327,10 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(dict)
     def _on_rpi_status(self, data: dict) -> None:
+        # PİLOTA DEVİR: araç GUIDED'da tutunup onay bekliyor olabilir.
+        # Diğer alanlardan ÖNCE bakılır ki ayrıştırma hatası acil durumu
+        # gizlemesin.
+        self._pilot_devir_durum(bool(data.get("pilot_devir_bekleniyor")))
         # Ondalık taşmasını önle: yüzdeler tam sayı, sıcaklık tek ondalık.
         try:
             cpu = int(round(float(data.get("cpu_pct", 0.0))))
@@ -1471,6 +1475,87 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "Görev Reddedildi", f"Yardımcı bilgisayar görevi kabul etmedi:\n\n{reason}")
 
     @pyqtSlot(str, str, str)
+    def _pilot_devir_durum(self, bekliyor: bool) -> None:
+        """Araç pilota devir onayı bekliyorsa ACİL DURUM ilan eder.
+
+        NEDEN (2026-09-03 operatör kararı): görev sonunda firmware doğrudan
+        LOITER'a geçiyordu. ArduCopter'da LOITER PİLOT kipidir — gaz kolu
+        doğrudan alçalma hızını sürer (mode_loiter.cpp:96). Pilotun kolu
+        dipteyken habersiz geçiş aracı azami hızla indirir. Artık araç
+        GUIDED'da (çubuklar YOK SAYILIR) tutunuyor ve devir yalnızca buradan
+        verilen onayla yapılıyor — bu, pilotun bilgilendirilip gaz kolunu
+        ORTALAMASI için gereken zamanı yaratır.
+        """
+        onceki = getattr(self, "_pilot_devir_bekliyor", False)
+        self._pilot_devir_bekliyor = bekliyor
+
+        if bekliyor and not onceki:
+            logger.warning("PİLOTA DEVİR ONAYI BEKLENİYOR — acil durum ilan edildi")
+            self._apply_rpi_status_style("danger", bold=True)
+            self._status_label.setText(
+                "ACİL DURUM — PİLOTA DEVİR ONAYI BEKLENİYOR "
+                "(araç GUIDED'da tutunuyor, çubuklar yok sayılıyor)")
+            try:
+                self.tts_worker.speak(
+                    "Acil durum. Pilota devir onayı bekleniyor. "
+                    "Gaz kolunu ortaya alın.")
+            except Exception:
+                pass
+            try:
+                self._dashboard.add_status_message(
+                    "[DEVİR] Pilota devir onayı bekleniyor — gaz kolunu ORTAYA alın", 3)
+            except Exception:
+                pass
+            self._pilot_devir_dialog_ac()
+
+        elif not bekliyor and onceki:
+            logger.info("Pilota devir beklemesi bitti")
+            self._apply_rpi_status_style("text_muted", bold=False)
+            self._status_label.setText("Pilota devir beklemesi bitti.")
+            dlg = getattr(self, "_pilot_devir_dlg", None)
+            if dlg is not None:
+                try:
+                    dlg.close()
+                except Exception:
+                    pass
+                self._pilot_devir_dlg = None
+
+    def _pilot_devir_dialog_ac(self) -> None:
+        """Onay penceresini açar. MODAL DEĞİL: iptal/acil düğmeleri erişilebilir
+        kalmalı; pencere durum düzelince kendiliğinden kapanır."""
+        from PyQt6.QtWidgets import QMessageBox
+        if getattr(self, "_pilot_devir_dlg", None) is not None:
+            return
+        dlg = QMessageBox(self)
+        dlg.setIcon(QMessageBox.Icon.Warning)
+        dlg.setWindowTitle("ACİL DURUM — PİLOTA DEVİR ONAYI")
+        dlg.setText("Görev bitti. Araç GUIDED'da pozisyonunu tutuyor.")
+        dlg.setInformativeText(
+            "Şu anda kumanda çubukları YOK SAYILIYOR.\n\n"
+            "ONAY VERİLDİĞİNDE araç LOITER'a geçer ve gaz kolu ANINDA "
+            "alçalma hızını sürmeye başlar — kol dipteyse araç iner.\n\n"
+            "1) Pilot hazır mı?\n"
+            "2) GAZ KOLU ORTADA mı?\n\n"
+            "İkisi de evetse 'PİLOTA DEVRET'e basın."
+        )
+        onay = dlg.addButton("PİLOTA DEVRET", QMessageBox.ButtonRole.AcceptRole)
+        dlg.addButton("Bekle", QMessageBox.ButtonRole.RejectRole)
+        dlg.setModal(False)
+
+        def _bitti(_btn=None):
+            if dlg.clickedButton() is onay:
+                logger.warning("Operatör PİLOTA DEVİR onayı verdi")
+                try:
+                    self.ai_worker.send_pilot_devir_onay()
+                except Exception:
+                    logger.exception("Devir onayı gönderilemedi")
+            self._pilot_devir_dlg = None
+
+        dlg.finished.connect(_bitti)
+        self._pilot_devir_dlg = dlg
+        dlg.show()
+        dlg.raise_()
+
     def _on_health_alert(self, subsystem: str, level: str, message: str) -> None:
         """Companion'dan gelen FAILED/CRITICAL failsafe uyarısı."""
         from PyQt6.QtWidgets import QMessageBox
