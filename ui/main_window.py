@@ -606,6 +606,11 @@ class MainWindow(QMainWindow):
         # TEK parametre okuyan bir slot yok (yalnız tam liste) — bu yüzden
         # istek de tam liste isteğidir; paneller bunu kullanıcıya yazıyor.
         self._calib_view.request_params.connect(w.request_parameters)
+        # Eksik parametre tamamlama: FC'nin bildirdiği sıra no/toplam depoya
+        # akar, eksikler tek tek yeniden istenir (RFD900A'da liste hep
+        # eksik kalıyordu; ArduPilot kayıp paketi tekrarlamaz).
+        w.param_ilerleme.connect(self._calib_view.on_param_ilerleme)
+        self._calib_view.request_param_index.connect(w.request_param_index)
         self._tuning_view.send_command.connect(w.send_command)
         self._tuning_view.set_param.connect(w.set_param)
         self._advanced_view.set_param.connect(w.set_param)

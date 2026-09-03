@@ -140,6 +140,13 @@ class MavlinkWorker(QThread):
     # ve bunu 1 Hz ile TEKRARLAR — tek atışlık STATUSTEXT'in aksine
     # kaybolmaz. Mission Planner'ın kullandığı kanal budur.
     accelcal_pos_received = pyqtSignal(int)   # 1..6 | 16777215 | 16777216
+    # NEDEN (2026-09-03): param_received yalnız (ad, değer) taşıyordu; SIRA NO ve
+    # TOPLAM arayüze hiç ulaşmıyordu. Bu yüzden ParamDeposu indirmenin bittiğini
+    # 3 sn'lik SESSİZLİK tahminiyle karar veriyordu — RFD900A'da (57600 baud)
+    # akış ortasında 3 sn boşluk olağan, indirme YARIDA 'bitti' sayılıyordu.
+    # Üstelik kayıp PARAM_VALUE'lar hiç yeniden istenmiyordu; ArduPilot
+    # kaybolan paketi KENDİLİĞİNDEN TEKRARLAMAZ, GCS tek tek sormak zorundadır.
+    param_ilerleme = pyqtSignal(int, int)   # param_index, param_count
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -714,7 +721,11 @@ class MavlinkWorker(QThread):
                 p_name  = msg.param_id.rstrip("\x00") if isinstance(msg.param_id, str) else msg.param_id
                 p_value = float(msg.param_value)
                 p_count = int(getattr(msg, "param_count", 0))
+                p_index = int(getattr(msg, "param_index", -1))
                 self.param_received.emit(p_name, p_value)
+                # Sıra no + toplam: eksik parametrelerin TEK TEK yeniden
+                # istenebilmesi için şart (bkz. param_ilerleme NEDEN notu).
+                self.param_ilerleme.emit(p_index, p_count)
                 # Cache: tüm parametreler gelince toplu DB yazımı
                 self._param_cache[p_name] = p_value
                 if p_count > 0:
@@ -998,6 +1009,27 @@ class MavlinkWorker(QThread):
     @pyqtSlot()
     def request_parameters(self) -> None:
         self._enqueue_action(self._do_request_parameters)
+
+    @pyqtSlot(int)
+    def request_param_index(self, index: int) -> None:
+        """TEK parametreyi SIRA NUMARASIYLA ister (eksik tamamlama).
+
+        NEDEN index ile: kayıp paketin ADINI bilmiyoruz — bilseydik zaten
+        elimizde olurdu. MAVLink PARAM_REQUEST_READ, param_id boş ve
+        param_index >= 0 verildiğinde sırayla sorar.
+        """
+        self._enqueue_action(lambda: self._do_request_param_index(int(index)))
+
+    def _do_request_param_index(self, index: int) -> None:
+        if self._mav is None:
+            return
+        try:
+            self._mav.mav.param_request_read_send(
+                self._mav.target_system, self._mav.target_component,
+                b"", int(index),
+            )
+        except Exception as exc:
+            logger.error("Parametre #%d istenemedi: %s", index, exc)
 
     def _do_request_parameters(self) -> None:
         if self._mav is None:

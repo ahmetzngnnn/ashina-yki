@@ -299,22 +299,57 @@ class ParamDeposu(QObject):
     # Yeni parametre gelmeden geçen bu süre sonunda indirme bitmiş sayılır.
     SESSIZLIK_S = 3.0
 
+    # Eksik parametreler tek tek yeniden istenirken bir turda kaç istek
+    # gönderileceği. RFD900A dar bir hat; hepsini birden sormak linki boğar.
+    TUR_BASINA_ISTEK = 20
+    # Art arda bu kadar tur HİÇ yeni parametre gelmezse durulur. ZAMAN
+    # AŞIMI DEĞİL: ilerleme oldukça sonsuza kadar sürer.
+    ILERLEMESIZ_TUR_SINIRI = 6
+
     def __init__(
         self,
         istek_gonder: Callable[[], None],
         istek_yolu_denetle: Callable[[], bool],
         parent: Optional[QObject] = None,
+        tek_param_iste: Optional[Callable[[int], None]] = None,
     ) -> None:
         super().__init__(parent)
         self._istek_gonder = istek_gonder
         self._istek_yolu_denetle = istek_yolu_denetle
+        # Eksik tamamlama yolu. Verilmezse eski davranış (yalnız sessizlik).
+        self._tek_param_iste = tek_param_iste
         self.degerler: dict[str, float] = {}
         self._indiriyor = False
         self._son_paket_ts = 0.0
         self._indirme_baslangic_adet = 0
+        # ── Eksik takibi (2026-09-03) ────────────────────────────────────
+        # FC'nin bildirdiği TOPLAM ve gelen SIRA NUMARALARI. Bunlar olmadan
+        # indirmenin bittiği yalnızca TAHMİN edilebiliyordu.
+        self._toplam = 0
+        self._gelen_idx: set[int] = set()
+        self._ilerlemesiz_tur = 0
+        self._son_gelen_adet = 0
         self._zamanlayici = QTimer(self)
         self._zamanlayici.setInterval(500)
         self._zamanlayici.timeout.connect(self._sessizlik_denetle)
+
+    # ── İlerleme (mavlink_worker.param_ilerleme'den) ─────────────────────
+    def ilerleme_geldi(self, index: int, toplam: int) -> None:
+        """PARAM_VALUE'nun sıra no + toplam alanları.
+
+        NEDEN: ArduPilot kaybolan PARAM_VALUE'yu KENDİLİĞİNDEN TEKRARLAMAZ.
+        Hangi sıraların geldiğini bilmeden hangilerinin eksik olduğu
+        bilinemez, dolayısıyla tamamlanamaz.
+        """
+        if toplam and toplam > 0:
+            self._toplam = int(toplam)
+        if index is not None and index >= 0:
+            self._gelen_idx.add(int(index))
+
+    def eksik_sayisi(self) -> int:
+        if self._toplam <= 0:
+            return 0
+        return max(0, self._toplam - len(self._gelen_idx))
 
     # ── Okuma ────────────────────────────────────────────────────────────
     def get(self, ad: str) -> Optional[float]:
@@ -355,6 +390,11 @@ class ParamDeposu(QObject):
         self._indiriyor = True
         self._indirme_baslangic_adet = len(self.degerler)
         self._son_paket_ts = time.monotonic()
+        # Yeni indirme: eksik takibi sıfırdan başlar.
+        self._toplam = 0
+        self._gelen_idx = set()
+        self._ilerlemesiz_tur = 0
+        self._son_gelen_adet = 0
         self._zamanlayici.start()
         self.durum.emit("İndiriliyor… (tam parametre listesi — telemetri "
                         "linkinde dakikalar sürebilir)")
@@ -378,18 +418,70 @@ class ParamDeposu(QObject):
         self.indirme_bitti.emit(len(self.degerler))
 
     def _sessizlik_denetle(self) -> None:
+        """Akış durunca EKSİKLERİ TAMAMLAR; zaman aşımıyla pes ETMEZ.
+
+        NEDEN DEĞİŞTİ (2026-09-03): eskiden 3 sn yeni paket gelmezse indirme
+        "bitti" sayılıyordu. RFD900A'da (57600 baud) akış ortasında 3 sn
+        boşluk olağan olduğu için liste YARIDA bitmiş sayılıyor, üstelik
+        kaybolan PARAM_VALUE'lar hiç yeniden istenmiyordu — ArduPilot onları
+        KENDİLİĞİNDEN TEKRARLAMAZ. Artık FC'nin bildirdiği TOPLAM ile gelen
+        SIRA NUMARALARI karşılaştırılıp eksikler tek tek yeniden isteniyor.
+        Durma ölçütü süre değil, İLERLEMENİN DURMASI.
+        """
         if not self._indiriyor:
             self._zamanlayici.stop()
             return
         if time.monotonic() - self._son_paket_ts < self.SESSIZLIK_S:
             return
+
+        # Toplam bilinmiyorsa (eski FC / param_count gelmiyorsa) eski
+        # gözleme dayalı ölçüte düş.
+        if self._toplam <= 0 or self._tek_param_iste is None:
+            self._bitir("toplam bilinmiyor — sessizlik ölçütü kullanıldı")
+            return
+
+        eksik = [i for i in range(self._toplam) if i not in self._gelen_idx]
+        if not eksik:
+            self._bitir("TAMAM — eksik yok")
+            return
+
+        # İlerleme var mı?
+        if len(self._gelen_idx) > self._son_gelen_adet:
+            self._ilerlemesiz_tur = 0
+            self._son_gelen_adet = len(self._gelen_idx)
+        else:
+            self._ilerlemesiz_tur += 1
+
+        if self._ilerlemesiz_tur >= self.ILERLEMESIZ_TUR_SINIRI:
+            self._bitir(
+                f"{len(eksik)} parametre alınamadı "
+                f"({self.ILERLEMESIZ_TUR_SINIRI} turdur ilerleme yok)")
+            return
+
+        # Eksikleri tur tur yeniden iste (linki boğmadan).
+        istenecek = eksik[: self.TUR_BASINA_ISTEK]
+        for idx in istenecek:
+            try:
+                self._tek_param_iste(idx)
+            except Exception:
+                logger.exception("Eksik parametre #%d istenemedi", idx)
+        self._son_paket_ts = time.monotonic()   # yanıt için yeni pencere
+        self.durum.emit(
+            f"Eksik tamamlanıyor… {len(self._gelen_idx)}/{self._toplam} alındı, "
+            f"{len(eksik)} eksik ({len(istenecek)} tanesi yeniden istendi)")
+
+    def _bitir(self, neden: str) -> None:
         self._indiriyor = False
         self._zamanlayici.stop()
         yeni = len(self.degerler) - self._indirme_baslangic_adet
-        self.durum.emit(
-            f"İndirme bitti — toplam {len(self.degerler)} parametre "
-            f"({yeni} yeni). {self.SESSIZLIK_S:.0f} s'dir yeni paket gelmedi."
-        )
+        if self._toplam > 0:
+            self.durum.emit(
+                f"İndirme bitti — {len(self._gelen_idx)}/{self._toplam} "
+                f"parametre ({yeni} yeni). {neden}")
+        else:
+            self.durum.emit(
+                f"İndirme bitti — toplam {len(self.degerler)} parametre "
+                f"({yeni} yeni). {neden}")
         self.indirme_bitti.emit(len(self.degerler))
 
 

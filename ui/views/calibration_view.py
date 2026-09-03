@@ -506,6 +506,10 @@ class CalibrationView(QWidget):
     # bir slot YOK (yalnız request_parameters = TÜM liste), bu yüzden istek de
     # tam liste isteğidir. main_window bunu w.request_parameters'a bağlar.
     request_params = pyqtSignal()
+    # Eksik parametreleri TEK TEK yeniden istemek için (sıra numarasıyla).
+    # NEDEN: ArduPilot kaybolan PARAM_VALUE'yu kendiliğinden TEKRARLAMAZ;
+    # RFD900A üzerinde tam liste hep eksik kalıyordu.
+    request_param_index = pyqtSignal(int)
 
     # FC STATUSTEXT anahtar kelimeleri (ArduPilot ivmeölçer kalibrasyon akışı)
     _ST_PROMPT = ("place vehicle", "press any key", "place aircraft")
@@ -578,6 +582,7 @@ class CalibrationView(QWidget):
             istek_gonder=self.request_params.emit,
             istek_yolu_denetle=lambda: self._signal_connected(self.request_params),
             parent=self,
+            tek_param_iste=self.request_param_index.emit,
         )
         # Radyo kalibrasyonu yazmalarını GERİ OKUYARAK doğrulayan yazıcı.
         # NEDEN: PARAM_SET'in MAVLink'te ACK'i yoktur; eski kod RCn_MIN/MAX'i
@@ -785,6 +790,11 @@ class CalibrationView(QWidget):
     # ALT PANELLERE DAĞITIM — main_window yalnızca bu sınıfa bağlanır
     # ──────────────────────────────────────────────────────────────
     @pyqtSlot(str, float)
+    @pyqtSlot(int, int)
+    def on_param_ilerleme(self, index: int, toplam: int) -> None:
+        """PARAM_VALUE sıra no + toplam → depo eksik takibi."""
+        self._depo.ilerleme_geldi(index, toplam)
+
     def on_param_received(self, ad: str, deger: float) -> None:
         """mavlink_worker.param_received → paylaşılan parametre deposu.
 
