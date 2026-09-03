@@ -1313,10 +1313,15 @@ class DashboardView(QWidget):
         self._guided_ctrl.send_yaw.connect(self._on_guided_yaw)
         msg_tabs.addTab(self._guided_ctrl, "Guided")
 
-        # Sekme 4: TOF (Durum Makinesi)
-        if TofWidget:
-            self._tof_widget = TofWidget()
-            msg_tabs.addTab(self._tof_widget, "TOF")
+        # SOL ALT "TOF" SEKMESİ KALDIRILDI (operatör talebi 2026-09-03):
+        # TOF halkası artık sağ sütunun alt panelinde (GorevTofPanel) ve orada
+        # kendi TofWidget'ı var — soldaki İKİNCİ kopyaydı, aynı veriyi iki
+        # yerde göstermek ekranı kalabalıklaştırıyordu.
+        # NEDEN widget TAMAMEN silindi (gizlenmedi): ebeveynsiz bırakılan bir
+        # QWidget _build_ui biter bitmez çöp toplanır ve C++ nesnesi ölür —
+        # bu depoda aynı hata road_tab ve ai_tab'da iki kez yaşandı. Besleyen
+        # kod da (update_rpi_status içindeki _tof_widget bloğu) kaldırıldı,
+        # yoksa ölü nesneye yazan üçüncü bir yol kalırdı.
 
         ll.addWidget(msg_tabs, stretch=1)
 
@@ -1359,8 +1364,10 @@ class DashboardView(QWidget):
         self._video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._video_label.setObjectName("mutedLabel")   # statik renk → QSS class
         vfl.addWidget(self._video_label, stretch=1)
-        # (cl.addWidget(vframe, ...) BİLEREK burada değil — servo grubundan
-        #  sonra, merkez sütunun en altında yapılır.)
+        # Video HUD'un HEMEN ALTINDA — ESKİ KONUM (operatör talebi 2026-09-03).
+        # 2026-09-02'de kamera en alta, servo düğmeleri ufkun altına alınmıştı;
+        # operatör eski dizilimi geri istedi. Sıra yine HUD → KAMERA → servo.
+        cl.addWidget(vframe, stretch=3)
 
         # ── Otonom Yük & Servo (Sonsuz Derece Premium Grid Düzen) ──────────────────────
         servo_grp = QFrame()
@@ -1553,16 +1560,13 @@ class DashboardView(QWidget):
         servo_lay.setColumnStretch(1, 4)
         servo_lay.setColumnStretch(2, 4)
         
-        # ── Merkez sütun dizilimi: HUD → servo düğmeleri → KAMERA ──────────
-        # NEDEN servo ufkun hemen altında: yük bırakma/grabber düğmeleri
-        # operatörün ufka bakarken göz kaydırmadan ulaşacağı yerde olmalı;
-        # kamera ise görev sırasında sürekli izlenen büyük alan olarak en altta
-        # panelleşir (operatör talebi 2026-09-02).
-        # NEDEN stretch 2/3 korundu: servo grubu zaten sabit yükseklikte
-        # (stretch=0), esnek alanın paylaşımı değişmedi — kamera hâlâ en büyük
-        # bölge (%60), HUD okunabilir kalıyor. Sıra değişti, oran değişmedi.
+        # ── Merkez sütun dizilimi: HUD → KAMERA → manuel tetiklemeler ─────
+        # ESKİ DİZİLİM GERİ ALINDI (operatör talebi 2026-09-03). 09-02'de
+        # servo/manuel tetikleme grubu ufkun hemen altına, kamera en alta
+        # taşınmıştı; operatör eski yerleşimi geri istedi.
+        # Oranlar değişmedi (HUD 2 / kamera 3, servo sabit yükseklik=0),
+        # yalnız SIRA eski hâline döndü.
         cl.addWidget(servo_grp, stretch=0)
-        cl.addWidget(vframe, stretch=3)
 
         # Kolon oranı: GÖREV İZLEME (PFD + video + yük paneli) haritadan belirgin
         # şekilde geniş olmalı — operatör uçuşu buradan takip eder. Minimum genişlik
@@ -2495,13 +2499,9 @@ class DashboardView(QWidget):
         except Exception:
             pass
 
-        # ── TOF widget'ı besle (Görev 3 yük alma görselleştirmesi) ──────────
-        tof = data.get("tof_distances", {})
-        if tof and getattr(self, "_tof_widget", None) is not None:
-            try:
-                self._tof_widget.update_tof_data(tof)
-            except Exception:
-                pass
+        # (Sol alt TOF widget'ı 2026-09-03'te kaldırıldı — besleme de kalktı.
+        #  TOF artık yalnız sağ alt paneldeki GorevTofPanel'den gösteriliyor,
+        #  o da aşağıdaki TEK BESLEME NOKTASI'ndan besleniyor.)
 
         # ── SAĞ ALT PANEL — TEK BESLEME NOKTASI ──────────────────────────
         # Panelin okuduğu anahtarların hepsi bu sözlükte: tof_distances
