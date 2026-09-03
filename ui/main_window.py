@@ -576,6 +576,10 @@ class MainWindow(QMainWindow):
         # gönderildi, FC tek STATUSTEXT döndürmedi; komutun reddedilip
         # edilmediğini görmek İMKÂNSIZDI. Bu bağlantı olmadan panel yine kör.
         w.command_ack_received.connect(self._calib_view.on_command_ack)
+        # ArduPilot ivmeölçer kalibrasyonunun GERÇEK kanalı: araç ilk konum
+        # komutundan sonra STATUSTEXT istemi göndermeyi bırakır (snoop kapanır)
+        # ve konumu/sonucu COMMAND_LONG(42429) ile 1 Hz tekrarlar.
+        w.accelcal_pos_received.connect(self._calib_view.on_accelcal_pos)
         # AutoTune paneli: eksen maskesi/agresiflik FC'ye YAZILIR ve FC'nin
         # gerçek değerleri geri okunur; AUTOTUNE ilerlemesi STATUSTEXT'ten gelir.
         w.connection_changed.connect(self._autotune_view.on_connection_changed)

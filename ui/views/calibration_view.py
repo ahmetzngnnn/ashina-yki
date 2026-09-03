@@ -540,6 +540,8 @@ class CalibrationView(QWidget):
         # bu durum bayrakları olmadan "tamamlandı" iddiası doğrulanamıyordu.
         self._accel_active = False
         self._accel_awaiting_fc = False
+        # FC sonucu 1 Hz TEKRARLANIR; aynı sonucu defalarca işlemeyelim.
+        self._accel_sonuc_islendi = False
         # FC onayı hiç gelmezse UI sonsuza dek kilitli kalmasın diye emniyet sayacı
         self._accel_ack_timer = QTimer(self)
         self._accel_ack_timer.setSingleShot(True)
@@ -1004,6 +1006,7 @@ class CalibrationView(QWidget):
         )
         self._accel_step = 0
         self._accel_active = True
+        self._accel_sonuc_islendi = False
         self._accel_awaiting_fc = False
         self._accel_progress.setValue(1)
         self._btn_accel_next.setEnabled(True)
@@ -1215,6 +1218,69 @@ class CalibrationView(QWidget):
                 "güvenlik anahtarının basılı olmadığından emin olup tekrar deneyin."
             )
             self._accel_step_style("danger")
+
+    _ACCELCAL_BASARILI = 16777215
+    _ACCELCAL_BASARISIZ = 16777216
+    _ACCELCAL_KONUM_ADI = {
+        1: "DÜZ/YATAY", 2: "SOL YANA", 3: "SAĞ YANA",
+        4: "BURUN AŞAĞI", 5: "BURUN YUKARI", 6: "SIRTÜSTÜ",
+    }
+
+    @pyqtSlot(int)
+    def on_accelcal_pos(self, poz: int) -> None:
+        """Aracın ivmeölçer kalibrasyonu konum/sonuç kanalı (COMMAND_LONG 42429).
+
+        NEDEN ASIL KANAL BU (ArduPilot kaynağından doğrulandı, 2026-09-03):
+        AP_AccelCal.cpp:402 gcs_vehicle_position() ilk ACCELCAL_VEHICLE_POS
+        komutunda _use_gcs_snoop=false yapar — yani "Place vehicle ... and
+        press any key." STATUSTEXT istemleri İLK ADIMDAN SONRA HİÇ GELMEZ.
+        Panel yalnız STATUSTEXT dinlediği sürece 2..6. adımlarda FC'den asla
+        onay göremezdi. Araç bunun yerine GCS'e COMMAND_LONG(42429) yollar ve
+        1 Hz TEKRARLAR (GCS_Common.cpp:3441, AP_AccelCal.cpp:113-116,166-183).
+
+        TUZAK: sonuç tekrarı, BİR ÖNCEKİ kalibrasyondan kalmış olabilir
+        (_last_result yalnız start()/cancel() ile sıfırlanır). Bu yüzden
+        sonuç YALNIZCA bu panel bir kalibrasyon başlattıysa kabul edilir.
+        """
+        if not self._accel_active:
+            return
+
+        if poz == self._ACCELCAL_BASARILI:
+            if self._accel_sonuc_islendi:
+                return
+            self._accel_sonuc_islendi = True
+            self._accel_finish(True, "FC: kalibrasyon BAŞARILI (ACCELCAL_VEHICLE_POS)")
+            return
+        if poz == self._ACCELCAL_BASARISIZ:
+            if self._accel_sonuc_islendi:
+                return
+            self._accel_sonuc_islendi = True
+            self._accel_finish(False, "FC: kalibrasyon BAŞARISIZ (ACCELCAL_VEHICLE_POS)")
+            return
+
+        if not 1 <= poz <= 6:
+            return
+        # FC bu konumu BEKLİYOR demektir → operatör aracı oraya koyup
+        # 'Sonraki'ye basacak. Adım sayacını FC'ye göre hizala; panelin kendi
+        # sayması ile FC'nin beklediği konum ayrışırsa FC kazanır.
+        self._accel_ack_timer.stop()
+        self._accel_awaiting_fc = False
+        self._accel_step = poz - 1
+        self._accel_progress.setValue(poz)
+        self._model3d_poz(self._accel_step)
+        if self._accel_step < len(_ACCEL_STEPS):
+            _view, msg = _ACCEL_STEPS[self._accel_step]
+            r, p, y = self._ACCEL_ATT.get(_view, (0, 0, 0))
+            self._accel_drone.set_target_attitude(r, p, y)
+            self._accel_step_lbl.setText(
+                msg + "\n(FC bu konumu BEKLİYOR — yerleştirip 'Sonraki'ye basın)")
+        else:
+            self._accel_step_lbl.setText(
+                f"FC {poz}. konumu bekliyor — yerleştirip 'Sonraki'ye basın.")
+        self._accel_step_style("warning")
+        self._btn_accel_next.setEnabled(True)
+        self._accel_log.append(
+            f"[FC İSTER] {poz}. konum: {self._ACCELCAL_KONUM_ADI.get(poz, '?')}")
 
     # ──────────────────────────────────────────────────────────────
     # PUSULA

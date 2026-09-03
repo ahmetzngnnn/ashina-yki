@@ -52,6 +52,16 @@ _MAV_RESULT_ADLARI = {
 # Ret sayılan sonuçlar — 0 (kabul) ve 5 (sürüyor) dışındaki her şey.
 _MAV_RESULT_RET = (1, 2, 3, 4, 6)
 
+# ArduPilot ivmeölçer kalibrasyonu — araçtan GCS'e gelen konum/sonuç kanalı.
+_CMD_ACCELCAL_VEHICLE_POS = 42429
+_ACCELCAL_POS_BASARILI = 16777215
+_ACCELCAL_POS_BASARISIZ = 16777216
+_ACCELCAL_POS_ADLARI = {
+    1: "düz/yatay", 2: "sol yan", 3: "sağ yan", 4: "burun aşağı",
+    5: "burun yukarı", 6: "sırtüstü",
+    16777215: "BAŞARILI", 16777216: "BAŞARISIZ",
+}
+
 # ── Telemetri akış aralıkları (µs) — mesaj_id → aralık ────────────────────────
 # Radyo (telemetri COM, ~57600 baud) bant genişliğine uygun seçildi. Eskiden
 # REQUEST_DATA_STREAM(ALL@4Hz) + yüksek SET_MESSAGE_INTERVAL birlikte radyoyu
@@ -120,6 +130,16 @@ class MavlinkWorker(QThread):
     # döndürmedi. Komut kabul mü edildi red mi — COMMAND_ACK okunmadığı için
     # YKİ'nin bunu bilmesi İMKÂNSIZDI; panel sessizliği 'devam' sandı.
     command_ack_received = pyqtSignal(int, int)   # command_id, MAV_RESULT
+    # NEDEN AYRI SİNYAL (2026-09-03, ArduPilot kaynağından doğrulandı):
+    # ArduPilot 6-konum ivmeölçer kalibrasyonunda GCS'e STATUSTEXT ile
+    # konuşmayı BIRAKIR. AP_AccelCal.cpp:402 gcs_vehicle_position() ilk
+    # ACCELCAL_VEHICLE_POS komutunda _use_gcs_snoop=false yapar; ondan
+    # sonra 'Place vehicle ...' istemleri ARTIK GÖNDERİLMEZ. Araç bunun
+    # yerine GCS'e COMMAND_LONG(42429) yollar (GCS_Common.cpp:3441):
+    #   param1 = 1..6 beklenen konum, 16777215 BAŞARILI, 16777216 BAŞARISIZ
+    # ve bunu 1 Hz ile TEKRARLAR — tek atışlık STATUSTEXT'in aksine
+    # kaybolmaz. Mission Planner'ın kullandığı kanal budur.
+    accelcal_pos_received = pyqtSignal(int)   # 1..6 | 16777215 | 16777216
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -565,6 +585,14 @@ class MavlinkWorker(QThread):
                             msg.eph, msg.epv)
             elif msg_type == "EKF_STATUS_REPORT":
                 self._telemetry_accumulator["ekf_flags"] = msg.flags
+            elif msg_type == "COMMAND_LONG":
+                # Araç → GCS yönünde gelen TEK komut bu; başka bir
+                # COMMAND_LONG beklenmiyor, o yüzden dar süzgeç.
+                if int(getattr(msg, "command", -1)) == _CMD_ACCELCAL_VEHICLE_POS:
+                    _poz = int(getattr(msg, "param1", 0))
+                    logger.info("ACCELCAL_POS: %d (%s)", _poz,
+                                _ACCELCAL_POS_ADLARI.get(_poz, "konum"))
+                    self.accelcal_pos_received.emit(_poz)
             elif msg_type == "COMMAND_ACK":
                 _ack_cmd = int(getattr(msg, "command", -1))
                 _ack_res = int(getattr(msg, "result", -1))
