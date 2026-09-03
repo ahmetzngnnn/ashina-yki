@@ -15,6 +15,15 @@ CHUNK_SIZE = 512
 
 
 _GGA_RESEND_INTERVAL_S = 30.0   # Mission Planner CommsNTRIP.cs ile AYNI (kullanıcı talebi — "aynı mantıkla çalışsın")
+
+# NTRIP başlık okuma bütçesi (2026-09-03, denetimde bulundu — YÜKSEK):
+# eski kod bu süreyi HİÇ sınırlamıyordu, yalnız TEK bir recv()'i sock.settimeout(15)
+# ile sınırlıyordu. Karşı taraf ara sıra 1 bayt damlatıp \r\n\r\n'i HİÇ
+# göndermezse recv() her seferinde "başarıyla" döner, döngü isInterruptionRequested()'i
+# HİÇ kontrol etmediği için SONSUZA KADAR sürer — stop()'un süresiz wait()'i ile
+# birleşince YKİ kapanışı tamamen kilitleniyordu (deneyle üretildi).
+_NTRIP_BASLIK_BUDGET_S = 15.0
+_NTRIP_BASLIK_MAX_BAYT = 8192   # kardeş worker'ların _MAX_RESPONSE_BUF deseniyle aynı
 _RESYNC_MAX_BUF = 4096  # senkron kaybında tampon büyümesi için güvenlik payı
 
 
@@ -190,12 +199,40 @@ class NtripWorker(QThread):
         # YANLIŞLIKLA başarı sanıyordu (2026-08-28, sahada TUSAGA-Aktif ile
         # yakalandı: yanlış mountpoint adı "200 OK" içerdiği için "bağlandı"
         # loglandı ama hiç RTCM gelmedi).
+        #
+        # BAŞLIK OKUMA — SINIRLANDIRILDI (2026-09-03, denetimde bulundu —
+        # YÜKSEK): eski döngü ne toplam süreye ne isInterruptionRequested()'e
+        # bakıyordu; sock.settimeout(15) yalnız TEK recv()'i sınırlıyordu.
+        # Karşı taraf \r\n\r\n'i HİÇ göndermeden ara sıra bayt akıtırsa
+        # (captive portal / bozuk proxy) recv() hep "başarıyla" dönüp döngü
+        # SONSUZA KADAR sürüyordu — stop()'un (aşağıda düzeltilen) süresiz
+        # wait()'iyle birleşince YKİ kapanışı TAMAMEN kilitleniyordu.
+        # DENEYLE ÜRETİLDİ: sahte caster \r\n\r\n'i asla göndermeyince
+        # stop() 30 saniyede bile dönmedi (worker hâlâ çalışıyordu).
+        # Artık: kısa recv dilimi (kesme bayrağı sık kontrol edilsin),
+        # toplam bütçe (_NTRIP_BASLIK_BUDGET_S), tampon tavanı (kardeş
+        # worker'ların _MAX_RESPONSE_BUF deseniyle aynı).
+        sock.settimeout(1.0)
+        _baslik_bitis = time.monotonic() + _NTRIP_BASLIK_BUDGET_S
         response_buf = b""
         while b"\r\n\r\n" not in response_buf:
-            chunk = sock.recv(256)
+            if self.isInterruptionRequested():
+                raise InterruptedError("NTRIP başlık okuma kesildi (stop() istendi)")
+            if time.monotonic() > _baslik_bitis:
+                raise ConnectionError(
+                    f"NTRIP sunucu başlığı {_NTRIP_BASLIK_BUDGET_S:.0f} s içinde "
+                    "tamamlanmadı")
+            if len(response_buf) > _NTRIP_BASLIK_MAX_BAYT:
+                raise ConnectionError("NTRIP sunucu başlığı çok büyük — "
+                                      "bozuk/kötücül yanıt olabilir")
+            try:
+                chunk = sock.recv(256)
+            except socket.timeout:
+                continue
             if not chunk:
                 raise ConnectionError("NTRIP sunucu yanıtı alınamadı")
             response_buf += chunk
+        sock.settimeout(15)   # geri: aşağıdaki GGA gönderimi eski davranışla aynı
 
         header_bytes, _, leftover = response_buf.partition(b"\r\n\r\n")
         header = header_bytes.decode(errors="replace")
@@ -243,5 +280,16 @@ class NtripWorker(QThread):
             sock.close()
 
     def stop(self) -> None:
+        # SÜRESİZ wait() KALDIRILDI (2026-09-03, denetimde bulundu — YÜKSEK):
+        # kardeş worker'ların hepsi sınırlı bekliyor (mavlink_worker.wait(5000),
+        # rpi_status_worker/video_stream_worker/rtk_gps_worker.wait(3000));
+        # ntrip_worker TEK argümansız olanıydı. main_window bunu closeEvent
+        # ve "NTRIP Durdur" düğmesinden GUI THREAD'İNDEN çağırıyor — worker
+        # başlık okuma döngüsünde (yukarıda düzeltildi) ya da bağlanma
+        # aşamasında takılırsa uygulama SÜRESİZ donuyordu.
+        # 5000 ms: başlık döngüsü artık en geç _NTRIP_BASLIK_BUDGET_S (15 s)
+        # içinde kesme bayrağını görür ve genelde çok daha hızlı (kısa recv
+        # dilimi) çıkar; 5 s "en azından donmuş görünmesin, devam et" bandıdır
+        # — kardeş worker'ların "donmuşsa devam et" felsefesiyle aynı.
         self.requestInterruption()
-        self.wait()
+        self.wait(5000)
