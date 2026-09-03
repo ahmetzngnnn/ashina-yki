@@ -101,6 +101,17 @@ VARSAYILAN_BEKLENEN: list[tuple[str, float, str, str]] = [
      "kopunca araç 20 m'de GUIDED'da asılı kaldı; 1 = RTL bunu önler. "
      "GERÇEK LOGDA 0 ÇIKMIŞTI — sahada mutlaka doğrulayın."),
     ("FS_GCS_TIMEOUT",  5,     SINIF_SARTNAME, "GCS failsafe tetikleme süresi (s)."),
+    ("FLTMODE1",        2,     SINIF_KRITIK,
+     "ALT_HOLD. Operatör kararı 2026-09-03: AUTO anahtardan KALDIRILDI. "
+     "Gerekçe: FC'de artık kalmış, ilk satırı TAKEOFF olan bir görev vardı; "
+     "AUTO'da arm edilince ArduCopter onu BAŞLATIYOR ve 'Mission: 1 Takeoff' "
+     "basıyordu (logda 18:47/20:37/20:40)."),
+    ("FLTMODE2",        5,     SINIF_KRITIK,
+     "LOITER — pilotun devralma kipi. DİKKAT: LOITER'da gaz kolu alçalma "
+     "hızını sürer; devralırken kol ORTADA olmalı."),
+    ("FLTMODE3",        9,     SINIF_KRITIK,
+     "LAND. Yarışma görevi FC'nin AUTO'sunu kullanmaz (GUIDED ile uçar), "
+     "bu yüzden AUTO'nun anahtarda olmasına gerek yoktur."),
     ("BATT_MONITOR",    4,     SINIF_KRITIK,
      "4 = analog gerilim + akım. Akım okunmazsa harcanan mAh sayılamaz ve "
      "yüzde tabanlı emniyet anlamsızlaşır."),
