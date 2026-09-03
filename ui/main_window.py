@@ -35,6 +35,7 @@ from ui.views.tuning_view import TuningView
 from ui.views.advanced_view import AdvancedView
 from ui.views.system_log_view import SystemLogView
 from ui.views.flight_analysis_view import FlightAnalysisView
+from ui.views.autotune_view import AutoTuneView
 from ui.views.settings_view import SettingsView
 from ui.views.iha_test_panel_view import IHATestPanelView
 from ui.views.saha_testi_view import SahaTestiView
@@ -384,6 +385,7 @@ class MainWindow(QMainWindow):
         self._syslog_view    = SystemLogView(self._db_conn)
         self._flight_analysis_view = FlightAnalysisView(self._db_conn)
         self._settings_view  = SettingsView()
+        self._autotune_view  = AutoTuneView()
 
         self._tabs.addTab(self._dashboard,      "Dashboard")
         self._tabs.addTab(self._mission_view,   "Görev Planlama")
@@ -396,6 +398,7 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._advanced_view,  "Gelişmiş")
         self._tabs.addTab(self._syslog_view,    "Sistem/Log")
         self._tabs.addTab(self._flight_analysis_view, "Kayıtlar")
+        self._tabs.addTab(self._autotune_view,  "AutoTune")
         self._tabs.addTab(self._settings_view,  "Ayarlar")
 
         # GÜVENLİK: Kalibrasyon sekmesinden çıkılırken motor testi DURDURULUR.
@@ -573,6 +576,14 @@ class MainWindow(QMainWindow):
         # gönderildi, FC tek STATUSTEXT döndürmedi; komutun reddedilip
         # edilmediğini görmek İMKÂNSIZDI. Bu bağlantı olmadan panel yine kör.
         w.command_ack_received.connect(self._calib_view.on_command_ack)
+        # AutoTune paneli: eksen maskesi/agresiflik FC'ye YAZILIR ve FC'nin
+        # gerçek değerleri geri okunur; AUTOTUNE ilerlemesi STATUSTEXT'ten gelir.
+        w.connection_changed.connect(self._autotune_view.on_connection_changed)
+        w.status_text_received.connect(self._autotune_view.on_status_text)
+        w.param_received.connect(self._autotune_view.on_param_received)
+        self._autotune_view.send_command.connect(w.send_command)
+        self._autotune_view.set_param.connect(w.set_param)
+        self._autotune_view.request_params.connect(w.request_parameters)
         w.mission_download_done.connect(self._on_mission_download_done)
         w.mission_download_progress.connect(self._on_mission_download_progress)
         w.mission_upload_progress.connect(self._on_mission_upload_progress)
