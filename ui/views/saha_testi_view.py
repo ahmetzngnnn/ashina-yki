@@ -83,7 +83,11 @@ class SahaTestiView(QWidget):
 
         self._kapi = PervaneKapisi(
             ek_uyari="  5) Bu panel aracı ARM ETTİRİR ve motorları DÖNDÜRÜR. "
-                     "Güvenlik pilotu kumanda başında olsun.")
+                     "Güvenlik pilotu kumanda başında olsun.\n"
+                     "  6) ÜST ÇUBUKTAKİ '▶ Görev Başlat (FCU)' DÜĞMESİNE ASLA "
+                     "BASMAYIN — o companion'ı atlayıp doğrudan FC'ye ARM+tırmanma "
+                     "gazı gönderir, sağlık kapısına tabi DEĞİLDİR. Yalnız "
+                     "'▶ Görev Başlat (Yard. PC)' kullanın.")
         self._kapi.durum_degisti.connect(self._kapi_degisti)
         root.addWidget(self._kapi)
 
