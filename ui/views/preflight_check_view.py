@@ -68,10 +68,16 @@ VARSAYILAN_BEKLENEN: list[tuple[str, float, str, str]] = [
     ("SERVO3_FUNCTION", 35,    SINIF_DONANIM, "Motor 3."),
     ("SERVO4_FUNCTION", 36,    SINIF_DONANIM, "Motor 4."),
     ("MOT_PWM_TYPE",    0,     SINIF_DONANIM, "0 = normal PWM."),
-    ("SERVO5_FUNCTION", 56,    SINIF_DONANIM,
-     "Eski gimbal kanalı — gimbal 2026-08-30'da SÖKÜLDÜ, kanal BOŞTA."),
-    ("SERVO6_FUNCTION", 57,    SINIF_DONANIM, "Kırmızı yük bırakma (RCIN passthrough)."),
-    ("SERVO7_FUNCTION", 58,    SINIF_DONANIM, "Mavi yük bırakma (RCIN passthrough)."),
+    ("SERVO5_FUNCTION", 0,     SINIF_KRITIK,
+     "Eski gimbal kanalı — gimbal 2026-08-30'da SÖKÜLDÜ. 2026-09-03: RCIN6 "
+     "passthrough KAPATILDI, ölü kanalda RC yolu açık bırakmanın sebebi yok."),
+    ("SERVO6_FUNCTION", 0,     SINIF_KRITIK,
+     "KIRMIZI yük bırakma. 2026-09-03 OPERATÖR KARARI: eskiden 57 (RCIN7) idi, "
+     "yani kumandanın Aux3 anahtarı kapağı DOĞRUDAN sürüyordu. Artık yalnızca "
+     "uçuş yazılımı (DO_SET_SERVO). Manuel acil bırakma yedeği KALDIRILDI."),
+    ("SERVO7_FUNCTION", 0,     SINIF_KRITIK,
+     "MAVİ yük bırakma. Eskiden 58 (RCIN8) — kumandanın Aux4 anahtarı. "
+     "Bkz. SERVO6_FUNCTION."),
     ("SERVO8_FUNCTION", 0,     SINIF_DONANIM,
      "Kavrayıcı sol — sürekli dönüş servosu, RC passthrough KAPALI olmalı."),
     ("SERVO9_FUNCTION", 0,     SINIF_DONANIM, "Kavrayıcı sağ — aynı gerekçe."),
