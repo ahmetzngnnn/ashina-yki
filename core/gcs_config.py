@@ -101,6 +101,18 @@ DEFAULTS: dict = {
     # kaynak koduna gömer — bu repo git'e push edilirse şifre repo
     # geçmişinde kalır. Kullanıcı bilerek bu kolaylığı istedi.
     "ntrip_autostart":  True,
+    # ── AÇILIŞTA KENDİLİĞİNDEN BAĞLAN (2026-09-03, operatör talebi) ────────
+    # NEDEN: YKİ açıldığında drone (MAVLink) ve Yardımcı Bilgisayar bağlantıları
+    # operatörün iki ayrı düğmeye basmasını bekliyordu. Sahada bu, her açılışta
+    # tekrarlanan el işi ve unutulabilir bir adım.
+    # İLK DENEME BOŞA DÜŞEBİLİR, SORUN DEĞİL: araç ve yardımcı bilgisayar
+    # açılırken YKİ önce hazır olabilir. Her iki worker da SONSUZA KADAR
+    # yeniden dener (mavlink_worker: 2/4/8/15/30 s geri çekilme merdiveni,
+    # tavan 30 s; rpi_status_worker: 5 s), ve mavlink_worker bağlantı dizesini
+    # hata hâlinde KORUR — yani araç geri geldiğinde kendiliğinden bağlanır.
+    # Operatör elle "Kes" derse worker boşaltılır ve KENDİLİĞİNDEN GERİ
+    # BAĞLANMAZ (operatörle inatlaşmamak için bilerek böyle).
+    "auto_connect":     True,
     "ntrip_host":       "212.156.70.42",
     "ntrip_port":       2101,
     "ntrip_mountpoint": "VRSRTCM34",
@@ -213,6 +225,11 @@ class GCSConfig:
     @property
     def ntrip_autostart(self) -> bool:
         return bool(self._data.get("ntrip_autostart", False))
+
+    @property
+    def auto_connect(self) -> bool:
+        """Açılışta drone + Yardımcı Bilgisayar bağlantılarını kendiliğinden kur."""
+        return bool(self._data.get("auto_connect", True))
 
     @property
     def ntrip_host(self) -> str:

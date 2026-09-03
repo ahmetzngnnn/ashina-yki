@@ -264,6 +264,33 @@ class MainWindow(QMainWindow):
             self._on_start_ntrip(config.ntrip_host, config.ntrip_port,
                                  config.ntrip_mountpoint, config.ntrip_username,
                                  config.ntrip_password)
+        # ── AÇILIŞTA KENDİLİĞİNDEN BAĞLAN (2026-09-03, operatör talebi) ───
+        # Worker'lar başladıktan SONRA: ikisi de kendi thread'inde bağlantı
+        # dizesini bekliyor. Buraya kadar kimse set_connection/enable
+        # çağırmadığı için YKİ, operatör iki düğmeye basana dek BOŞTA
+        # duruyordu.
+        # İLK DENEMENİN BOŞA DÜŞMESİ BEKLENEN BİR DURUMDUR: araç ve yardımcı
+        # bilgisayar açılırken YKİ önce hazır olabilir. Her iki worker da
+        # sonsuza kadar yeniden dener ve mavlink_worker bağlantı dizesini
+        # hata hâlinde korur — araç geri geldiğinde kendiliğinden bağlanır.
+        # Elle "Kes" denirse geri bağlanmaz (bkz. _on_disconnect_requested:
+        # worker boşaltılıyor) — operatörle inatlaşmamak için bilerek.
+        if config.auto_connect:
+            try:
+                self._on_connect_requested("tcp", config.mavlink_address,
+                                           57600, "drone")
+            except Exception:
+                logger.exception("Otomatik drone bağlantısı başlatılamadı")
+            try:
+                self._on_rpi_connect_requested(config.companion_host,
+                                               config.companion_status_port)
+            except Exception:
+                logger.exception("Otomatik Yardımcı Bilgisayar bağlantısı başlatılamadı")
+            logger.info("Otomatik bağlanma AÇIK — drone %s, yardımcı %s:%d",
+                        config.mavlink_address, config.companion_host,
+                        config.companion_status_port)
+        else:
+            logger.info("Otomatik bağlanma KAPALI (auto_connect=false)")
         logger.info("Worker thread'leri başlatıldı (NTRIP isteğe bağlı)")
 
     # ── UI ────────────────────────────────────────────────────────────────────
