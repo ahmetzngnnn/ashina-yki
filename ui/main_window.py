@@ -622,6 +622,9 @@ class MainWindow(QMainWindow):
         # telemetri yalnız AKTİF sekmeye gittiği için o an 'aracın kalkış
         # anı' değil 'operatörün sekmeyi açtığı an' oluyordu.
         w.home_position_updated.connect(self._mission_panel.on_home_position)
+        # Dashboard haritası da AYNI otoriteyi kullansın; yoksa iki harita
+        # farklı 'H' gösterip operatörü ikileme düşürür.
+        w.home_position_updated.connect(self._dashboard.on_home_position)
         self._test_panel.send_command.connect(w.send_command)
         self.top_bar.fcu_start_mission_requested.connect(w.start_flight_sequence)
         self._syslog_view.request_log_list.connect(w.request_log_list)

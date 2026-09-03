@@ -826,7 +826,16 @@ class CalibrationView(QWidget):
     # param1=1 → yalnızca uçuş kontrolcüsünü yeniden başlat.
     # param1=3 BOOTLOADER'a düşürür ve araç telemetriye BİR DAHA dönmez
     # (kurtarmak için USB + yer istasyonu gerekir) — bu yüzden sabit 1.
+    # ArduPilot param1 için YALNIZCA 1 veya 3 kabul eder, başka her değer
+    # MAV_RESULT_UNSUPPORTED ile reddedilir (GCS_Common.cpp:3660-3663).
+    #
+    # ⚠ param6 SIFIR KALMALI. ArduPilot ARM'lıyken reboot'u reddeder AMA bir
+    # kaçış kapısı vardır: COMMAND_INT.y == 20190226 ise ARM'LI OLSA BİLE
+    # yeniden başlatır (GCS_Common.cpp:3653-3659). COMMAND_LONG → COMMAND_INT
+    # dönüşümünde param6 doğrudan y'ye kopyalanır. Yani param6'ya o sayıyı
+    # yazmak, uçan araçta motorları kesen bir reboot demektir.
     _REBOOT_PARAMS = [1, 0, 0, 0, 0, 0, 0]
+    _ARM_ZORLA_SIHIRLI = 20190226        # ASLA gönderilmemeli — bkz. yukarı
 
     def _guncelle_reboot_butonu(self) -> None:
         """Reboot düğmesinin açık/kapalı durumunu ve NEDENİNİ yazar."""
@@ -853,7 +862,10 @@ class CalibrationView(QWidget):
             "Uçuş kontrolcüsü YENİDEN BAŞLATILACAK.\n\n"
             "• Telemetri linki kopacak, birkaç saniye sonra geri gelir.\n"
             "• Kaydedilmemiş parametreler KAYBOLUR.\n"
-            "• Araç havadayken ASLA yapılmamalıdır.\n\n"
+            "• Araç havadayken ASLA yapılmamalıdır.\n"
+            "• ESC_CALIBRATION=2 (PASSTHROUGH_ALWAYS) ise araç reboot'tan\n"
+            "  sonra ESC kalibrasyonuna girer ve GAZ DOĞRUDAN ESC'lere\n"
+            "  aktarılır (ARM gerekmez). PERVANELER SÖKÜLÜ OLSUN.\n\n"
             "Devam edilsin mi?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -867,8 +879,18 @@ class CalibrationView(QWidget):
             self._compass_log.append(
                 "[REBOOT] Yeniden başlatma komutu gönderildi — link birkaç "
                 "saniye kopacak. FC hükmü (COMMAND_ACK) aşağıda görünecek.")
+            # NEDEN LİNK ELLE DÜŞÜRÜLÜYOR: seri hat üzerinden FC resetlenince
+            # PORT AÇIK KALIR; mavlink_worker connection_changed(False)
+            # YAYMAZ ve MavKanal.link_var True kalır. Panel bu yüzden araç
+            # ölüyken düğmeleri açık gösterirdi. Durumu BİLİNMİYOR'a çekip
+            # operatörden telemetrinin geri geldiğini teyit etmesini istiyoruz.
+            self._kanal.link_ayarla(False)
+            self._armed = False
+            self._guncelle_reboot_butonu()
             self._reboot_lbl.setText(
-                "Reboot gönderildi — telemetri geri gelene kadar bekleyin.")
+                "Reboot gönderildi. Telemetri geri gelene kadar FC durumu "
+                "BİLİNMİYOR — üst çubukta bağlantı yeşile dönünce devam edin.")
+            self._reboot_lbl.setStyleSheet(f"color:{theme.c('warning')};")
         else:
             self._compass_log.append(
                 "[HATA] Reboot komutu gönderilemedi (link yok).")

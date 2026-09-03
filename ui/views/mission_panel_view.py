@@ -1420,7 +1420,12 @@ class _BaseMissionTab(QWidget):
     if self._wps:
       if not self._rth_cb.isChecked() and len(self._wps) > 1:
         self._wps[-1]["type"] = "LAND"
-      elif len(self._wps) == 1:
+      elif len(self._wps) == 1 and self._home_lat is None:
+        # NEDEN home KOŞULU (2026-09-03): kalkış noktası araçtan otomatik
+        # geliyorsa operatörün ayrıca TAKEOFF noktası koymasına gerek yok.
+        # Bu dal home_auto'yu hiç kontrol etmiyordu; WP'ler tek kalana kadar
+        # silindiğinde kalan tarama köşesi zorla TAKEOFF'a dönüyor ve
+        # operatöre yine "kalkış noktası seçtirilmiş" gibi görünüyordu.
         self._wps[0]["type"] = "TAKEOFF"
     for i, wp in enumerate(self._wps):
       wp["idx"] = i

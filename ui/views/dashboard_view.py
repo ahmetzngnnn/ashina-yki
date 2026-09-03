@@ -163,17 +163,28 @@ var isFirstFix = true;
 // yerleştirilir ve o andan sonra sabit kalır (yer istasyonu hareket etmez).
 var stationMarker = null; var stationSet = false;
 
-function updateDrone(lat,lon,hdg){
+function updateDrone(lat,lon,hdg,fixOk){
   drone.setLatLng([lat,lon]);
   drone.setIcon(makeDroneIcon(hdg));
   trail.push([lat,lon]);
   if(trail.length>500) trail.shift();
   trailLine.setLatLngs(trail);
-  if(!homeSet){homeMarker=L.marker([lat,lon],{icon:homeIcon}).addTo(map);homeSet=true;}
+  /* NEDEN fixOk KAPISI (2026-09-03): burada home ilk sıfır olmayan
+     konuma kilitleniyordu, GPS fix kalitesine BAKILMADAN. Görev
+     panelinde aynı hata düzeltilince iki harita farklı 'H' gösterir
+     ve operatör hangisinin doğru olduğunu bilemezdi. */
+  if(!homeSet&&fixOk){homeMarker=L.marker([lat,lon],{icon:homeIcon}).addTo(map);homeSet=true;}
   if(isFirstFix){
     map.setView([lat,lon], 18);
     isFirstFix = false;
   }
+}
+/* FC'nin KENDİ home'u (HOME_POSITION). Otoritedir: telemetriden
+   kilitlenmiş tahmini home'u ezer ve tazelenebilir. */
+function setFcHome(lat,lon){
+ if(homeMarker){map.removeLayer(homeMarker);}
+ homeMarker=L.marker([lat,lon],{icon:homeIcon}).addTo(map);
+ homeSet=true;
 }
 function updateStation(lat,lon){
   if(!stationSet){
@@ -856,31 +867,42 @@ class MapWidget(QWidget):
     def _on_load_finished(self, ok: bool) -> None:
         self._map_ready = ok
         if ok and self._pending is not None:
-            lat, lon, hdg = self._pending
+            lat, lon, hdg, fix_ok = self._pending
             self._pending = None
-            self._run_js(lat, lon, hdg)
+            self._run_js(lat, lon, hdg, fix_ok)
         if ok and self._pending_station is not None:
             lat, lon = self._pending_station
             self._pending_station = None
             self._run_station_js(lat, lon)
 
-    def _run_js(self, lat: float, lon: float, hdg: float) -> None:
+    def _run_js(self, lat: float, lon: float, hdg: float,
+                fix_ok: bool = False) -> None:
         page = self._web.page()
         if page is not None:
-            page.runJavaScript(f"updateDrone({lat},{lon},{hdg:.1f})")
+            page.runJavaScript(
+                f"updateDrone({lat},{lon},{hdg:.1f},{str(bool(fix_ok)).lower()})")
 
     def _run_station_js(self, lat: float, lon: float) -> None:
         page = self._web.page()
         if page is not None:
             page.runJavaScript(f"updateStation({lat},{lon})")
 
-    def update_position(self, lat: float, lon: float, hdg: float = 0.0) -> None:
+    def update_position(self, lat: float, lon: float, hdg: float = 0.0,
+                        fix_ok: bool = False) -> None:
         if not self._has_web:
             return
         if not self._map_ready:
-            self._pending = (lat, lon, hdg)   # yüklenince gönder
+            self._pending = (lat, lon, hdg, bool(fix_ok))   # yüklenince gönder
             return
-        self._run_js(lat, lon, hdg)
+        self._run_js(lat, lon, hdg, fix_ok)
+
+    def set_fc_home(self, lat: float, lon: float) -> None:
+        """FC'nin HOME_POSITION'ı — telemetriden kilitlenen tahmini home'u ezer."""
+        if not self._has_web or not self._map_ready:
+            return
+        page = self._web.page()
+        if page is not None:
+            page.runJavaScript(f"setFcHome({lat},{lon})")
 
     def update_station(self, lat: float, lon: float) -> None:
         """Yer istasyonu (RTK GPS) konumu — İHA'dan bağımsız, ayrı işaretçi."""
@@ -2064,6 +2086,20 @@ class DashboardView(QWidget):
 
     # ── Slotlar ───────────────────────────────────────────────────────────
     @pyqtSlot(dict)
+    @pyqtSlot(float, float, float)
+    def on_home_position(self, lat: float, lon: float, alt: float) -> None:
+        """FC'nin HOME_POSITION'ı — görev paneliyle AYNI 'H' gösterilsin diye.
+
+        NEDEN: dashboard haritası home'u telemetriden kilitliyordu; görev
+        paneli otoriteyi FC'den alınca iki harita farklı nokta gösterebilirdi.
+        """
+        if not lat and not lon:
+            return
+        try:
+            self._map.set_fc_home(float(lat), float(lon))
+        except Exception:
+            logger.exception("Dashboard FC home işaretçisi güncellenemedi")
+
     def update_telemetry(self, data: dict) -> None:
         self._quick_data.update_telemetry(data)
         self._hud.update_telemetry(data)
@@ -2086,8 +2122,14 @@ class DashboardView(QWidget):
         if (lat is not None and lon is not None
                 and abs(float(lat)) > 0.001):
             hdg_val = data.get("hdg", data.get("heading", 0))
+            # Home kilidi için fix kalitesi: görev panelindeki eşiklerle AYNI
+            # olmalı, yoksa iki harita farklı 'H' gösterir.
+            _fix = data.get("gps_fix_type")
+            _sats = data.get("gps_sats")
+            _fix_ok = (_fix is not None and int(_fix) >= 3
+                       and (_sats is None or int(_sats) >= 6))
             self._map.update_position(
-                float(lat), float(lon), float(hdg_val)
+                float(lat), float(lon), float(hdg_val), _fix_ok
             )
 
         # ── Kablosuz Bağlantı Kalitesi: GERÇEK veriler ───────────────────────
