@@ -1330,7 +1330,14 @@ class MainWindow(QMainWindow):
         # PİLOTA DEVİR: araç GUIDED'da tutunup onay bekliyor olabilir.
         # Diğer alanlardan ÖNCE bakılır ki ayrıştırma hatası acil durumu
         # gizlemesin.
-        self._pilot_devir_durum(bool(data.get("pilot_devir_bekleniyor")))
+        _devir = data.get("pilot_devir_bekleniyor")
+        if _devir is None:
+            # Yayın şeması değişirse acil durum sessizce kaybolmasın:
+            # mission bloğunun altına da bakılır.
+            _m = data.get("mission")
+            if isinstance(_m, dict):
+                _devir = _m.get("pilot_devir_bekleniyor")
+        self._pilot_devir_durum(bool(_devir))
         # Ondalık taşmasını önle: yüzdeler tam sayı, sıcaklık tek ondalık.
         try:
             cpu = int(round(float(data.get("cpu_pct", 0.0))))
