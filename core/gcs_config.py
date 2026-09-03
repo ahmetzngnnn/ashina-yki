@@ -113,6 +113,22 @@ DEFAULTS: dict = {
     # Operatör elle "Kes" derse worker boşaltılır ve KENDİLİĞİNDEN GERİ
     # BAĞLANMAZ (operatörle inatlaşmamak için bilerek böyle).
     "auto_connect":     True,
+    # ── OTOMATİK BAĞLANMADA DRONE BAĞLANTISI ──────────────────────────────
+    # NEDEN SERİ (2026-09-03, sahada doğrulandı): araç MAVLink'i FC'ye USB
+    # SERİ üzerinden konuşuyor (IHA/config.json → mavlink.connection="serial")
+    # ve TCP MAVLink sunucusu AÇMIYOR — araçta dinleyen portlar yalnız
+    # 22/5601/5602/8080/8081; 5762/5763 diye bir şey YOK (ss ile doğrulandı).
+    # YKİ'ye telemetri RFD900A telemetri radyosundan, YKİ Pi'sindeki USB seri
+    # köprüsünden geliyor (ölçüldü: CP2102, 115200 baud).
+    # "tcp"/"udp" seçenekleri SITL/simülasyon için duruyor; o hâlde adres
+    # mavlink_host:mavlink_port'tan alınır.
+    "drone_link_type":  "serial",          # "serial" | "tcp" | "udp"
+    # BOŞ = KENDİ BULSUN: /dev/serial/by-id altındaki ilk telemetri radyosu
+    # seçilir; u-blox/GNSS içerenler ELENİR (o RTK alıcısıdır, radyo değil).
+    # NEDEN seri numarası sabitlenmiyor: radyo değişirse ya da başka bir
+    # adaptör takılırsa sabit yol ölür ve bağlantı sessizce kurulmaz.
+    "drone_serial_port": "",
+    "drone_serial_baud": 115200,
     "ntrip_host":       "212.156.70.42",
     "ntrip_port":       2101,
     "ntrip_mountpoint": "VRSRTCM34",
@@ -230,6 +246,19 @@ class GCSConfig:
     def auto_connect(self) -> bool:
         """Açılışta drone + Yardımcı Bilgisayar bağlantılarını kendiliğinden kur."""
         return bool(self._data.get("auto_connect", True))
+
+    @property
+    def drone_link_type(self) -> str:
+        v = str(self._data.get("drone_link_type", "serial")).strip().lower()
+        return v if v in ("serial", "tcp", "udp") else "serial"
+
+    @property
+    def drone_serial_port(self) -> str:
+        return str(self._data.get("drone_serial_port", "") or "").strip()
+
+    @property
+    def drone_serial_baud(self) -> int:
+        return int(self._data.get("drone_serial_baud", 115200))
 
     @property
     def ntrip_host(self) -> str:

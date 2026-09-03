@@ -248,6 +248,42 @@ class MainWindow(QMainWindow):
             self.rtk_gps_worker = RtkGpsWorker(
                 port=config.rtk_gps_port, baud=config.rtk_gps_baud, parent=self)
 
+    # ── Otomatik bağlanma yardımcıları ───────────────────────────────────
+    @staticmethod
+    def _telemetri_radyosu_bul() -> str:
+        """/dev/serial/by-id altındaki ilk TELEMETRİ radyosunu döndürür.
+
+        GNSS alıcıları (u-blox F9P) BİLEREK elenir: o RTK tabanıdır, MAVLink
+        radyosu değil. Ona bağlanmak MAVLink akışı hiç gelmeden "bağlandı"
+        görüntüsü verirdi. by-id kullanılır çünkü /dev/ttyUSBx numaraları
+        fişten çekip takınca kayar (bkz. top_bar.py başındaki not).
+        """
+        import os
+        d = "/dev/serial/by-id"
+        try:
+            adaylar = sorted(os.listdir(d))
+        except OSError:
+            return ""
+        for ad in adaylar:
+            dusuk = ad.lower()
+            if "u-blox" in dusuk or "ublox" in dusuk or "gnss" in dusuk:
+                continue
+            return os.path.join(d, ad)
+        return ""
+
+    def _oto_drone_baglantisi(self):
+        """Otomatik bağlanma için (tip, adres, baud); bulunamazsa None."""
+        import os
+        tip = config.drone_link_type
+        if tip in ("tcp", "udp"):
+            return tip, config.mavlink_address, 57600
+        port = config.drone_serial_port
+        if not port or not os.path.exists(port):
+            port = self._telemetri_radyosu_bul()
+        if not port:
+            return None
+        return "serial", port, config.drone_serial_baud
+
     def _start_workers(self) -> None:
         self.tts_worker.start_tts_process()
         self.tts_worker.start()
@@ -277,8 +313,13 @@ class MainWindow(QMainWindow):
         # worker boşaltılıyor) — operatörle inatlaşmamak için bilerek.
         if config.auto_connect:
             try:
-                self._on_connect_requested("tcp", config.mavlink_address,
-                                           57600, "drone")
+                _drone = self._oto_drone_baglantisi()
+                if _drone is None:
+                    logger.warning("Otomatik drone bağlantısı ATLANDI — telemetri "
+                                   "radyosu bulunamadı (/dev/serial/by-id boş). "
+                                   "Radyo takılınca üst çubuktan elle bağlanın.")
+                else:
+                    self._on_connect_requested(_drone[0], _drone[1], _drone[2], "drone")
             except Exception:
                 logger.exception("Otomatik drone bağlantısı başlatılamadı")
             try:
