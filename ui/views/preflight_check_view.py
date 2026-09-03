@@ -106,12 +106,14 @@ VARSAYILAN_BEKLENEN: list[tuple[str, float, str, str]] = [
      "Gerekçe: FC'de artık kalmış, ilk satırı TAKEOFF olan bir görev vardı; "
      "AUTO'da arm edilince ArduCopter onu BAŞLATIYOR ve 'Mission: 1 Takeoff' "
      "basıyordu (logda 18:47/20:37/20:40)."),
-    ("FLTMODE2",        5,     SINIF_KRITIK,
+    ("FLTMODE4",        5,     SINIF_KRITIK,
      "LOITER — pilotun devralma kipi. DİKKAT: LOITER'da gaz kolu alçalma "
      "hızını sürer; devralırken kol ORTADA olmalı."),
-    ("FLTMODE3",        9,     SINIF_KRITIK,
+    ("FLTMODE6",        9,     SINIF_KRITIK,
      "LAND. Yarışma görevi FC'nin AUTO'sunu kullanmaz (GUIDED ile uçar), "
-     "bu yüzden AUTO'nun anahtarda olmasına gerek yoktur."),
+     "bu yüzden AUTO'nun anahtarda olmasına gerek yoktur. "
+     "NOT: FLTMODE2/3/5 bilerek listelenmedi — operatör belirtmedi ve "
+     "FC'de şu an 0 (STABILIZE); uydurulmuş değer yazılmadı."),
     ("BATT_MONITOR",    4,     SINIF_KRITIK,
      "4 = analog gerilim + akım. Akım okunmazsa harcanan mAh sayılamaz ve "
      "yüzde tabanlı emniyet anlamsızlaşır."),
