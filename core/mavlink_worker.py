@@ -5,6 +5,7 @@ Yakalanan paketler: HEARTBEAT, VFR_HUD, ATTITUDE, SYS_STATUS,
                     GLOBAL_POSITION_INT, PARAM_VALUE, LOG_ENTRY
 """
 import queue
+import threading
 import time
 import logging
 from typing import Any, Optional
@@ -14,6 +15,16 @@ from core import local_storage
 from core import batarya
 
 logger = logging.getLogger(__name__)
+
+
+class _BaglantiGecersizKilindi(Exception):
+    """set_connection()/stop() bu bağlantı denemesini GEÇERSİZ KILDI.
+
+    Gerçek bir arıza DEĞİLDİR — operatörün kendi isteğiyle (yeniden bağlan,
+    kes) tetiklenen bir yan etkidir. run() bunu backoff/log OLMADAN ele alır;
+    metin eşleştirmeye değil, jenerasyon sayacına dayanır (bkz. __init__
+    içindeki NEDEN notu).
+    """
 
 
 _COPTER_MODES = {
@@ -96,6 +107,25 @@ class MavlinkWorker(QThread):
         self._connection_string: str = ""
         self._baud: int = 57600
         self._mav: Any = None
+        # ── self._mav SENKRONİZASYONU (2026-09-03, canlıda yakalandı) ────
+        # NEDEN: self._mav GUI thread'den (set_connection/stop) ve worker
+        # thread'den (_connect_and_listen: wait_heartbeat + recv_match döngüsü)
+        # KİLİTSİZ paylaşılıyordu. GUI thread bir bağlantıyı değiştirirken/
+        # keserken worker AYNI ANDA o nesneyi okuyor/kullanıyor olabiliyordu.
+        # CANLI ARAÇTA ÖLÇÜLDÜ (operatör drone bağlantısını elle kesip/kurarken):
+        #   MavlinkWorker run() exception: 'NoneType' object has no attribute 'recv_match'
+        #   MavlinkWorker run() exception: Bağlantı kurulamadı: Attempting to use a port that is not open
+        # İkisi de İSTEĞE BAĞLI bağlantı değişiminin YAN ETKİSİYDİ, gerçek bir
+        # arıza değildi — ama _note_connect_failure'daki "quiet" metin listesi
+        # bu iki hata dizesini KAPSAMIYORDU, yani operatöre "Worker hatası" diye
+        # tekrar tekrar gösteriliyordu (kes/bağlan her denendiğinde).
+        # Jenerasyon sayacı + kilit: bağlantıyı GEÇERSİZ KILAN her eylem
+        # (set_connection, stop) sayacı ilerletir; _connect_and_listen kendi
+        # jenerasyonunu tutar, run() bir istisna yakaladığında sayaç değiştiyse
+        # bunun İSTEĞE BAĞLI bir değişim olduğunu anlar — metin eşleştirmeye
+        # değil, olgusal bir duruma bakar.
+        self._mav_lock = threading.Lock()
+        self._mav_generation: int = 0
         # queue.Queue thread-safe: UI thread put, worker thread get
         self._command_queue: queue.Queue = queue.Queue(maxsize=64)
         self._ned_vel_queue: queue.Queue = queue.Queue(maxsize=32)
@@ -158,16 +188,30 @@ class MavlinkWorker(QThread):
         """SQLite bağlantısını atar — parametre cache DB'ye yazılır."""
         self._db_conn = db_conn
 
+    def _invalidate_connection(self) -> None:
+        """self._mav'i GÜVENLE kapatır ve jenerasyonu ilerletir.
+
+        Kilit altında sadece REFERANS DEĞİŞİMİ yapılır (atomik); yavaş olan
+        `.close()` I/O çağrısı kilidin DIŞINDA yapılır — GUI thread'i bir
+        seri port kapanışı için bloke ETMEMELİDİR.
+        set_connection(), stop() ve run()'ın hata yakalama bloğu artık HEPSİ
+        bunu çağırır — üç ayrı yerde tekrarlanan kilitsiz close+None deseni
+        tek noktaya toplandı.
+        """
+        with self._mav_lock:
+            self._mav_generation += 1
+            mav, self._mav = self._mav, None
+        if mav is not None:
+            try:
+                mav.close()
+            except Exception:
+                pass
+
     def set_connection(self, conn_str: str, baud: int = 57600) -> None:
         """Yeni bağlantı dizisi + baudrate atar ve aktif bağlantıyı keser."""
         self._connection_string = conn_str
         self._baud = baud
-        if self._mav is not None:
-            try:
-                self._mav.close()
-            except Exception:
-                pass
-            self._mav = None
+        self._invalidate_connection()
 
     def set_connection_string(self, conn_str: str) -> None:
         """Geriye dönük uyumluluk — baudrate değişmez."""
@@ -176,18 +220,46 @@ class MavlinkWorker(QThread):
     def run(self) -> None:
         while not self.isInterruptionRequested():
             self.heartbeat_counter += 1  # watchdog: her döngüde artır
+            _baslangic_nesli = self._mav_generation
             try:
                 self._connect_and_listen()
+            except _BaglantiGecersizKilindi:
+                # set_connection()/stop() BU bağlantı denemesi sürerken
+                # çağrıldı — istisna bunun DOĞRUDAN sonucu, gerçek bir arıza
+                # değil. Ne log ne backoff: stop() ise isInterruptionRequested
+                # zaten bir sonraki turda döngüyü bitirecek; set_connection()
+                # ise self._connection_string ZATEN yeni hedefe güncellendi,
+                # hemen (beklemeden) yeniden denenir.
+                logger.debug(
+                    "MAVLink bağlantısı değiştirildi/kesildi (operatör "
+                    "isteği) — jenerasyon %d -> %d",
+                    _baslangic_nesli, self._mav_generation)
+                continue
             except Exception as exc:
                 self.connection_changed.emit(False)
-                # Eski socket'i kapat, ama bağlantı dizesini KORU →
-                # SITL/uçak yeniden açıldığında otomatik tekrar bağlan.
-                if self._mav is not None:
-                    try:
-                        self._mav.close()
-                    except Exception:
-                        pass
-                    self._mav = None
+                # NEDEN generation ÖNCE okunur: _invalidate_connection() KENDİSİ
+                # sayacı ilerletir — çağrıdan SONRA karşılaştırsaydık "değişti"
+                # her zaman True çıkardı (kendi bumpumuzu görürdük).
+                _nesil_degisti = (self._mav_generation != _baslangic_nesli)
+                # ÖNCESİ: burada self._mav kilitsiz close+None ediliyordu —
+                # tam da bu istisnayı üreten yarışın kaynağıydı. Artık aynı
+                # kilitli/jenerasyonlu yol kullanılıyor (bkz. __init__ NEDEN).
+                self._invalidate_connection()
+                if _nesil_degisti:
+                    # _BaglantiGecersizKilindi YALNIZCA bağlantı FAZINDA
+                    # (_connect_and_listen başındaki üç kontrol) atılır;
+                    # 350+ satırlık dinleme döngüsü içindeki self._mav
+                    # kullanımları o denetimlerin DIŞINDA kalır ve ORADA
+                    # oluşan bir yarış HAM bir istisna (AttributeError/
+                    # PortNotOpenError) olarak buraya düşer. Jenerasyon
+                    # kontrolü bu YEDEK KATMANDIR — metne bakmadan, olgusal
+                    # olarak "bu istisna set_connection()/stop() yüzünden mi"
+                    # sorusuna cevap verir. ÖLÇÜLDÜ: eklenmeden önce bu yol
+                    # "MavlinkWorker run() exception: Attempting to use a port that is not open" diye ERROR logluyordu.
+                    logger.debug(
+                        "MAVLink bağlantısı değiştirildi/kesildi (operatör "
+                        "isteği) sırasında beklenen istisna: %s", exc)
+                    continue
                 # NEDEN: Hata raporlaması ve üstel geri çekilme tek yerde
                 # toplandı — log boğulma koruması ve backoff merdiveni birlikte
                 # yürür (bkz. _note_connect_failure). Backoff SIFIRLAMASI artık
@@ -278,12 +350,45 @@ class MavlinkWorker(QThread):
             time.sleep(0.5)
             return
 
-        logger.info("MAVLink bağlanıyor: %s  baud=%d", self._connection_string, self._baud)
+        # Bu bağlantı denemesinin JENERASYONU — set_connection()/stop() bu
+        # deneme sürerken çağrılırsa sayaç ilerler ve aşağıdaki kontroller
+        # bunu YARIŞ HATASI değil, İSTEĞE BAĞLI geçersiz kılma olarak görür
+        # (bkz. __init__ NEDEN notu + _BaglantiGecersizKilindi).
+        my_nesil = self._mav_generation
+        conn_str, baud = self._connection_string, self._baud
+        logger.info("MAVLink bağlanıyor: %s  baud=%d", conn_str, baud)
         try:
-            self._mav = mavutil.mavlink_connection(self._connection_string, baud=self._baud)
-            self._mav.wait_heartbeat(timeout=10)
+            mav = mavutil.mavlink_connection(conn_str, baud=baud)
         except Exception as exc:
             raise ConnectionError(f"Bağlantı kurulamadı: {exc}") from exc
+
+        with self._mav_lock:
+            if self._mav_generation != my_nesil:
+                # set_connection()/stop() nesne YARATILIRKEN çağrıldı —
+                # henüz self._mav'e hiç atanmadı, kimse etkilenmedi.
+                try:
+                    mav.close()
+                except Exception:
+                    pass
+                raise _BaglantiGecersizKilindi()
+            self._mav = mav
+
+        try:
+            mav.wait_heartbeat(timeout=10)
+        except Exception as exc:
+            if self._mav_generation != my_nesil:
+                # ÖLÇÜLDÜ (2026-09-03): set_connection()/stop() wait_heartbeat
+                # SÜRERKEN çağrılırsa GUI thread bu AYNI nesneyi kapatır ve
+                # pyserial "Attempting to use a port that is not open" atar.
+                # Metin eşleştirmeye gerek yok — jenerasyon değişmiş olması
+                # tek başına yeterli kanıt.
+                raise _BaglantiGecersizKilindi() from exc
+            raise ConnectionError(f"Bağlantı kurulamadı: {exc}") from exc
+
+        if self._mav_generation != my_nesil:
+            # wait_heartbeat TAM bu sırada tamamlandı ama hemen ardından
+            # geçersiz kılındı — "bağlandı" diye duyurmadan sessizce çık.
+            raise _BaglantiGecersizKilindi()
 
         # NEDEN: Backoff merdiveni ve hata tekrar sayacı YALNIZCA gerçekten
         # bağlanıldığında sıfırlanır. Eskiden `_connect_and_listen()` temiz
@@ -1352,11 +1457,9 @@ class MavlinkWorker(QThread):
 
     def stop(self) -> None:
         self.requestInterruption()
-        # Socket'i hemen kapat → recv_match(blocking) bloke çözülür
-        if self._mav is not None:
-            try:
-                self._mav.close()
-            except Exception:
-                pass
-            self._mav = None
+        # Socket'i hemen kapat → recv_match(blocking) bloke çözülür.
+        # _invalidate_connection() KİLİTLİ + JENERASYONLU yol (bkz. __init__
+        # NEDEN) — run() bu kapanışı bir arıza değil, isteğe bağlı kesme
+        # olarak tanır ve sessizce çıkar.
+        self._invalidate_connection()
         self.wait(5000)  # Maks 5 saniye bekle; donmuşsa devam et
