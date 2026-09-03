@@ -117,6 +117,18 @@ VARSAYILAN_BEKLENEN: list[tuple[str, float, str, str]] = [
      "LOW ile arasında 0.6 V var. Eski FC değerleri (21.2 / 21.0) arasında "
      "yalnız 0.2 V vardı ve araç RTL'e geçtikten hemen sonra Land'e düşüp "
      "eve dönemeden olduğu yere iniyordu; aralık üç katına çıkarıldı."),
+    ("BATT_LOW_TIMER",  10,    SINIF_KRITIK,
+     "Gerilim eşiğinin ALTINDA kesintisiz kalınması gereken süre (s). Yük "
+     "altında gerilim çöker; bu süre olmadan her gaz darbesi sahte failsafe "
+     "tetikler. Companion BatteryWatcher.SURE_S ile AYNI değer."),
+    ("BATT_LOW_MAH",    0,     SINIF_KRITIK,
+     "0 = mAh tabanlı düşük-batarya tetiği DEVRE DIŞI. 2026-09-03 operatör "
+     "kararı: failsafe şimdilik YALNIZ gerilime göre, çünkü mAh sayımı akım "
+     "sensörü kalibrasyonuna bağlı ve o kalibrasyon henüz yapılmadı."),
+    ("BATT_CRT_MAH",    0,     SINIF_KRITIK,
+     "0 = mAh tabanlı KRİTİK tetik DEVRE DIŞI. Bu tetik ArduPilot'ta "
+     "ZAMANLAYICISIZ, ANINDA çalışır (gerilim tetiği LOW_TIMER bekler) — "
+     "kalibresiz sensörle en tehlikeli yol budur."),
     ("BATT_FS_LOW_ACT", 2,     SINIF_SARTNAME,
      "2 = RTL. Companion'ın batarya RTL'i KALDIRILDI; batarya emniyeti artık "
      "TAMAMEN FC'de. Uymuyorsa görev BAŞLAMAZ."),
