@@ -311,12 +311,13 @@ class MainWindow(QMainWindow):
         # hata hâlinde korur — araç geri geldiğinde kendiliğinden bağlanır.
         # Elle "Kes" denirse geri bağlanmaz (bkz. _on_disconnect_requested:
         # worker boşaltılıyor) — operatörle inatlaşmamak için bilerek.
-        if config.auto_connect:
-            # NEDEN try DIŞINDA ilklenir: aşağıdaki özet log satırı _drone'u
-            # okuyor. try içinde kalsaydı _oto_drone_baglantisi() bir istisna
-            # attığında isim hiç bağlanmaz ve log satırı NameError verip
-            # otomatik bağlanma bloğunu KIRARDI — üstelik yardımcı bilgisayar
-            # bağlantısı zaten kurulmuşken.
+        # ── DRONE (RFD) — AYRI ANAHTAR, VARSAYILAN KAPALI ─────────────────
+        # Operatör talebi (2026-09-03): drone linki ELLE kurulacak. Yardımcı
+        # Bilgisayar otomatik bağlanmasından BAĞIMSIZ — biri diğerini etkilemez.
+        if config.drone_auto_connect:
+            # NEDEN try DIŞINDA ilklenir: aşağıdaki log satırı _drone'u okuyor.
+            # try içinde kalsaydı _oto_drone_baglantisi() bir istisna attığında
+            # isim hiç bağlanmaz ve log satırı NameError verirdi.
             _drone = None
             try:
                 _drone = self._oto_drone_baglantisi()
@@ -326,25 +327,29 @@ class MainWindow(QMainWindow):
                                    "Radyo takılınca üst çubuktan elle bağlanın.")
                 else:
                     self._on_connect_requested(_drone[0], _drone[1], _drone[2], "drone")
+                    # NEDEN gerçekten kullanılan bağlantı yazılıyor: seri olsa
+                    # bile config.mavlink_address'i (TCP) basmak, kurulmayan
+                    # bir bağlantıyı kurulmuş gibi gösterirdi.
+                    _d = ("%s @ %s" % (_drone[1], _drone[2]) if _drone[0] == "serial"
+                          else "%s:%s" % (_drone[0], _drone[1]))
+                    logger.info("Otomatik drone bağlantısı AÇIK — %s", _d)
             except Exception:
                 logger.exception("Otomatik drone bağlantısı başlatılamadı")
+        else:
+            logger.info("Otomatik drone bağlantısı KAPALI (drone_auto_connect=false) "
+                        "— üst çubuktan elle bağlanın.")
+
+        # ── YARDIMCI BİLGİSAYAR — ayrı anahtar (auto_connect) ─────────────
+        if config.auto_connect:
             try:
                 self._on_rpi_connect_requested(config.companion_host,
                                                config.companion_status_port)
+                logger.info("Otomatik Yardımcı Bilgisayar bağlantısı AÇIK — %s:%d",
+                            config.companion_host, config.companion_status_port)
             except Exception:
                 logger.exception("Otomatik Yardımcı Bilgisayar bağlantısı başlatılamadı")
-            # NEDEN gerçekten kullanılan bağlantı yazılıyor: önceki sürüm
-            # kullanılan yol seri olsa bile config.mavlink_address'i (TCP)
-            # basıyordu — yani log, kurulmayan bir bağlantıyı kurulmuş gibi
-            # gösteriyordu. Yanlış log, olmayan hatadan beter.
-            _d = "kurulmadı (radyo yok)" if _drone is None else (
-                "%s @ %s" % (_drone[1], _drone[2]) if _drone[0] == "serial"
-                else "%s:%s" % (_drone[0], _drone[1]))
-            logger.info("Otomatik bağlanma AÇIK — drone %s, yardımcı %s:%d",
-                        _d, config.companion_host,
-                        config.companion_status_port)
         else:
-            logger.info("Otomatik bağlanma KAPALI (auto_connect=false)")
+            logger.info("Otomatik Yardımcı Bilgisayar bağlantısı KAPALI (auto_connect=false)")
         logger.info("Worker thread'leri başlatıldı (NTRIP isteğe bağlı)")
 
     # ── UI ────────────────────────────────────────────────────────────────────

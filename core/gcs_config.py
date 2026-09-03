@@ -113,6 +113,12 @@ DEFAULTS: dict = {
     # Operatör elle "Kes" derse worker boşaltılır ve KENDİLİĞİNDEN GERİ
     # BAĞLANMAZ (operatörle inatlaşmamak için bilerek böyle).
     "auto_connect":     True,
+    # ── DRONE (RFD) OTOMATİK BAĞLANMASI — AYRI ANAHTAR (2026-09-03) ────────
+    # NEDEN AYRI: operatör talebiyle drone tarafı KAPATILDI — RFD900A linki
+    # elle kurulacak (üst çubuktan). Yardımcı Bilgisayar (auto_connect) hâlâ
+    # kendiliğinden bağlanıyor; ikisi bağımsız anahtarlar, biri diğerini
+    # etkilemez. Açmak isterseniz: "drone_auto_connect": true.
+    "drone_auto_connect": False,
     # ── OTOMATİK BAĞLANMADA DRONE BAĞLANTISI ──────────────────────────────
     # NEDEN SERİ (2026-09-03, sahada doğrulandı): araç MAVLink'i FC'ye USB
     # SERİ üzerinden konuşuyor (IHA/config.json → mavlink.connection="serial")
@@ -244,8 +250,18 @@ class GCSConfig:
 
     @property
     def auto_connect(self) -> bool:
-        """Açılışta drone + Yardımcı Bilgisayar bağlantılarını kendiliğinden kur."""
+        """Açılışta Yardımcı Bilgisayar bağlantısını kendiliğinden kur."""
         return bool(self._data.get("auto_connect", True))
+
+    @property
+    def drone_auto_connect(self) -> bool:
+        """Açılışta drone (RFD) bağlantısını kendiliğinden kur.
+
+        VARSAYILAN False (2026-09-03, operatör talebi): drone elle bağlanır.
+        auto_connect'ten BAĞIMSIZDIR — Yardımcı Bilgisayar otomatik bağlanmaya
+        devam eder, yalnız drone tarafı kapatıldı.
+        """
+        return bool(self._data.get("drone_auto_connect", False))
 
     @property
     def drone_link_type(self) -> str:
