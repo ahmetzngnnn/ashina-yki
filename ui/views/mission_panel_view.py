@@ -176,6 +176,109 @@ function drawRoute(pts,col,fit){
    fillOpacity:0,weight:2}).bindTooltip('Rota sonu').addTo(map));
  if(fit){try{map.fitBounds(L.latLngBounds(ll),{padding:[40,40]});}catch(e){}}
 }
+/* ── ÇOK PARÇALI ROTA + YÖN OKLARI + KESİŞİM İŞARETİ ───────────────────────
+   NEDEN (2026-09-03 operatör isteği): drawRoute tek renk çiziyor ve yalnız
+   1/4-2/4-3/4 noktalarına üç ok koyuyordu. Operatör "1. tur nerede bitiyor,
+   2. tur nerede başlıyor, rotaya hangi yönden giriyor, kesişimler nerede"
+   sorularını haritadan CEVAPLAYAMIYORDU. Bu fonksiyon her parçayı (turu)
+   AYRI RENKTE çizer, yol boyunca sık ok koyar, parça sınırlarını numaralı
+   işaretle gösterir ve rotanın KENDİ KENDİNİ kestiği yerleri X ile basar.  */
+function _okEkle(a,b,col){
+ /* Ok, a→b yönünü gösterir. Leaflet'te y=enlem, x=boylam; ekran açısı için
+    atan2(dLon*cos(lat), dLat) gerekir — düz atan2(dLat,dLon) yüksek enlemde
+    yanlış yöne bakar. CSS rotate saat yönünde ve 0° yukarı olduğu için
+    kuzeyden ölçülen kerteriz doğrudan kullanılabilir. */
+ var la=(a[0]+b[0])/2*Math.PI/180;
+ var dy=b[0]-a[0], dx=(b[1]-a[1])*Math.cos(la);
+ if(Math.abs(dx)<1e-12&&Math.abs(dy)<1e-12)return null;
+ var ang=Math.atan2(dx,dy)*180/Math.PI;
+ return L.marker(b,{interactive:false,zIndexOffset:400,icon:L.divIcon({
+   html:'<div style="width:0;height:0;border-left:5px solid transparent;'+
+        'border-right:5px solid transparent;border-bottom:12px solid '+col+';'+
+        'filter:drop-shadow(0 0 1px #000);'+
+        'transform:rotate('+ang+'deg);transform-origin:50% 50%;"></div>',
+   className:'',iconSize:[12,12],iconAnchor:[6,6]})});
+}
+function _kesisim(p1,p2,p3,p4){
+ /* İki doğru parçasının kesişimi (düzlemsel yaklaşım — birkaç yüz metrede
+    enlem/boylam düzlemi kabul edilebilir). Uç noktada birleşen ardışık
+    parçalar kesişim SAYILMAZ (t/u uçlardan içeride olmalı). */
+ var x1=p1[1],y1=p1[0],x2=p2[1],y2=p2[0],x3=p3[1],y3=p3[0],x4=p4[1],y4=p4[0];
+ var d=(x2-x1)*(y4-y3)-(y2-y1)*(x4-x3);
+ if(Math.abs(d)<1e-14)return null;
+ var t=((x3-x1)*(y4-y3)-(y3-y1)*(x4-x3))/d;
+ var u=((x3-x1)*(y2-y1)-(y3-y1)*(x2-x1))/d;
+ var e=1e-9;
+ if(t<=e||t>=1-e||u<=e||u>=1-e)return null;
+ return [y1+t*(y2-y1), x1+t*(x2-x1)];
+}
+function drawRouteMulti(segs,opts){
+ clearRoute();
+ opts=opts||{};
+ if(!segs||!segs.length)return;
+ var okAralik=opts.okAralik||6, hepsi=[], tumNok=[];
+ segs.forEach(function(sg,si){
+  var ll=(sg.pts||[]).map(function(p){return[p.lat,p.lon];});
+  if(ll.length<2)return;
+  var col=sg.color||'#4ade80';
+  /* Altta kalın koyu gövde: uydu görüntüsünde tek renk çizgi zeminle
+     karışıyor (koyu asfalt/gölge). */
+  prv.push(L.polyline(ll,{color:'#000',weight:6,opacity:0.35}).addTo(map));
+  var pl=L.polyline(ll,{color:col,weight:3,opacity:0.95,
+    dashArray:sg.dash||null}).addTo(map);
+  if(sg.label)pl.bindTooltip(sg.label,{sticky:true});
+  prv.push(pl);
+  for(var i=okAralik;i<ll.length;i+=okAralik){
+   var ok=_okEkle(ll[i-1],ll[i],col); if(ok)prv.push(ok.addTo(map));
+  }
+  /* Parça başı: numaralı daire (1. tur, 2. tur ...). Bitişi bir sonraki
+     parçanın başıdır; son parçanın sonu ayrıca işaretlenir. */
+  if(sg.label){
+   prv.push(L.marker(ll[0],{interactive:true,zIndexOffset:600,icon:L.divIcon({
+     html:'<div style="background:'+col+';color:#000;border:2px solid #000;'+
+          'border-radius:50%;width:20px;height:20px;line-height:17px;'+
+          'text-align:center;font:bold 11px sans-serif;">'+(si+1)+'</div>',
+     className:'',iconSize:[20,20],iconAnchor:[10,10]})})
+     .bindTooltip(sg.label+' — BAŞLANGIÇ').addTo(map));
+  }
+  hepsi.push(ll);
+  ll.forEach(function(p){tumNok.push(p);});
+ });
+ /* Rota sonu */
+ var son=hepsi[hepsi.length-1];
+ if(son&&son.length){
+  prv.push(L.circleMarker(son[son.length-1],{radius:6,color:'#ff4444',
+    fillColor:'#ff4444',fillOpacity:0.9,weight:2})
+    .bindTooltip('ROTA SONU').addTo(map));
+ }
+ /* ── Kesişimler ────────────────────────────────────────────────────────
+    Sekiz çizme deseninde kesişim BEKLENİR (ortada bir tane). Beklenmeyen
+    yerde çıkan kesişim rota hatasının en görünür belirtisidir. */
+ if(opts.kesisim!==false&&tumNok.length>3&&tumNok.length<1200){
+  var bulunan=[];
+  for(var a=0;a<tumNok.length-1;a++){
+   for(var b=a+2;b<tumNok.length-1;b++){
+    var k=_kesisim(tumNok[a],tumNok[a+1],tumNok[b],tumNok[b+1]);
+    if(!k)continue;
+    var yakin=false;
+    for(var q=0;q<bulunan.length;q++){
+     if(Math.abs(bulunan[q][0]-k[0])<1e-6&&Math.abs(bulunan[q][1]-k[1])<1e-6){yakin=true;break;}
+    }
+    if(yakin)continue;
+    bulunan.push(k);
+    prv.push(L.marker(k,{interactive:true,zIndexOffset:700,icon:L.divIcon({
+      html:'<div style="color:#ffffff;font:bold 16px/16px sans-serif;'+
+           'text-shadow:0 0 3px #000,0 0 3px #000;">&#10005;</div>',
+      className:'',iconSize:[16,16],iconAnchor:[8,8]})})
+      .bindTooltip('Rota kendini kesiyor').addTo(map));
+   }
+  }
+  if(window._kesisimGeri)window._kesisimGeri(bulunan.length);
+ }
+ if(opts.fit&&tumNok.length){
+  try{map.fitBounds(L.latLngBounds(tumNok),{padding:[40,40]});}catch(e){}
+ }
+}
 /* Önizleme katmanına EK çizgi — clearRoute ETMEZ, drawRoute'tan SONRA
    çağrılır (Görev 1 şematik son bacağı: kesikli + ayrı renk). Aynı prv
    dizisine eklenir ki clearRoute/drawRoute ana rotayla birlikte silsin. */
@@ -466,6 +569,28 @@ class MissionMapWidget(QWidget):
     dash: Leaflet dashArray (ör. "7,7"); boş string = düz çizgi."""
     js_pts = json.dumps([{"lat": p[0], "lon": p[1]} for p in pts])
     self._js(f"drawRouteExtra({js_pts},'{color}','{dash}')")
+
+  def draw_route_multi(self, segments: list[dict], ok_araligi: int = 6,
+                       kesisim: bool = True, fit: bool = False):
+    """Çok parçalı rota çizer: parça başına renk + yol boyunca yön okları.
+
+    segments: [{"pts": [(lat,lon)...], "color": "#rrggbb", "label": "1. tur",
+                "dash": "7,7" (opsiyonel)}, ...]
+
+    NEDEN drawRoute yerine bu: drawRoute tek renk çiziyor ve yalnız üç ok
+    koyuyordu; operatör turların nerede başlayıp bittiğini, rotaya hangi
+    yönden girildiğini ve kesişimleri haritadan göremiyordu.
+    """
+    js_segs = json.dumps([
+      {"pts": [{"lat": p[0], "lon": p[1]} for p in sg["pts"]],
+       "color": sg.get("color", _MAP_ROUTE_COLOR),
+       "label": sg.get("label", ""),
+       "dash": sg.get("dash", "")}
+      for sg in segments if sg.get("pts")
+    ])
+    opts = json.dumps({"okAralik": int(ok_araligi),
+                       "kesisim": bool(kesisim), "fit": bool(fit)})
+    self._js(f"drawRouteMulti({js_segs},{opts})")
 
   def clear_route(self):
     self._js("clearRoute()")
@@ -1634,6 +1759,60 @@ class TargetDropMissionTab(_BaseMissionTab):
   # Çeldirici yerleşimi modu — bkz. _MODE_MIXED/_MODE_SEPARATE NEDEN
   _MODE_MIXED    = "Karışık (çeldiriciler hedeflerle aynı alanda)"
   _MODE_SEPARATE = "Ayrık (Sabit Kanat ayrı pistte)"
+
+  # Görev 2 rota önizleme renkleri.
+  _G2_GIRIS_RENGI = "#94a3b8"      # kalkış → ilk WP (kesikli)
+  _G2_ROTA_RENGI  = "#4ade80"      # gönderilen WP zinciri
+  _G2_KAPI_RENGI  = "#f59e0b"      # direk kapısı (Direk 1 → Direk 2)
+
+  def _refresh_map(self):
+    super()._refresh_map()
+    self._gorev2_rota_ciz()
+
+  def _gorev2_rota_ciz(self):
+    """Haritaya GÖNDERİLEN WP sırasını, yönünü ve kapıyı çizer.
+
+    NEDEN VE SINIRI (2026-09-03 operatör isteği): operatör "yanlış bir hareket
+    var mı" diye rotayı görmek istedi. Burada çizilen şey YKİ'nin gerçekten
+    gönderdiği waypoint sırasıdır — aracın alan İÇİNDE üreteceği süpürme
+    ızgarası DEĞİLDİR. O ızgara araçta hesaplanıyor (sweep_scan.sweep_grid) ve
+    girdisi kameranın ÖLÇÜLEN kalibrasyonundan türeyen tespit menzili; YKİ'de
+    yeniden üretmek kaçınılmaz olarak araçtan sapar ve harita yalan söylerdi.
+    Bu yüzden burada YALNIZCA operatörün kendi girdiği ve sırasını
+    değiştirebildiği şeyler gösterilir — hata yapılabilecek yer zaten orasıdır.
+    """
+    try:
+      if not self._wps:
+        self._map.clear_route()
+        return
+      zincir = [(w["lat"], w["lon"]) for w in self._wps]
+      parcalar = []
+      if self._home_lat is not None and self._home_lon is not None:
+        parcalar.append({"pts": [(self._home_lat, self._home_lon), zincir[0]],
+                         "color": self._G2_GIRIS_RENGI,
+                         "label": "Kalkış → 1. nokta", "dash": "6,5"})
+      if len(zincir) >= 2:
+        parcalar.append({"pts": zincir, "color": self._G2_ROTA_RENGI,
+                         "label": "Gönderilen WP sırası"})
+      # Alan kapalı bir poligon olarak gönderiliyor: son köşeden ilkine dönüş
+      # de uçulur. Kesikli çizilir ki operatör "bunu ben koymadım" demesin.
+      if len(zincir) >= 3:
+        parcalar.append({"pts": [zincir[-1], zincir[0]],
+                         "color": self._G2_ROTA_RENGI,
+                         "label": "Alan kapanışı", "dash": "4,4"})
+      if not parcalar:
+        self._map.clear_route()
+        return
+      self._map.draw_route_multi(parcalar, ok_araligi=1, kesisim=True)
+      # Direk kapısı: şartnamenin geçiş çizgisi. Rota katmanına EK olarak
+      # çizilir (draw_route_extra temizlemez).
+      if self._pole1 and self._pole2:
+        self._map.draw_route_extra(
+          [(self._pole1["lat"], self._pole1["lon"]),
+           (self._pole2["lat"], self._pole2["lon"])],
+          self._G2_KAPI_RENGI, dash="9,6")
+    except Exception:
+      logger.exception("Görev 2 rota önizlemesi çizilemedi")
 
   def _build_specific_controls(self):
     self._pole1: dict | None = None
@@ -3163,6 +3342,9 @@ class InfinityMissionTab(_BaseMissionTab):
       "dist": dist, "algo": algo,
       "eta_s": length / max(0.5, loop_v),
       "finish_leg": finish_leg, "finish_ab": finish_ab,
+      # Tur sınırlarını haritada gösterebilmek için: full = [kalkış] + desen,
+      # desen `tur` kez tekrarlanan aynı sekiz çizimidir.
+      "desen_n": len(pts), "tur": int(self._inf_laps.value()),
     }
 
   # ── Tur Hızı: otomatik türetme (2026-08-31) ─────────────────────────────
@@ -3264,6 +3446,40 @@ class InfinityMissionTab(_BaseMissionTab):
         f"optimumunu kullanır.{_kirpildi}")
     self._speed_note.setVisible(True)
 
+  # Tur renkleri — ardışık turlar birbirinden AYIRT EDİLEBİLİR olmalı; bu
+  # yüzden yakın tonlar seçilmedi. Renk körlüğünde de ayrışsın diye ton
+  # (mavi/turuncu/mor/camgöbeği/pembe) yanında parlaklık da değişiyor.
+  _TUR_RENKLERI = ["#4ade80", "#f59e0b", "#a78bfa", "#22d3ee", "#fb7185"]
+  _GIRIS_RENGI = "#94a3b8"
+
+  def _inf_tur_parcalari(self, full: list, info: dict) -> list[dict]:
+    """full listesini [giriş bacağı] + tur tur parçalara böler."""
+    desen_n = int(info.get("desen_n") or 0)
+    tur = max(1, int(info.get("tur") or 1))
+    parcalar: list[dict] = []
+    if desen_n <= 0 or len(full) < 2:
+      return [{"pts": full, "color": _MAP_ROUTE_COLOR, "label": "Rota"}]
+
+    # full[0] kalkış noktası, kalanı desen. Giriş bacağı ayrı renk/kesikli:
+    # operatör "rotaya nasıl giriyor" sorusunu buradan cevaplıyor.
+    parcalar.append({"pts": [full[0], full[1]],
+                     "color": self._GIRIS_RENGI, "label": "Giriş bacağı",
+                     "dash": "6,5"})
+    desen = full[1:1 + desen_n]
+    adim = max(1, desen_n // tur)
+    for i in range(tur):
+      bas = i * adim
+      son = desen_n if i == tur - 1 else min(desen_n, (i + 1) * adim)
+      if bas >= son:
+        continue
+      # Turlar bitişik görünsün diye bir sonraki turun ilk noktası eklenir;
+      # yoksa renk değişiminde çizgide görsel boşluk kalır.
+      dilim = desen[bas:son + (1 if son < desen_n else 0)]
+      parcalar.append({"pts": dilim,
+                       "color": self._TUR_RENKLERI[i % len(self._TUR_RENKLERI)],
+                       "label": f"{i + 1}. tur"})
+    return parcalar
+
   def _refresh_inf_preview(self, fit: bool = False):
     """Rota önizlemesini haritaya çizer ve özet etiketini günceller."""
     if not hasattr(self, "_inf_prev_lbl"):
@@ -3280,9 +3496,13 @@ class InfinityMissionTab(_BaseMissionTab):
         pass
       return
     try:
-      self._map.draw_route(pts, _MAP_ROUTE_COLOR, fit=fit)
+      # NEDEN TUR TUR (2026-09-03 operatör isteği): "1. tur nerede bitiyor,
+      # 2. tur nerede başlıyor" tek renk çizgide görülemiyordu. full listesi
+      # [kalkış] + `tur` kez tekrarlanan desen; aynı sırayla dilimlenir.
+      self._map.draw_route_multi(self._inf_tur_parcalari(pts, info),
+                                 ok_araligi=5, kesisim=True, fit=fit)
       # Son bacak: pist çizgisi (düz, A-B hattı) + şematik bitiş bacağı
-      # (kesikli). drawRoute her çağrıda önizleme katmanını sıfırladığı için
+      # (kesikli). draw_route_multi önizleme katmanını sıfırladığı için
       # ekler ONDAN SONRA çizilmeli (draw_route_extra temizlemez, ekler).
       if info.get("finish_ab"):
         self._map.draw_route_extra(list(info["finish_ab"]), _MAP_FINISH_COLOR)
@@ -3290,7 +3510,7 @@ class InfinityMissionTab(_BaseMissionTab):
         self._map.draw_route_extra(list(info["finish_leg"]),
                                    _MAP_FINISH_COLOR, dash="7,7")
     except Exception:
-      pass
+      logger.exception("Görev 1 rota önizlemesi çizilemedi")
     _eta = info["eta_s"]
     self._inf_prev_lbl.setText(
       f"Rota: {info['n']} nokta, {info['length_m']:.0f} m yol, "
