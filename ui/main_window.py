@@ -568,6 +568,11 @@ class MainWindow(QMainWindow):
         # "Calibration successful/FAILED") göre ilerler. Bu bağlantı olmadan panel
         # adımları körlemesine sayar ve doğrulanmamış "tamamlandı" gösterirdi.
         w.status_text_received.connect(self._calib_view.on_status_text)
+        # NEDEN (2026-09-03): FC'nin komut hükmü (COMMAND_ACK) bugüne kadar
+        # hiç okunmuyordu. Ölçüldü: ivmeölçer kalibrasyonunda altı konum da
+        # gönderildi, FC tek STATUSTEXT döndürmedi; komutun reddedilip
+        # edilmediğini görmek İMKÂNSIZDI. Bu bağlantı olmadan panel yine kör.
+        w.command_ack_received.connect(self._calib_view.on_command_ack)
         w.mission_download_done.connect(self._on_mission_download_done)
         w.mission_download_progress.connect(self._on_mission_download_progress)
         w.mission_upload_progress.connect(self._on_mission_upload_progress)
@@ -595,6 +600,13 @@ class MainWindow(QMainWindow):
         self._mission_view.write_mission.connect(w.upload_mission)
         self._mission_view.read_mission.connect(w.request_mission)
         self._mission_panel.send_command.connect(w.send_command)
+        # NEDEN: HOME_POSITION FC'nin OTORİTE kalkış noktasıdır (ArduPilot
+        # GPS kilidi/arm anında kendi belirler). Bugüne kadar mavlink_worker
+        # bunu yayınlıyordu ama arayüzde KİMSE dinlemiyordu; görev paneli
+        # bunun yerine gördüğü İLK telemetri konumuna kilitleniyordu — ve
+        # telemetri yalnız AKTİF sekmeye gittiği için o an 'aracın kalkış
+        # anı' değil 'operatörün sekmeyi açtığı an' oluyordu.
+        w.home_position_updated.connect(self._mission_panel.on_home_position)
         self._test_panel.send_command.connect(w.send_command)
         self.top_bar.fcu_start_mission_requested.connect(w.start_flight_sequence)
         self._syslog_view.request_log_list.connect(w.request_log_list)

@@ -513,6 +513,15 @@ class CalibrationView(QWidget):
     _ST_FAIL   = ("calibration failed", "calibration cancelled",
                   "calibration canceled", "calibration timed out")
 
+    # Zaman aşımı süreleri. NEDEN İKİ FARKLI DEĞER (2026-09-03 saha ölçümü):
+    # eskiden tek bir 3000 ms vardı. Konumlar arası 3 sn FC daha örnekleme
+    # bitirmeden doluyor, SON konumdan sonra ise FC'nin altı konumu çözüp
+    # "Calibration successful" yollaması saniyeler sürüyor. 3 sn dolunca
+    # _accel_active sıfırlanıyor, sonra gelen GERÇEK başarı mesajı
+    # on_status_text'in ilk kapısından sessizce düşüyordu.
+    _ACCEL_ADIM_ACK_MS  = 10_000    # konumlar arası istem beklemesi
+    _ACCEL_SONUC_ACK_MS = 45_000    # son konumdan sonra sonuç beklemesi
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._accel_step = 0
@@ -524,6 +533,9 @@ class CalibrationView(QWidget):
         self._rc_max_labels = {}
         self._capturing_rc = False
         self._compass_active = False
+        # Reboot kapısı için: ARM'lı araçta yeniden başlatma ENGELLENİR.
+        # Telemetriden okunur (motor testiyle aynı kaynak: data['armed']).
+        self._armed = False
         # NEDEN: İvmeölçer akışı artık FC onayına (STATUSTEXT) dayanıyor;
         # bu durum bayrakları olmadan "tamamlandı" iddiası doğrulanamıyordu.
         self._accel_active = False
@@ -582,11 +594,11 @@ class CalibrationView(QWidget):
 
         self._build_ui()
         self._install_wheel_guards()
-        # Tema değişince satır-içi renkler son duruma göre yeniden yazılır
+        # Tema değişince satir-içi renkler son duruma göre yeniden yazılır
         theme.notifier().changed.connect(lambda _n: self._apply_theme_colors())
 
     # ──────────────────────────────────────────────────────────────
-    # TEMA — satır-içi renklerin tek kaynağı
+    # TEMA — satir-içi renklerin tek kaynağı
     # ──────────────────────────────────────────────────────────────
     @staticmethod
     def _log_style() -> str:
@@ -631,9 +643,9 @@ class CalibrationView(QWidget):
         self._rc_status.setStyleSheet(f"color:{theme.c(self._rc_token)};{weight}")
 
     def _apply_theme_colors(self) -> None:
-        """Tema değişince TÜM satır-içi renkleri son duruma göre yeniden yazar.
+        """Tema değişince TÜM satir-içi renkleri son duruma göre yeniden yazar.
 
-        NEDEN: Kurulumda yazılan satır-içi renkler tema değişince BAYAT kalır
+        NEDEN: Kurulumda yazılan satir-içi renkler tema değişince BAYAT kalır
         (koyu tema yeşili beyaz zeminde okunmaz). Her durum metninin son
         token'ı saklandığı için burada anlamı bozmadan yeniden uygulanır.
         """
@@ -806,6 +818,58 @@ class CalibrationView(QWidget):
                     fn(bagli)
                 except Exception:
                     logger.exception("Alt panel bağlantı bildirimi hatası")
+        self._guncelle_reboot_butonu()
+
+    # ── ARACI YENİDEN BAŞLAT ────────────────────────────────────────────
+    # param1=1 → yalnızca uçuş kontrolcüsünü yeniden başlat.
+    # param1=3 BOOTLOADER'a düşürür ve araç telemetriye BİR DAHA dönmez
+    # (kurtarmak için USB + yer istasyonu gerekir) — bu yüzden sabit 1.
+    _REBOOT_PARAMS = [1, 0, 0, 0, 0, 0, 0]
+
+    def _guncelle_reboot_butonu(self) -> None:
+        """Reboot düğmesinin açık/kapalı durumunu ve NEDENİNİ yazar."""
+        if not hasattr(self, "_btn_reboot"):
+            return
+        neden = self._kanal.neden_kapali()
+        if not neden and self._armed:
+            # Uçan/ARM'lı araçta reboot = motorların anında durması.
+            neden = "Araç ARM'LI — reboot engellendi. Önce DISARM edin."
+        self._btn_reboot.setEnabled(not neden)
+        self._reboot_lbl.setText(neden)
+        self._reboot_lbl.setStyleSheet(
+            f"color:{theme.c('danger' if self._armed else 'text_muted')};")
+
+    def _reboot_fc(self) -> None:
+        """Uçuş kontrolcüsünü yeniden başlatır (onay ister)."""
+        neden = self._kanal.neden_kapali()
+        if neden or self._armed:
+            aciklama = neden or "araç ARM'lı"
+            self._compass_log.append("[RET] Reboot gönderilmedi: " + aciklama)
+            return
+        yanit = QMessageBox.question(
+            self, "Aracı Yeniden Başlat",
+            "Uçuş kontrolcüsü YENİDEN BAŞLATILACAK.\n\n"
+            "• Telemetri linki kopacak, birkaç saniye sonra geri gelir.\n"
+            "• Kaydedilmemiş parametreler KAYBOLUR.\n"
+            "• Araç havadayken ASLA yapılmamalıdır.\n\n"
+            "Devam edilsin mi?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if yanit != QMessageBox.StandardButton.Yes:
+            return
+        gonderildi = self._kanal.komut(
+            self._get_mavlink().MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN,
+            self._REBOOT_PARAMS)
+        if gonderildi:
+            self._compass_log.append(
+                "[REBOOT] Yeniden başlatma komutu gönderildi — link birkaç "
+                "saniye kopacak. FC hükmü (COMMAND_ACK) aşağıda görünecek.")
+            self._reboot_lbl.setText(
+                "Reboot gönderildi — telemetri geri gelene kadar bekleyin.")
+        else:
+            self._compass_log.append(
+                "[HATA] Reboot komutu gönderilemedi (link yok).")
 
     def acil_motor_durdur(self) -> None:
         """Dışarıdan (main_window sekme değişimi / kapanış) çağrılır."""
@@ -980,7 +1044,9 @@ class CalibrationView(QWidget):
         # NEDEN: FC yanıtı gelene kadar buton kilitli; ama STATUSTEXT hiç bağlı
         # değilse kullanıcı kilitli kalmasın diye zaman aşımı ile serbest bırakılır.
         self._btn_accel_next.setEnabled(False)
-        self._accel_ack_timer.start(3000)
+        self._accel_ack_timer.start(
+            self._ACCEL_SONUC_ACK_MS if self._accel_step >= len(_ACCEL_STEPS)
+            else self._ACCEL_ADIM_ACK_MS)
 
         if self._accel_step >= len(_ACCEL_STEPS):
             self._accel_progress.setValue(6)
@@ -1004,12 +1070,16 @@ class CalibrationView(QWidget):
         self._accel_awaiting_fc = False
         if self._accel_step >= len(_ACCEL_STEPS):
             self._accel_step_lbl.setText(
-                "⚠ Tüm konumlar gönderildi — FC'den sonuç mesajı alınamadı.\n"
-                "Kalibrasyonun BAŞARILI olduğu doğrulanamadı."
+                "⚠ Tüm konumlar gönderildi — FC'den sonuç mesajı GELMEDİ.\n"
+                "Kalibrasyonun BAŞARILI olduğu DOĞRULANMADI. Dinleme sürüyor."
             )
             self._accel_step_style("warning")
-            self._accel_log.append("[UYARI] FC sonuç mesajı (STATUSTEXT) alınamadı")
-            self._accel_active = False
+            self._accel_log.append(
+                "[UYARI] FC sonuç mesajı (STATUSTEXT) alınamadı — dinleme sürüyor")
+            # NEDEN _accel_active KAPATILMIYOR (2026-09-03): kapatılırsa
+            # on_status_text'in ilk kapısı, SONRADAN gelen gerçek
+            # "Calibration successful" mesajını sessizce yutuyordu. Kullanıcı
+            # kilitlenmesin diye Başlat açılır; geç gelen sonuç yine işlenir.
             self._btn_accel_start.setEnabled(True)
         else:
             self._btn_accel_next.setEnabled(True)
@@ -1084,6 +1154,68 @@ class CalibrationView(QWidget):
                 )
                 self._accel_step_style("warning")
 
+    # FC hükmünü operatör diline çeviren tablo. Ham "result=4" saha ekibine
+    # hiçbir şey anlatmıyordu.
+    _ACK_ADLARI = {
+        0: "kabul edildi",
+        1: "GEÇİCİ RET — araç şu an uygun değil (armed mi? güvenlik anahtarı?)",
+        2: "GEÇERSİZ PARAMETRE",
+        3: "DESTEKLENMİYOR — bu FC sürümü bu komutu tanımıyor",
+        4: "BAŞARISIZ — FC komutu reddetti",
+        5: "sürüyor",
+        6: "iptal edildi",
+    }
+    # İlgilendiğimiz komutlar: kalibrasyon başlat / konum bildir / pusula / reboot
+    _ACK_KOMUT_ADLARI = {
+        241:   "Kalibrasyon başlat (PREFLIGHT_CALIBRATION)",
+        42429: "İvmeölçer konum bildir (ACCELCAL_VEHICLE_POS)",
+        42424: "Pusula kalibrasyonu (DO_START_MAG_CAL)",
+        42425: "Pusula kalibrasyonu durdur",
+        246:   "Yeniden başlat (PREFLIGHT_REBOOT_SHUTDOWN)",
+    }
+
+    @pyqtSlot(int, int)
+    def on_command_ack(self, cmd_id: int, result: int) -> None:
+        """FC'nin komut hükmünü panele yansıtır.
+
+        NEDEN VAR (2026-09-03 saha ölçümü): operatör ivmeölçer kalibrasyonunu
+        başlattı, altı konumu da gönderdi (GCS logu: CMD id=241, sonra
+        42429 pos=1..6), FC HİÇBİR STATUSTEXT döndürmedi. Komutun kabul mü
+        edildiği red mi olduğu YKİ'de görünmüyordu çünkü COMMAND_ACK hiç
+        okunmuyordu — panel bu sessizliği "devam ediyor" sanıp operatörü
+        altı adım boyunca körlemesine tıklattı. Artık ret ANINDA yazılır.
+        """
+        if cmd_id not in self._ACK_KOMUT_ADLARI:
+            return
+        ad = self._ACK_KOMUT_ADLARI[cmd_id]
+        hukum = self._ACK_ADLARI.get(result, f"bilinmeyen sonuç ({result})")
+        satir = f"[FC HÜKMÜ] {ad}: {hukum}"
+
+        if cmd_id == 42424 or cmd_id == 42425:
+            self._compass_log.append(satir)
+        elif cmd_id == 246:
+            self._compass_log.append(satir)
+        else:
+            self._accel_log.append(satir)
+
+        # Kabul (0) ve "sürüyor" (5) dışındaki her sonuç REDDİR.
+        if result in (0, 5):
+            return
+
+        if cmd_id in (241, 42429) and self._accel_active:
+            # Kalibrasyon fiilen başlamadı/ilerlemedi — sahte ilerlemeyi durdur.
+            self._accel_ack_timer.stop()
+            self._accel_active = False
+            self._accel_awaiting_fc = False
+            self._btn_accel_next.setEnabled(False)
+            self._btn_accel_start.setEnabled(True)
+            self._accel_step_lbl.setText(
+                f"✗ FC komutu REDDETTİ: {hukum}\n"
+                "Kalibrasyon BAŞLAMADI — aracın disarm ve düz durduğundan,\n"
+                "güvenlik anahtarının basılı olmadığından emin olup tekrar deneyin."
+            )
+            self._accel_step_style("danger")
+
     # ──────────────────────────────────────────────────────────────
     # PUSULA
     # ──────────────────────────────────────────────────────────────
@@ -1154,6 +1286,29 @@ class CalibrationView(QWidget):
         self._btn_compass_cancel.clicked.connect(self._cancel_compass)
         btn_row.addWidget(self._btn_compass_cancel)
         rl.addLayout(btn_row)
+
+        # ── ARACI YENİDEN BAŞLAT ────────────────────────────────────────────
+        # NEDEN BURADA: ArduPilot pusula kalibrasyonundan sonra ayarları
+        # uygulamak için reboot İSTER — sahada ölçüldü (2026-09-03), FC
+        # dakikalarca "PreArm: Compass calibrated requires reboot" bastı ve
+        # YKİ'de reboot yolu olmadığı için operatör Mission Planner'a geçmek
+        # zorunda kalıyordu. Bu yüzden düğme pusula sekmesinde.
+        self._btn_reboot = QPushButton("⟳ Aracı Yeniden Başlat (FC reboot)")
+        self._btn_reboot.setObjectName("dangerButton")
+        self._btn_reboot.setMinimumHeight(30)
+        self._btn_reboot.setToolTip(
+            "Uçuş kontrol kartını yeniden başlatır.\n"
+            "Pusula kalibrasyonundan sonra ayarların uygulanması için gerekir.\n"
+            "ARM'lıyken veya bağlantı yokken ÇALIŞMAZ. Telemetri kısa süre kopar."
+        )
+        self._btn_reboot.clicked.connect(self._reboot_fc)
+        rl.addWidget(self._btn_reboot)
+
+        self._reboot_lbl = QLabel("")
+        self._reboot_lbl.setWordWrap(True)
+        self._reboot_lbl.setObjectName("mutedLabel")
+        rl.addWidget(self._reboot_lbl)
+        self._guncelle_reboot_butonu()
 
         self._compass_log = QTextEdit()
         self._compass_log.setReadOnly(True)
@@ -1710,6 +1865,11 @@ class CalibrationView(QWidget):
         # sekmeye veriyor (_dispatch_telemetry) ve gördüğü widget bu sınıftır;
         # alt paneller aksi hâlde canlı veri (armed durumu, RC PWM'i, titreşim)
         # HİÇ almazdı — motor kapısı "araç ARM'lı" durumunu göremezdi.
+        _armed_yeni = bool(data.get("armed", False))
+        if _armed_yeni != self._armed:
+            self._armed = _armed_yeni
+            self._guncelle_reboot_butonu()
+
         for panel in (self._sensor_view, self._motor_view, self._modes_view):
             fn = getattr(panel, "update_telemetry", None)
             if callable(fn):

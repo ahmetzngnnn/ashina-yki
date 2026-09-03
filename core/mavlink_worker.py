@@ -38,6 +38,20 @@ _COPTER_MODES = {
 
 _GPS_FIX_NAMES = {0: "No GPS", 1: "No Fix", 2: "2D", 3: "3D", 4: "DGPS", 5: "RTK Float", 6: "RTK Fixed"}
 
+# MAV_RESULT — FC'nin komut hükmü. Operatöre TÜRKÇE gösterilebilsin diye
+# burada; ham sayı (ör. 4) saha ekibine hiçbir şey anlatmıyor.
+_MAV_RESULT_ADLARI = {
+    0: "KABUL EDİLDİ",
+    1: "GEÇİCİ RET (araç şu an uygun değil)",
+    2: "GEÇERSİZ PARAMETRE",
+    3: "DESTEKLENMİYOR",
+    4: "BAŞARISIZ (FC komutu reddetti)",
+    5: "SÜRÜYOR",
+    6: "İPTAL EDİLDİ",
+}
+# Ret sayılan sonuçlar — 0 (kabul) ve 5 (sürüyor) dışındaki her şey.
+_MAV_RESULT_RET = (1, 2, 3, 4, 6)
+
 # ── Telemetri akış aralıkları (µs) — mesaj_id → aralık ────────────────────────
 # Radyo (telemetri COM, ~57600 baud) bant genişliğine uygun seçildi. Eskiden
 # REQUEST_DATA_STREAM(ALL@4Hz) + yüksek SET_MESSAGE_INTERVAL birlikte radyoyu
@@ -100,6 +114,12 @@ class MavlinkWorker(QThread):
     log_download_progress = pyqtSignal(int, int)    # bytes_received, total_bytes
     log_download_done = pyqtSignal(bool, str, bytes)  # success, filename, raw_data
     home_position_updated = pyqtSignal(float, float, float)  # lat, lon, alt_m
+    # NEDEN (2026-09-03): FC'nin komut hükmü bugüne kadar HİÇ okunmuyordu.
+    # Ölçüldü: operatör 18:56:39'da ivmeölçer kalibrasyonu başlattı, altı
+    # konumu da gönderdi (log: CMD id=241/42429), FC hiçbir STATUSTEXT
+    # döndürmedi. Komut kabul mü edildi red mi — COMMAND_ACK okunmadığı için
+    # YKİ'nin bunu bilmesi İMKÂNSIZDI; panel sessizliği 'devam' sandı.
+    command_ack_received = pyqtSignal(int, int)   # command_id, MAV_RESULT
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -545,6 +565,13 @@ class MavlinkWorker(QThread):
                             msg.eph, msg.epv)
             elif msg_type == "EKF_STATUS_REPORT":
                 self._telemetry_accumulator["ekf_flags"] = msg.flags
+            elif msg_type == "COMMAND_ACK":
+                _ack_cmd = int(getattr(msg, "command", -1))
+                _ack_res = int(getattr(msg, "result", -1))
+                logger.info("COMMAND_ACK: cmd=%d result=%d (%s)",
+                            _ack_cmd, _ack_res,
+                            _MAV_RESULT_ADLARI.get(_ack_res, "?"))
+                self.command_ack_received.emit(_ack_cmd, _ack_res)
             elif msg_type == "STATUSTEXT":
                 txt = msg.text
                 if isinstance(txt, bytes):

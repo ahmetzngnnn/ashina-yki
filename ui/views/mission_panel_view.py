@@ -505,6 +505,11 @@ class _BaseMissionTab(QWidget):
     super().__init__(parent)
     self._wps: list[dict] = []
     self._first_home_set = False
+    # FC'nin KENDİ home'u geldi mi. NEDEN ayrı bayrak (2026-09-03):
+    # HOME_POSITION otoritedir (ArduPilot GPS kilidinde kendi belirler);
+    # telemetriden kilitlenen tahmini home onu EZMEMELİ.
+    self._fc_home_alindi = False
+    self._map_ilk_ortalama = False
     # Aracın ilk telemetri konumu = otomatik kalkış (HOME) noktası
     self._home_lat: float | None = None
     self._home_lon: float | None = None
@@ -1423,14 +1428,83 @@ class _BaseMissionTab(QWidget):
     lon = data.get("lon")
     hdg = data.get("hdg", 0)
     if lat and lon:
-      if not self._first_home_set:
-        # Aracın ilk konumu = otomatik kalkış (HOME) noktası
-        self._home_lat = float(lat)
-        self._home_lon = float(lon)
-        self._map.center_at(float(lat), float(lon))
-        self._map.set_home(float(lat), float(lon))
-        self._first_home_set = True
+      # NEDEN FIX KALİTESİ ARANIYOR (2026-09-03): eskiden İLK sıfır olmayan
+      # lat/lon home yapılıyordu. İki ayrı arıza üretiyordu: (a) fix
+      # oturmadan gelen çöp konum kalkış noktası sanılıyordu; (b) telemetri
+      # YALNIZ AKTİF sekmeye dağıtıldığı için (main_window._dispatch_telemetry)
+      # kilit "aracın kalkış anı"na değil "operatörün bu sekmeyi ilk açtığı
+      # an"a düşüyordu. Artık 3D fix ve yeterli uydu şart; ayrıca FC'nin
+      # kendi HOME_POSITION'ı geldiyse bu yol hiç çalışmaz (o otoritedir).
+      if not self._first_home_set and not self._fc_home_alindi:
+        if self._gps_home_icin_yeterli(data):
+          self._home_lat = float(lat)
+          self._home_lon = float(lon)
+          self._map.center_at(float(lat), float(lon))
+          self._map.set_home(float(lat), float(lon))
+          self._first_home_set = True
+          self._wp_tiplerini_tazele()
       self._map.set_drone_pos(float(lat), float(lon), float(hdg))
+
+  # Home kilidi için asgari GPS kalitesi. 3D_FIX (3) altı konum metre-onlarca
+  # kayabilir; kalkış noktası bir kez kilitlenip görev boyunca kullanıldığı
+  # için buradaki hata TÜM görev geometrisine taşınır.
+  def _wp_tiplerini_tazele(self) -> None:
+    """Home sonradan gelince bayat TAKEOFF waypoint'ini düzeltir.
+
+    NEDEN: _add_wp, home YOKKEN eklenen ilk noktayı TAKEOFF yapıyor. Operatör
+    tarama alanını araç bağlanmadan çizerse ilk köşe TAKEOFF olarak kalıyor ve
+    home geldikten sonra da öyle kalıyordu — yani operatöre hâlâ "kalkış
+    noktası seçtirilmiş" oluyordu. Home varken TAKEOFF'a gerek yok.
+    """
+    if self._home_lat is None or not self._wps:
+      return
+    degisti = False
+    for wp in self._wps:
+      if wp.get("type") == "TAKEOFF":
+        wp["type"] = "WAYPOINT"
+        degisti = True
+    if degisti:
+      self._refresh_map()
+      self._refresh_table()
+
+  _HOME_MIN_FIX = 3        # MAV GPS_FIX_TYPE_3D_FIX
+  _HOME_MIN_SATS = 6
+
+  def _gps_home_icin_yeterli(self, data: dict) -> bool:
+    """Telemetri konumu kalkış noktası kilidi için güvenilir mi."""
+    fix = data.get("gps_fix_type")
+    sats = data.get("gps_sats")
+    # Alan hiç yoksa (eski/kısıtlı telemetri) eski davranışa dönme: kilitleme.
+    if fix is None:
+      return False
+    if int(fix) < self._HOME_MIN_FIX:
+      return False
+    if sats is not None and int(sats) < self._HOME_MIN_SATS:
+      return False
+    return True
+
+  @pyqtSlot(float, float, float)
+  def on_home_position(self, lat: float, lon: float, alt: float):
+    """FC'nin OTORİTE kalkış noktası (HOME_POSITION mesajı).
+
+    NEDEN (2026-09-03): mavlink_worker bu mesajı zaten ayrıştırıp
+    home_position_updated ile yayınlıyordu ama arayüzde KİMSE dinlemiyordu.
+    Operatör "kalkış noktasını bana seçtirmesin" dediği için doğru kaynak
+    budur: ArduPilot home'u GPS kilidi/arm anında kendi belirler, sonradan
+    değişirse (yeniden arm, farklı kalkış) yeni mesaj gelir ve BURASI
+    tazelenir — telemetri kilidinin aksine tek seferlik değildir.
+    """
+    if not lat and not lon:
+      return
+    self._home_lat = float(lat)
+    self._home_lon = float(lon)
+    self._fc_home_alindi = True
+    self._first_home_set = True
+    self._map.set_home(float(lat), float(lon))
+    if not self._map_ilk_ortalama:
+      self._map.center_at(float(lat), float(lon))
+      self._map_ilk_ortalama = True
+    self._wp_tiplerini_tazele()
 
   # ── GÖREV KRONOMETRESİ (2026-08-30 şartname denetimi) ─────────────────────
   def _clock_budget_from_field(self) -> float:
@@ -3502,6 +3576,21 @@ class MissionPanelView(QWidget):
   def update_telemetry(self, data: dict):
     for tab in (self._target_drop_tab, self._infinity_tab):
       tab.update_telemetry(data)
+
+  @pyqtSlot(float, float, float)
+  def on_home_position(self, lat: float, lon: float, alt: float):
+    """FC'nin HOME_POSITION'ını HER İKİ görev sekmesine dağıtır.
+
+    NEDEN dağıtım şart: update_telemetry yalnız GÖRÜNÜR sekmeye gidiyor
+    (main_window._dispatch_telemetry). Home ise sekme açık olsun olmasın
+    doğru olmalı — operatör görev sekmesini açmadan önce araç kalkmış
+    olabilir. Bu yuva doğrudan worker sinyaline bağlıdır, sekmeden bağımsız.
+    """
+    for tab in (self._target_drop_tab, self._infinity_tab):
+      try:
+        tab.on_home_position(lat, lon, alt)
+      except Exception:
+        logger.exception("Sekmeye home dağıtılamadı")
 
   @pyqtSlot(dict)
   def update_detection_status(self, resp: dict):
