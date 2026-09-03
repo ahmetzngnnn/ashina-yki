@@ -63,9 +63,16 @@ from __future__ import annotations
 from typing import Any, Mapping, Optional
 
 # ── Paket tanımı ───────────────────────────────────────────────────────────
-# ASHİNA aracı: 6S 4200 mAh LiPo. FC'de ölçülen (BATT_* parametreleri):
+# ASHİNA aracı: Leopard 40C 6S LiPo 4200 mAh (operatör doğruladı 2026-09-03).
+# FC'de OLMASI GEREKEN (bkz. IHA/config.json::fc_params_expected — uçuş öncesi
+# kontrol bunları denetler):
 #   BATT_MONITOR=4 (analog gerilim+akım), BATT_CAPACITY=4200,
-#   BATT_LOW_VOLT=21.2, BATT_CRT_VOLT=21.0, BATT_FS_VOLTSRC=0 (ham gerilim).
+#   BATT_LOW_VOLT=21.0 (3.50 V/hücre), BATT_CRT_VOLT=19.8 (3.30 V/hücre).
+#
+# 2026-09-03 DEĞİŞTİ: burada eskiden LOW=21.2 / CRT=21.0 yazıyordu; ikisi
+# arasında yalnız 0.2 V vardı. LOW → RTL, CRT → Land olduğu için araç RTL'e
+# geçtikten saniyeler sonra Land'e düşüyor ve eve dönmeye fırsat bulamadan
+# olduğu yere iniyordu. Yarışmada bu, bırakma alanının dışına inmek demektir.
 HUCRE_SAYISI = 6
 HUCRE_DOLU_V = 4.20      # tam dolu LiPo hücresi (üretici üst sınırı)
 HUCRE_BOS_V  = 3.50      # "boş" kabulü — kullanıcı kararı (bkz. dosya başlığı)

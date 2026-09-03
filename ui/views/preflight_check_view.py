@@ -101,6 +101,21 @@ VARSAYILAN_BEKLENEN: list[tuple[str, float, str, str]] = [
      "kopunca araç 20 m'de GUIDED'da asılı kaldı; 1 = RTL bunu önler. "
      "GERÇEK LOGDA 0 ÇIKMIŞTI — sahada mutlaka doğrulayın."),
     ("FS_GCS_TIMEOUT",  5,     SINIF_SARTNAME, "GCS failsafe tetikleme süresi (s)."),
+    ("BATT_MONITOR",    4,     SINIF_KRITIK,
+     "4 = analog gerilim + akım. Akım okunmazsa harcanan mAh sayılamaz ve "
+     "yüzde tabanlı emniyet anlamsızlaşır."),
+    ("BATT_CAPACITY",   4200,  SINIF_KRITIK,
+     "Leopard 40C 6S LiPo 4200 mAh (operatör bildirdi 2026-09-03). Yanlışsa "
+     "FC'nin bildirdiği kalan yüzde yanlış olur; İHA failsafe'i bu yüzdeyi "
+     "kullanıyor (bridge.py: battery_remaining) ve %10'da MANDALLI kritik "
+     "ilan edip görev kapısını kapatır."),
+    ("BATT_LOW_VOLT",   21.0,  SINIF_KRITIK,
+     "3.50 V/hücre x 6. RTL eşiği (BATT_FS_LOW_ACT=2)."),
+    ("BATT_CRT_VOLT",   19.8,  SINIF_KRITIK,
+     "3.30 V/hücre x 6. Land eşiği (BATT_FS_CRT_ACT=1). LOW ile arasında "
+     "1.2 V BİLEREK bırakıldı: FC'de kayıtlı eski değerler (21.2 / 21.0) "
+     "arasında yalnız 0.2 V vardı, yani RTL tetiklendikten hemen sonra Land "
+     "de tetikleniyor ve araç eve dönemeden olduğu yere iniyordu."),
     ("BATT_FS_LOW_ACT", 2,     SINIF_SARTNAME,
      "2 = RTL. Companion'ın batarya RTL'i KALDIRILDI; batarya emniyeti artık "
      "TAMAMEN FC'de. Uymuyorsa görev BAŞLAMAZ."),
