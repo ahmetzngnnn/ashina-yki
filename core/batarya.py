@@ -67,12 +67,20 @@ from typing import Any, Mapping, Optional
 # FC'de OLMASI GEREKEN (bkz. IHA/config.json::fc_params_expected — uçuş öncesi
 # kontrol bunları denetler):
 #   BATT_MONITOR=4 (analog gerilim+akım), BATT_CAPACITY=4200,
-#   BATT_LOW_VOLT=21.0 (3.50 V/hücre), BATT_CRT_VOLT=19.8 (3.30 V/hücre).
+#   BATT_LOW_VOLT=21.2 (3.533 V/hücre), BATT_CRT_VOLT=20.6 (3.433 V/hücre).
 #
-# 2026-09-03 DEĞİŞTİ: burada eskiden LOW=21.2 / CRT=21.0 yazıyordu; ikisi
-# arasında yalnız 0.2 V vardı. LOW → RTL, CRT → Land olduğu için araç RTL'e
-# geçtikten saniyeler sonra Land'e düşüyor ve eve dönmeye fırsat bulamadan
-# olduğu yere iniyordu. Yarışmada bu, bırakma alanının dışına inmek demektir.
+# 2026-09-03 DEĞİŞTİ (operatör kararı): CRT eskiden 21.0 idi, LOW ile arasında
+# yalnız 0.2 V vardı. LOW → RTL, CRT → Land olduğu için araç RTL'e geçtikten
+# saniyeler sonra Land'e düşüyor ve eve dönmeye fırsat bulamadan olduğu yere
+# iniyordu; yarışmada bu, bırakma alanının dışına inmek demektir. Aralık
+# 0.6 V'a (üç katına) çıkarıldı.
+#
+# DİKKAT — buradaki gerilim→yüzde eşlemesi (25.2 V=%100, 21.0 V=%0) ile FC'nin
+# bildirdiği KALAN YÜZDE AYRI ŞEYLERDİR. FC yüzdesi harcanan mAh sayımıdır ve
+# akım sensörü (BATT_AMP_PERVLT) kalibre EDİLMEDİĞİ sürece güvenilmezdir:
+# 2026-09-03'te 23.06 V'ta %10 raporladı, gerilim ~%49 diyordu. İHA'nın
+# batarya failsafe'i (failsafe_manager, %10'da MANDALLI kritik) FC yüzdesini
+# kullanır — kalibrasyon yapılana kadar sahte kritik beklenmelidir.
 HUCRE_SAYISI = 6
 HUCRE_DOLU_V = 4.20      # tam dolu LiPo hücresi (üretici üst sınırı)
 HUCRE_BOS_V  = 3.50      # "boş" kabulü — kullanıcı kararı (bkz. dosya başlığı)

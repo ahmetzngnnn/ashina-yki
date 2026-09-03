@@ -109,13 +109,14 @@ VARSAYILAN_BEKLENEN: list[tuple[str, float, str, str]] = [
      "FC'nin bildirdiği kalan yüzde yanlış olur; İHA failsafe'i bu yüzdeyi "
      "kullanıyor (bridge.py: battery_remaining) ve %10'da MANDALLI kritik "
      "ilan edip görev kapısını kapatır."),
-    ("BATT_LOW_VOLT",   21.0,  SINIF_KRITIK,
-     "3.50 V/hücre x 6. RTL eşiği (BATT_FS_LOW_ACT=2)."),
-    ("BATT_CRT_VOLT",   19.8,  SINIF_KRITIK,
-     "3.30 V/hücre x 6. Land eşiği (BATT_FS_CRT_ACT=1). LOW ile arasında "
-     "1.2 V BİLEREK bırakıldı: FC'de kayıtlı eski değerler (21.2 / 21.0) "
-     "arasında yalnız 0.2 V vardı, yani RTL tetiklendikten hemen sonra Land "
-     "de tetikleniyor ve araç eve dönemeden olduğu yere iniyordu."),
+    ("BATT_LOW_VOLT",   21.2,  SINIF_KRITIK,
+     "3.533 V/hücre x 6. RTL eşiği (BATT_FS_LOW_ACT=2). OPERATÖR KARARI "
+     "2026-09-03."),
+    ("BATT_CRT_VOLT",   20.6,  SINIF_KRITIK,
+     "3.433 V/hücre x 6. Land eşiği (BATT_FS_CRT_ACT=1). OPERATÖR KARARI: "
+     "LOW ile arasında 0.6 V var. Eski FC değerleri (21.2 / 21.0) arasında "
+     "yalnız 0.2 V vardı ve araç RTL'e geçtikten hemen sonra Land'e düşüp "
+     "eve dönemeden olduğu yere iniyordu; aralık üç katına çıkarıldı."),
     ("BATT_FS_LOW_ACT", 2,     SINIF_SARTNAME,
      "2 = RTL. Companion'ın batarya RTL'i KALDIRILDI; batarya emniyeti artık "
      "TAMAMEN FC'de. Uymuyorsa görev BAŞLAMAZ."),
