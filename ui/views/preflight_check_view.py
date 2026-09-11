@@ -89,7 +89,10 @@ VARSAYILAN_BEKLENEN: list[tuple[str, float, str, str]] = [
     ("ATC_ACCEL_R_MAX", 45000, SINIF_KRITIK, "Gerçek uçuş logunda ölçülen."),
     ("ATC_ACCEL_P_MAX", 45000, SINIF_KRITIK, "Gerçek uçuş logunda ölçülen."),
     ("ANGLE_MAX",       2500,  SINIF_KRITIK, "25° — gerçek logda ölçülen, kullanıcı onaylı."),
-    ("INS_HNTCH_FREQ",  78.8,  SINIF_KRITIK, "Harmonik notch merkez frekansı."),
+    ("INS_HNTCH_FREQ",  59.0,  SINIF_KRITIK,
+     "Harmonik notch merkez frekansı. 2026-09-06: 78.8 -> 59.0 (bu kopya "
+     "BAYATTI — gerçek pervane/motorla FFT ölçümü FARKLI çıktı, IHA/config.json "
+     "ile senkronlandı)."),
     ("ARMING_RUDDER",   2,     SINIF_KRITIK, "Rudder ile arm/disarm."),
     ("SERIAL1_BAUD",    115,   SINIF_KRITIK, "Companion MAVLink hattı (115200)."),
     ("FS_THR_ENABLE",   3,     SINIF_SARTNAME,
@@ -147,8 +150,11 @@ VARSAYILAN_BEKLENEN: list[tuple[str, float, str, str]] = [
      "TAMAMEN FC'de. Uymuyorsa görev BAŞLAMAZ."),
     ("BATT_FS_CRT_ACT", 1,     SINIF_SARTNAME, "1 = Land (kritik batarya)."),
     ("SERVO6_MIN",      1100,  SINIF_KRITIK,
-     "pwm_open=400 ArduPilot tarafından SERVOn_MIN'e kırpılır — bu kırpma artık "
-     "doğrulanan bir sözleşmedir, 800'e çekilirse servo dayanağa zorlanır."),
+     "2026-09-04 DÜZELTME: eski not 'pwm_open=400 SERVOn_MIN'e kırpılır' "
+     "diyordu — kaynak kod (SRV_Channel.cpp) okundu, KIRPMA YOK, PWM olduğu "
+     "gibi çıkışa gider. pwm_open artık 715 (400/820 DEĞİL, gerçek yükle "
+     "canlı doğrulandı 2026-09-05). Bu MIN/MAX'ın 715 ile hâlâ güvenli/"
+     "anlamlı olduğu ayrıca doğrulanmalı — salt yazılı değeri değil."),
     ("SERVO6_MAX",      1900,  SINIF_KRITIK, "Yük kapağı kapalı ucu."),
     ("SERVO7_MIN",      1100,  SINIF_KRITIK, "Bkz. SERVO6_MIN."),
     ("SERVO7_MAX",      1900,  SINIF_KRITIK, "Yük kapağı kapalı ucu."),

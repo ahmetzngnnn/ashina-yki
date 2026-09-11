@@ -294,6 +294,29 @@ function setHome(lat,lon){
  window._hm=L.marker([lat,lon],{icon:mkIco('#00e5ff','H')}).addTo(map);
  window._hm.bindPopup('<b>HOME / KALKIŞ NOKTASI</b><br>'+lat.toFixed(6)+','+lon.toFixed(6));
 }
+/* ── DİREK 1/2 — KALICI İŞARETÇİLER ─────────────────────────────────────────
+   NEDEN AYRI (drawCirc DEĞİL): drawCirc/drawPoly ortak 'xtra' katmanını
+   PAYLAŞIR ve her çağrıda clearX() ile o katmanı SIFIRLAR (tarama alanı
+   poligonu ile rota önizlemesinin aynı anda görünmesi için tasarlandı — bkz.
+   xtra yorumu). Direk 1 ve Direk 2 için ARDIŞIK iki drawCirc çağrısı
+   (_add_wp'teki eski kod) İKİNCİ direğin çemberi BİRİNCİYİ SİLİYORDU — iki
+   direk asla birlikte görünmüyordu. setHome/set_drone_pos'taki KALICI TEK
+   MARKER deseni burada da kullanılır: kendi değişkenlerinde tutulur, xtra'ya
+   dokunmaz, tekrar çağrıldığında konumu GÜNCELLENİR (silinip yeniden
+   eklenmez), profil her yüklendiğinde/alan her değiştiğinde çağrılabilir. */
+var _p1m=null, _p2m=null;
+function setPoles(lat1,lon1,lat2,lon2){
+ if(_p1m)map.removeLayer(_p1m);
+ if(_p2m)map.removeLayer(_p2m);
+ _p1m=L.marker([lat1,lon1],{icon:mkIco('#ffd700','1'),zIndexOffset:500}).addTo(map);
+ _p1m.bindTooltip('DİREK 1',{permanent:false});
+ _p2m=L.marker([lat2,lon2],{icon:mkIco('#ff8c00','2'),zIndexOffset:500}).addTo(map);
+ _p2m.bindTooltip('DİREK 2',{permanent:false});
+}
+function clearPoles(){
+ if(_p1m){map.removeLayer(_p1m);_p1m=null;}
+ if(_p2m){map.removeLayer(_p2m);_p2m=null;}
+}
 function centerMap(lat,lon){map.setView([lat,lon],16);}
 function ctr(lat,lon,z){map.setView([lat,lon],z||16);}
 
@@ -346,6 +369,12 @@ _MAP_FW_AREA_COLOR = "#a78bfa"  # Sabit Kanat pisti köşe çemberi (mor — ana
 _MAP_RED_AREA_COLOR  = "#ef4444"  # Kırmızı hedefin TAHMİNİ bölgesi
 _MAP_BLUE_AREA_COLOR = "#3b82f6"  # Mavi hedefin TAHMİNİ bölgesi
 _MAP_FINISH_COLOR    = "#22c55e"  # Pist başlangıç/bitiş çizgisi uçları (Görev 2)
+_MAP_LAND_COLOR      = "#f472b6"  # Görev 1 opsiyonel iniş noktası (pembe — kalkış/direk renklerinden ayrık)
+# Görev 2 TAM GÖREV ROTASI önizlemesi (2026-09-10, operatör: "kalkış
+# noktasından iniş noktasına kadar TÜM rotayı planla") — bkz.
+# TargetDropMissionTab._tum_gorev_rotasini_ciz.
+_MAP_TRANSIT_COLOR = "#60a5fa"  # Kalkış↔Direk / Direk↔Tarama transit bacakları (mavi)
+_MAP_GATE_COLOR    = "#fbbf24"  # Direk 1→Direk 2 kapı geçişi (amber — şartname kapı kuralı)
 
 # ── Fare Tekerleği Koruması ───────────────────────────────────────────────────
 # NEDEN: Sağ parametre paneli tekerlekle kaydırılırken imlecin ALTINDAKİ
@@ -598,6 +627,16 @@ class MissionMapWidget(QWidget):
   def set_home(self, lat: float, lon: float):
     self._js(f"setHome({lat},{lon})")
 
+  def set_poles(self, lat1: float, lon1: float, lat2: float, lon2: float):
+    """Direk 1/2'yi KALICI iki marker olarak çizer (drawCirc'ten farklı —
+    bkz. JS setPoles NEDEN: drawCirc'in paylaşılan 'xtra' katmanı ikinci
+    direği çizince birinciyi siliyordu). Tekrar çağrıldığında konum
+    güncellenir, birikmez — her önizleme yenilemesinde güvenle çağrılabilir."""
+    self._js(f"setPoles({lat1},{lon1},{lat2},{lon2})")
+
+  def clear_poles(self):
+    self._js("clearPoles()")
+
   def center_at(self, lat: float, lon: float, zoom: int = 16):
     self._js(f"ctr({lat},{lon},{zoom})")
 
@@ -606,6 +645,8 @@ class MissionMapWidget(QWidget):
 # (god-object küçültme + IHA ile senkron sözleşmesini tek yere toplama).
 from core.route_math import (  # noqa: F401
     _haversine, _bearing, _offset_point, _gen_lemniscate_pts, _gen_dubins_pts, compute_optimal_turn_radius, compute_ideal_cruise, build_infinity_route, infinity_to_qgc_wpl, _estimate_battery,
+    _gen_papyon_pts, compute_papyon_params, gen_coverage_path, swath_width_m,
+    compute_scanline, pole_clear_route, segment_pole_dist_m,
 )
 
 # ── Temel Görev Sekmesi ───────────────────────────────────────────────────────
@@ -1056,6 +1097,14 @@ class _BaseMissionTab(QWidget):
       "Kapalıyken harita tıklamaları yok sayılır."
     )
     self._sel_btn.toggled.connect(self._toggle_select)
+    # VARSAYILAN AÇIK (2026-09-10, operatör bildirimi: "harita seçim modu
+    # otomatik açık olarak uygulanmadı"). NEDEN: panel bu düğmeye basmadan
+    # haritaya tıklamayı YOK SAYIYOR — sahada 8 dakikalık hazırlık limitinde
+    # unutulan bir tıklama modu, "iniş noktasını haritadan seçeceğim"
+    # akışını baştan kilitler. `_map` ve `_hud_summary` bu satırdan önce
+    # zaten kuruldu (yukarıda __init__ sırası doğrulandı) — `setChecked`
+    # burada `_toggle_select(True)`'ı güvenle tetikler.
+    self._sel_btn.setChecked(True)
 
     btn_del = QPushButton("↩ Son WP Sil")
     btn_del.clicked.connect(self._remove_last)
@@ -1750,6 +1799,10 @@ class TargetDropMissionTab(_BaseMissionTab):
   _SEL_AREA  = "Tarama Köşesi"
   _SEL_POLE1 = "Direk 1"
   _SEL_POLE2 = "Direk 2"
+  _SEL_LAND  = "İniş Noktası (opsiyonel)"
+  # Tarama alanı üretiminde hattın hangi tarafı (bkz. _uret_tarama_alani)
+  _AREA_SIDE_RIGHT = "Sağ (Direk1→Direk2 yönüne göre)"
+  _AREA_SIDE_LEFT  = "Sol"
   # Pist başlangıç/bitiş çizgisi uçları — Görev 1'deki adlandırmayla AYNI
   # (bkz. InfinityMissionTab._SEL_FINISH_A/B), operatör iki panelde de aynı
   # kavramı aynı adla görsün.
@@ -1903,6 +1956,7 @@ class TargetDropMissionTab(_BaseMissionTab):
     sel_row.addWidget(QLabel("Harita tıklaması:"))
     self._sel_target = QComboBox()
     self._sel_target.addItems([self._SEL_AREA, self._SEL_POLE1, self._SEL_POLE2,
+                               self._SEL_LAND,
                                self._SEL_FINISH_A, self._SEL_FINISH_B,
                                self._SEL_RED_AREA, self._SEL_BLUE_AREA,
                                 self._SEL_FW_AREA])
@@ -1913,6 +1967,131 @@ class TargetDropMissionTab(_BaseMissionTab):
     self._pole_lbl = QLabel("Direk 1: —    Direk 2: —")
     self._pole_lbl.setObjectName("mutedLabel")
     lay.addWidget(self._pole_lbl)
+
+    # ── DİREK + İNİŞ KOORDİNATLARI — KALICI ALANLAR (2026-09-10) ──────────
+    # NEDEN: direkler şimdiye kadar YALNIZCA harita tıklamasıyla giriliyordu
+    # (self._pole1/_pole2 sözlükleri) ve profile KAYDEDİLMİYORDU — sahada her
+    # uçuşta yeniden tıklamak gerekiyordu. QLineEdit'e taşınınca
+    # _param_widgets() onları otomatik topluyor ve profil bunları saklıyor;
+    # yani sahada direkler PROFİLDEN GELİYOR, operatör yalnızca iniş
+    # noktasını seçiyor. Harita tıklaması bu alanları YAZAR (textChanged →
+    # _direkleri_alanlardan_oku), yani eski tıklama akışı da aynen çalışır —
+    # tek fark, artık kaydediliyor olması. Görev 1 sekmesi bu deseni zaten
+    # kullanıyordu (_p1_lat/_p1_lon...), Görev 2 ona hizalandı.
+    def _mk_coord_row2(icon_label: str, ipucu: str):
+      row = QGridLayout()
+      row.setHorizontalSpacing(6)
+      row.setVerticalSpacing(4)
+      lbl = QLabel(icon_label)
+      lbl.setFixedWidth(70)
+      lat_e = QLineEdit()
+      lat_e.setPlaceholderText("Enlem (ör. 38.3598333)")
+      lat_e.setMaximumWidth(220)
+      lon_e = QLineEdit()
+      lon_e.setPlaceholderText("Boylam (ör. 38.2613056)")
+      lon_e.setMaximumWidth(220)
+      wire_coord_edit(lat_e, f"{ipucu} enlem — ondalıklı derece")
+      wire_coord_edit(lon_e, f"{ipucu} boylam — ondalıklı derece")
+      row.addWidget(lbl, 0, 0, 2, 1, Qt.AlignmentFlag.AlignVCenter)
+      row.addWidget(lat_e, 0, 1)
+      row.addWidget(lon_e, 1, 1)
+      row.setColumnStretch(1, 1)
+      return row, lat_e, lon_e
+
+    r_p1, self._p1_lat, self._p1_lon = _mk_coord_row2("Direk 1:", "Direk 1")
+    r_p2, self._p2_lat, self._p2_lon = _mk_coord_row2("Direk 2:", "Direk 2")
+    r_ld, self._land_lat, self._land_lon = _mk_coord_row2("İniş:", "İniş noktası")
+    lay.addLayout(r_p1)
+    lay.addLayout(r_p2)
+    lay.addLayout(r_ld)
+    _ld_note = QLabel(
+      "İniş noktası (isteğe bağlı): bitiş çizgisi geçildikten SONRA araç bu "
+      "noktaya gidip iner (şartname s.1731-1733: iniş konumu takımın "
+      "inisiyatifinde, 1. ve 2. direk arasına iniş paterni kurulabilir). "
+      "Boş bırakılırsa eski davranış (kalkış noktasına RTL) kullanılır.")
+    _ld_note.setStyleSheet(_SL)
+    _ld_note.setWordWrap(True)
+    lay.addWidget(_ld_note)
+
+    for _e in (self._p1_lat, self._p1_lon, self._p2_lat, self._p2_lon):
+      _e.textChanged.connect(self._direkleri_alanlardan_oku)
+    # NEDEN AYRI BAĞLANTI (2026-09-10, operatör: "kalkış noktasından iniş
+    # noktasına kadar TÜM rotayı önizle"): iniş noktası _direkleri_
+    # alanlardan_oku'nun İZLEDİĞİ alanlarda DEĞİL — o yalnız _pole1/_pole2'yi
+    # günceller. Bağlantı olmadan operatör SADECE iniş noktasını değiştirse
+    # (direklere dokunmadan) tüm-görev-rotası önizlemesi eski (yanlış)
+    # kalırdı. _alan_otomatik_uret zaten "elle konan köşelere dokunma"
+    # kuralını koruyor — burada da aynı güvenlik geçerli.
+    for _e in (self._land_lat, self._land_lon):
+      _e.textChanged.connect(self._alan_otomatik_uret)
+
+    # ── TARAMA ALANI OTOMATİK ÜRETİMİ (2026-09-10, operatör isteği) ────────
+    # NEDEN: tarama köşeleri profile KAYDEDİLMİYOR — _snapshot_params() yalnız
+    # form widget'larını toplar, harita tıklamalarını (self._wps) DEĞİL. Yani
+    # her uçuşta 4 köşeyi göz kararı tıklamak gerekiyordu ve şartnamenin 8
+    # dakikalık uçuşa-hazırlık limiti altında metre hassasiyeti korunamıyordu
+    # (tıklama hatası doğrudan tarama alanını kaydırır).
+    # ÇÖZÜM: köşeleri saklamak yerine ÜRETME KURALINI sakla. Aşağıdaki üç
+    # mesafe + taraf birer WIDGET olduğu için profile GİRER; köşeler her
+    # seferinde direklerden YENİDEN hesaplanır. Direkler sahada biraz farklı
+    # yere konsa bile alan kurala göre doğru yerde çıkar.
+    # KURAL (şartname Şekil 7 + operatörün saha ölçüsü): her direkten direk
+    # hattı BOYUNCA içeri `inset` girilir (uzun kenar = |P1P2| − 2·inset),
+    # sonra hatta DİK olarak `yakın` ve `uzak` mesafelerinde iki kenar
+    # oluşturulur → 4 köşeli dikdörtgen.
+    _area_note = QLabel(
+      "Tarama alanı direklerden OTOMATİK üretilir: her direkten hat boyunca "
+      "içeri girilir, sonra hatta dik iki kenar oluşturulur. Bu değerler "
+      "profile kaydedilir; köşeler her üretimde yeniden hesaplanır.")
+    _area_note.setStyleSheet(_SL)
+    _area_note.setWordWrap(True)
+    lay.addWidget(_area_note)
+
+    def _mk_m_spin(val: float, tip: str) -> QDoubleSpinBox:
+      sp = QDoubleSpinBox()
+      sp.setRange(0.0, 500.0)
+      sp.setDecimals(2)
+      sp.setSingleStep(1.0)
+      sp.setSuffix(" m")
+      sp.setValue(val)
+      sp.setToolTip(tip)
+      guard_wheel(sp)
+      return sp
+
+    self._area_inset_m = _mk_m_spin(
+      25.0, "Her direkten, direk hattı BOYUNCA içeri girilecek mesafe")
+    self._area_near_m = _mk_m_spin(
+      20.0, "Direk hattına DİK: alanın yakın kenarının hattan uzaklığı")
+    self._area_far_m = _mk_m_spin(
+      50.0, "Direk hattına DİK: alanın uzak kenarının hattan uzaklığı")
+    self._area_side = QComboBox()
+    self._area_side.addItems([self._AREA_SIDE_RIGHT, self._AREA_SIDE_LEFT])
+    self._area_side.setToolTip(
+      "Alan, Direk1→Direk2 yönüne göre hattın hangi tarafında kalacak")
+    guard_wheel(self._area_side)
+
+    ag = QGridLayout()
+    ag.setHorizontalSpacing(6)
+    ag.setVerticalSpacing(4)
+    ag.addWidget(QLabel("Direkten içeri:"), 0, 0)
+    ag.addWidget(self._area_inset_m, 0, 1)
+    ag.addWidget(QLabel("Yakın kenar:"), 1, 0)
+    ag.addWidget(self._area_near_m, 1, 1)
+    ag.addWidget(QLabel("Uzak kenar:"), 2, 0)
+    ag.addWidget(self._area_far_m, 2, 1)
+    ag.addWidget(QLabel("Taraf:"), 3, 0)
+    ag.addWidget(self._area_side, 3, 1)
+    ag.setColumnStretch(1, 1)
+    lay.addLayout(ag)
+
+    self._area_gen_btn = QPushButton("⬛ Tarama alanını direklerden üret")
+    self._area_gen_btn.clicked.connect(self._uret_tarama_alani)
+    lay.addWidget(self._area_gen_btn)
+
+    self._area_gen_lbl = QLabel("Alan henüz üretilmedi.")
+    self._area_gen_lbl.setObjectName("mutedLabel")
+    self._area_gen_lbl.setWordWrap(True)
+    lay.addWidget(self._area_gen_lbl)
 
     # ── Pist başlangıç/bitiş çizgisi (İSTEĞE BAĞLI — 2026-08-30 denetimi) ─
     # Görev 1'deki finish_a/finish_b alanlarının birebir muadili (satır
@@ -1966,11 +2145,14 @@ class TargetDropMissionTab(_BaseMissionTab):
     # Aralık da İHA'nın güvenlik clamp'i ile hizalandı: TeknofestTask2Mission.
     # PARAM_LIMITS["scan_alt"] = (5, 60) — dışına çıkan değer zaten kısılıyor ve
     # operatöre uyarı basılıyordu (teknofest_task2.py:105).
-    self._scan_alt    = _dsb(5, 60, 16.0, 1.0, " m", 0)
+    # 2026-09-10: 16.0 → 20.0. Operatör GERÇEK ARAÇTA 20 m'de de sorunsuz
+    # tespit doğruladı; bkz. IHA/missions/task2/tuning.py scan_alt notu.
+    self._scan_alt    = _dsb(5, 60, 20.0, 1.0, " m", 0)
     self._scan_alt.setToolTip(
-      "Tarama irtifası. 16 m saha kalibrasyonlu varsayılandır: daha yükseğe "
-      "çıkıldığında kırmızı üçgen (1 m kenar) kamera çözünürlüğünde minimum "
-      "alan eşiğinin altına düşüp tespit edilemez. İHA 5-60 m dışını reddeder."
+      "Tarama irtifası. 20 m saha doğrulamalı varsayılandır (2026-09-10, "
+      "gerçek araçta test edildi). Daha da yükseğe çıkıldığında kırmızı "
+      "üçgen (1 m kenar) kamera çözünürlüğünde minimum alan eşiğinin altına "
+      "düşüp tespit edilemeyebilir. İHA 5-60 m dışını reddeder."
     )
     # NEDEN (aralık 1-15 → 1.5-10): PARAM_LIMITS["drop_alt"] = (1.5, 10.0).
     # Varsayılan 2.0, Task2Tuning.drop_alt ile zaten aynı.
@@ -2410,7 +2592,7 @@ class TargetDropMissionTab(_BaseMissionTab):
 
     self._ap_floor_red = _dsb(0.0, 20.0, 2.0, 0.5, " m", 1)  # 2026-08-31: firmware varsayılanıyla HİZALANDI (tuning.py). Panel eski değeri gönderiyor ve firmware düzeltmesini SESSİZCE EZİYORDU.
     # kırmızı üçgen çevrel çapı 0.577 m
-    self._ap_floor_blue = _dsb(0.0, 20.0, 5.0, 0.5, " m", 1)  # 2026-08-31: firmware varsayılanıyla HİZALANDI (tuning.py). Panel eski değeri gönderiyor ve firmware düzeltmesini SESSİZCE EZİYORDU.
+    self._ap_floor_blue = _dsb(0.0, 20.0, 0.0, 0.5, " m", 1)  # 2026-09-11: firmware varsayılanıyla YENİDEN HİZALANDI (tuning.py, K1 Parça A). 5.0 m, kamera IMX708'e değişip VFOV daraldıktan (51.85°→40.75°) SONRA da sabit kalmıştı; mavi altıgen kadrajın %107.7'sini kaplıyordu (pay NEGATİF). 0=OTOMATİK'e çekildi — bkz. aşağıdaki tooltip, panel bunu zaten destekliyordu.
     # mavi altıgen 2.0 m'ye inince KADRAJDAN TAŞTI (kullanıcı gözlemi)
     _floor_tip = ("0 = OTOMATİK: hedef alanı + aktif kamera FOV'undan türetilir.\n"
                   "Kamera profili değişince kendiliğinden güncellenir — sabit\n"
@@ -2623,6 +2805,18 @@ class TargetDropMissionTab(_BaseMissionTab):
     p2 = f"{self._pole2['lat']:.5f},{self._pole2['lon']:.5f}" if self._pole2 else "—"
     self._pole_lbl.setText(f"Direk 1: {p1}    Direk 2: {p2}")
 
+  def _draw_poles_if_ready(self):
+    """İkisi de biliniyorsa Direk 1/2'yi KALICI markerlarla haritaya çizer.
+
+    NEDEN set_poles (draw_circle DEĞİL): draw_circle'ın paylaştığı 'xtra'
+    katmanı her çağrıda sıfırlanıyordu — Direk 2 çizilince Direk 1'in
+    çemberi SİLİNİYORDU, ikisi asla birlikte görünmüyordu (bkz. JS setPoles
+    NEDEN bloğu). Yalnızca ikisi de mevcutken çizilir; tek biri varken eski
+    davranışla aynı ("—" etiketi zaten _pole_lbl'de görünür)."""
+    if self._pole1 and self._pole2:
+      self._map.set_poles(self._pole1["lat"], self._pole1["lon"],
+                          self._pole2["lat"], self._pole2["lon"])
+
   def _on_decoy_mode_changed(self, _idx: int = 0):
     """Mod "Ayrık" iken sabit kanat pisti köşe-sayacı görünür olur."""
     is_separate = self._decoy_mode.currentText() == self._MODE_SEPARATE
@@ -2669,18 +2863,410 @@ class TargetDropMissionTab(_BaseMissionTab):
     self._fw_area_lbl.setText(
       f"Sabit Kanat pisti: {n} köşe işaretlendi (en az 3 gerekir) {ok}")
 
+  def _direkleri_alanlardan_oku(self) -> None:
+    """Direk koordinat ALANLARI değişince self._pole1/_pole2'yi tazeler.
+
+    NEDEN: direkler artık kalıcı QLineEdit'lerde tutuluyor (profil onları
+    saklasın diye), ama panelin geri kalanı (harita çizimi, etiket,
+    _on_send, _uret_tarama_alani) hâlâ self._pole1/_pole2 SÖZLÜKLERİNİ
+    okuyor. Bu slot tek köprü: alan → sözlük. textChanged'e bağlı olduğu
+    için hem harita tıklaması hem PROFİL YÜKLEME (alanlara metin yazar)
+    aynı yoldan geçer; ikinci bir senkronizasyon noktası yok.
+    Geçersiz/yarım girdi (kullanıcı yazarken) sessizce None bırakır —
+    yazım sırasında uyarı yağmuru olmaz.
+    """
+    def _oku(la_e, lo_e):
+      try:
+        la, lo = float(la_e.text().strip()), float(lo_e.text().strip())
+      except (TypeError, ValueError):
+        return None
+      if -90.0 <= la <= 90.0 and -180.0 <= lo <= 180.0:
+        return {"lat": la, "lon": lo}
+      return None
+
+    self._pole1 = _oku(self._p1_lat, self._p1_lon)
+    self._pole2 = _oku(self._p2_lat, self._p2_lon)
+    self._draw_poles_if_ready()
+    self._update_pole_lbl()
+    # Direkler tamamlanır tamamlanmaz alanı KENDİLİĞİNDEN üret (profil
+    # açılışta bu alanları doldurduğu için, uygulama açılır açılmaz tarama
+    # alanı ve rotası hazır gelir — butona basmak gerekmez).
+    self._alan_otomatik_uret()
+
+  # Hedef bölgesini sıkı sarmalarken eklenecek emniyet payı (m). Tahmin
+  # birkaç metre şaşarsa bile gerçek hedefi tarama dışında BIRAKMAMALI —
+  # bu pay operatörün "16 m'de sorunsuz tespit ediyoruz" gözlemiyle
+  # birlikte okunmalı: dar pay, kamera zaten güvenilir tespit ettiği için
+  # riski büyütmüyor, sadece gereksiz taramayı kesiyor.
+  _BOLGE_PAYI_M = 10.0
+
+  def _hedef_bolgesine_gore_tazele(self) -> None:
+    """İşaretlenen tahmini hedef bölge(ler)ine göre tarama alanını SIKI sarar.
+
+    NEDEN BÜYÜT + KÜÇÜLT (2026-09-10, operatör talebi — "en hızlı yapacak
+    şekilde"): önceki sürüm yalnız BÜYÜTÜYORDU (bölge taşarsa) ve hedef
+    zaten alanın içindeyse hiçbir şey değiştirmiyordu — bu, işaretli
+    bölge tam alanın küçük bir köşesinde bile olsa TÜM 105×40 m'nin
+    taranmasına yol açıyordu. Operatör kamera/irtifa/HFOV'un GERÇEKTE
+    16 m'de kırmızı üçgen ve mavi altıgeni sorunsuz ayırt ettiğini
+    doğruladı — yani tespit güvenilirliği pay'i daraltmaktan değil, alanı
+    hedefe göre SIKILAŞTIRMAKTAN kazanılıyor: rota `_uret_tarama_alani`
+    içindeki `gen_coverage_path` ile alanın YENİ boyutuna göre yeniden
+    hesaplanır (şerit sayısı = alan/swath, swath zaten irtifa+HFOV'dan
+    geliyor — bkz. route_math.swath_width_m) — küçük alan = az şerit =
+    kısa rota, EKSTRA bir "yön/desen" hesabı gerekmez.
+
+    GÜVENLİK KORUNDU: sarma her zaman işaretli noktaları + `_BOLGE_PAYI_M`
+    kapsar — tahmin birkaç metre şaşsa bile hedef poligon dışında kalmaz.
+    Tek parametreli (simetrik) `inset` tasarım kısıtı nedeniyle direk
+    hattı boyunca iki ucun GEREKENİ FARKLIYSA daha sıkı olan taraf
+    belirleyici olur (asla daha az güvenli yönde yuvarlanmaz — bkz. min()).
+
+    Hiç hedef işaretlenmemişse HİÇBİR ŞEY değişmez (operatörün kararı:
+    "tahmini konum yoksa mevcutta olduğu gibi olsun").
+    """
+    if not self._pole1 or not self._pole2:
+      return
+    noktalar = list(getattr(self, "_red_area_wps", []) or []) + \
+               list(getattr(self, "_blue_area_wps", []) or [])
+    if not noktalar:
+      return
+    try:
+      p1, p2 = self._pole1, self._pole2
+      D = _haversine(p1["lat"], p1["lon"], p2["lat"], p2["lon"])
+      brg = _bearing(p1["lat"], p1["lon"], p2["lat"], p2["lon"])
+      sag = self._area_side.currentText() == self._AREA_SIDE_RIGHT
+      # Direk hattı çerçevesi: ileri = direk1→direk2, yan = seçilen taraf(+)
+      ileri_min = ileri_maks = None
+      yan_min = yan_maks = None
+      for w in noktalar:
+        d = _haversine(p1["lat"], p1["lon"], w["lat"], w["lon"])
+        b = _bearing(p1["lat"], p1["lon"], w["lat"], w["lon"])
+        fark = math.radians(b - brg)
+        ileri = d * math.cos(fark)
+        yan = d * math.sin(fark)          # saat yönü(+) = sağ
+        if not sag:
+          yan = -yan
+        ileri_min = ileri if ileri_min is None else min(ileri_min, ileri)
+        ileri_maks = ileri if ileri_maks is None else max(ileri_maks, ileri)
+        yan_min = yan if yan_min is None else min(yan_min, yan)
+        yan_maks = yan if yan_maks is None else max(yan_maks, yan)
+
+      pay = self._BOLGE_PAYI_M
+      inset = self._area_inset_m.value()
+      near = self._area_near_m.value()
+      far = self._area_far_m.value()
+
+      # Uzun eksen — SİMETRİK tek parametre: her iki uçta da (D1 ve D2
+      # tarafı) hedefi + pay kapsayan inset ayrı ayrı hesaplanır, DAHA
+      # SIKI (küçük) olan seçilir — böylece HİÇBİR taraf hedefi kaybetmez,
+      # gereksiz taraf varsa o da mümkün olduğunca daraltılmış olur.
+      gerekli_d1 = max(0.0, ileri_min - pay)
+      gerekli_d2 = max(0.0, D - (ileri_maks + pay))
+      y_inset = max(0.0, min(gerekli_d1, gerekli_d2))
+      # Toplam uzunluk çok küçülüp negatife düşmesin (uç durum: nokta
+      # direğin neredeyse üstünde) — en az 2×pay uzunluk garanti edilir.
+      if D - 2 * y_inset < 2 * pay:
+        y_inset = max(0.0, (D - 2 * pay) / 2.0)
+
+      # Yan eksen — koşulsuz sıkı sarma: hem büyütür hem küçültür.
+      y_near = max(0.0, yan_min - pay)
+      y_far = yan_maks + pay
+      if y_far - y_near < 2 * pay:
+        y_far = y_near + 2 * pay
+
+      if (abs(y_inset - inset) < 0.05 and abs(y_near - near) < 0.05
+              and abs(y_far - far) < 0.05):
+        return                                  # zaten optimal
+
+      buyudu = (y_inset < inset - 0.05) or (y_near < near - 0.05) or (y_far > far + 0.05)
+      kuculdu = (y_inset > inset + 0.05) or (y_near > near + 0.05) or (y_far < far - 0.05)
+
+      self._area_inset_m.setValue(round(y_inset, 2))
+      self._area_near_m.setValue(round(y_near, 2))
+      self._area_far_m.setValue(round(y_far, 2))
+      self._alan_otomatikti = True              # tazeleme silmeye izinli
+      self._uret_tarama_alani(sessiz=True)
+      if buyudu and kuculdu:
+        eylem = "hedefe göre YENİDEN BOYUTLANDIRILDI"
+      elif kuculdu:
+        eylem = "en hızlı tarama için SIKILAŞTIRILDI"
+      else:
+        eylem = "hedefi kapsayacak şekilde BÜYÜTÜLDÜ"
+      self._area_gen_lbl.setText(
+        self._area_gen_lbl.text() +
+        f"  🎯 Tarama alanı işaretli hedef(ler)e göre {eylem} "
+        f"(+{pay:.0f} m pay): içeri {y_inset:.1f} m, "
+        f"yan {y_near:.1f}–{y_far:.1f} m.")
+    except Exception:
+      pass                                      # tazeleme ASLA paneli bozmaz
+
+  def _alan_otomatik_uret(self) -> None:
+    """Direkler hazır olur olmaz tarama alanını KENDİLİĞİNDEN üretir.
+
+    NEDEN (2026-09-10, operatör bildirimi "otomatik tarama alanı
+    oluşturulmadı"): alan üretimi butona bağlıydı; profil açılışta direkleri
+    yüklüyor ama alan boş kalıyordu. Sahada 8 dakikalık hazırlık limitinde
+    "butona basmayı unutma" bir arıza kipidir — otomatik olmalı.
+
+    GÜVENLİ TETİKLEME: yalnızca (a) hiç nokta yokken, ya da (b) mevcut
+    noktalar ZATEN otomatik üretilmişken çalışır. Operatör elle köşe
+    koyduysa DOKUNULMAZ — elle yapılan iş sessizce silinmez. Elle konan
+    noktaları değiştirmek isteyen operatör butonu kullanır (o yol onay sorar).
+    """
+    if not self._pole1 or not self._pole2:
+      return
+    if self._wps and not getattr(self, "_alan_otomatikti", False):
+      return                                   # elle konmuş noktalar korunur
+    try:
+      self._uret_tarama_alani(sessiz=True)
+    except Exception:
+      pass                                     # otomatik üretim ASLA paneli bozmaz
+
+  def _uret_tarama_alani(self, sessiz: bool = False):
+    """Direk 1/2'den tarama alanının 4 köşesini KURALLA üretir.
+
+    sessiz=True: otomatik tetiklemede kullanılır — onay diyaloğu AÇILMAZ
+    (her koordinat değişiminde açılırsa panel kullanılamaz hale gelir).
+
+    NEDEN: bkz. arayüz bloğundaki NEDEN — köşeler profile kaydedilmiyor,
+    bu yüzden köşe yerine KURAL saklanıyor ve alan her seferinde direklerden
+    yeniden hesaplanıyor.
+
+    GEOMETRİ: X = direk1'den hat boyunca +inset, Y = direk2'den hat boyunca
+    −inset (aradaki uzun kenar = |P1P2| − 2·inset). Hatta DİK yönde
+    (sağ = kerteriz+90°) `yakın` ve `uzak` ofsetleriyle dört köşe. Sıralama
+    dikdörtgenin ÇEVRESİNİ dolaşır (yakın-D1 → yakın-D2 → uzak-D2 → uzak-D1),
+    böylece kendini kesen (bowtie) poligon oluşmaz — İHA tarafı bu poligondan
+    kendi süpürme desenini üretiyor.
+
+    Matematik route_math'ten alınıyor (_haversine/_bearing/_offset_point);
+    burada YENİ bir formül tanımlanmıyor — tek kaynak korunuyor.
+    """
+    if not self._pole1 or not self._pole2:
+      if not sessiz:
+        QMessageBox.warning(
+          self, "Direkler eksik",
+          "Önce haritadan Direk 1 ve Direk 2'yi işaretleyin.\n"
+          "(Harita tıklaması menüsünden 'Direk 1' / 'Direk 2' seçip tıklayın.)")
+      return
+
+    p1, p2 = self._pole1, self._pole2
+    D = _haversine(p1["lat"], p1["lon"], p2["lat"], p2["lon"])
+    inset = self._area_inset_m.value()
+    near  = self._area_near_m.value()
+    far   = self._area_far_m.value()
+
+    if D <= 2.0 * inset:
+      if not sessiz:
+        QMessageBox.warning(
+          self, "İçeri girme mesafesi çok büyük",
+          f"Direk arası {D:.1f} m, ancak iki uçtan toplam {2*inset:.1f} m "
+          f"içeri girilmek isteniyor — alan oluşmaz.")
+      return
+    if abs(far - near) < 0.5:
+      if not sessiz:
+        QMessageBox.warning(
+          self, "Kenarlar çakışık",
+          "Yakın ve uzak kenar neredeyse aynı — alan sıfır genişlikte olur.")
+      return
+
+    if self._wps:
+      if not sessiz and QMessageBox.question(
+          self, "Mevcut köşeler silinsin mi?",
+          f"Haritada {len(self._wps)} nokta var. Üretim bunları SİLİP "
+          f"yerine 4 yeni köşe koyacak. Devam edilsin mi?"
+      ) != QMessageBox.StandardButton.Yes:
+        return
+      self._clear_all()
+
+    brg  = _bearing(p1["lat"], p1["lon"], p2["lat"], p2["lon"])
+    sag  = self._area_side.currentText() == self._AREA_SIDE_RIGHT
+    perp = (brg + 90.0) % 360.0 if sag else (brg - 90.0) % 360.0
+
+    X = _offset_point(p1["lat"], p1["lon"], brg, inset)
+    Y = _offset_point(p2["lat"], p2["lon"], (brg + 180.0) % 360.0, inset)
+    koseler = [
+      _offset_point(X[0], X[1], perp, near),   # yakın kenar, Direk 1 tarafı
+      _offset_point(Y[0], Y[1], perp, near),   # yakın kenar, Direk 2 tarafı
+      _offset_point(Y[0], Y[1], perp, far),    # uzak kenar,  Direk 2 tarafı
+      _offset_point(X[0], X[1], perp, far),    # uzak kenar,  Direk 1 tarafı
+    ]
+    for la, lo in koseler:
+      super()._add_wp(la, lo)
+
+    # ÜRETİLEN KÖŞELER HER ZAMAN POLİGON KÖŞESİDİR — asla TAKEOFF değil.
+    # NEDEN: _add_wp, home HENÜZ YOKKEN (araç bağlı değilken) eklenen ilk
+    # noktayı TAKEOFF yapıyor (bkz. _wp_tiplerini_tazele NEDEN'i). Operatör
+    # alanı araç bağlanmadan üretirse 1. köşe tabloda/haritada "kalkış" gibi
+    # görünüyordu. _on_send zaten hepsini WAYPOINT'e çeviriyor (yani uçuşa
+    # giden veri doğruydu) ama sahada operatöre YANLIŞ görünüyordu; burada
+    # tek noktadan düzeltiliyor.
+    for wp in self._wps:
+      if wp.get("type") == "TAKEOFF":
+        wp["type"] = "WAYPOINT"
+    # Bu köşeler KURALDAN üretildi — otomatik yenileme bunları güvenle
+    # tazeleyebilir (elle konan noktalar bu bayrağı taşımaz, korunur).
+    self._alan_otomatikti = True
+    self._refresh_map()
+    self._refresh_table()
+
+    uzun = D - 2.0 * inset
+    genis = abs(far - near)
+
+    # ── TARAMA ROTASI ÖNİZLEMESİ (2026-09-10) ─────────────────────────────
+    # NEDEN: operatör alanı üretince "araç bunun içinde NASIL uçacak"
+    # görmüyordu. Rota, firmware'in GERÇEKTEN kullandığı üreticinin
+    # AYNISIYLA hesaplanıyor (core.route_math.gen_coverage_path ↔
+    # IHA/missions/task2/geometry.generate_coverage_path — parite testiyle
+    # 0.000 mm sapma doğrulandı), yani önizleme uçuşun kendisidir.
+    # Şerit genişliği de aynı formülden: 2·alt·tan(HFOV/2)·(1−0.40).
+    # UYARI: HFOV override KAPALIYKEN firmware kendi kalibrasyonunu okur;
+    # paneldeki değer ondan farklıysa önizleme kayar. Bu yüzden kullanılan
+    # HFOV etikette AÇIKÇA yazılıyor.
+    try:
+      _alt = float(self._scan_alt.value())
+      _hfov = float(self._cam_hfov.value())
+      _strip = swath_width_m(_alt, _hfov)
+      _rota = gen_coverage_path(koseler, _strip, align_long_axis=True)
+    except Exception as exc:                       # önizleme ASLA üretimi bozmasın
+      _rota, _strip, _hfov = [], 0.0, 0.0
+      self._log_view_hata(f"Tarama rotası önizlemesi çizilemedi: {exc}") \
+        if hasattr(self, "_log_view_hata") else None
+
+    _rota_bilgi = ""
+    if len(_rota) >= 2:
+      _uz = sum(_haversine(_rota[i][0], _rota[i][1], _rota[i + 1][0], _rota[i + 1][1])
+                for i in range(len(_rota) - 1))
+      _rota_bilgi = (f" · Kaplama: {len(_rota)//2} şerit, {_uz:.0f} m "
+                     f"(şerit {_strip:.1f} m @ {_alt:.0f} m irtifa, HFOV {_hfov:.1f}°)")
+
+    # TÜM GÖREV ROTASI (kaplama deseni + alan çevresi + kalkış/direk/tarama-
+    # girişi/bitiş bacağı, hepsi TEK çizimde — bkz. metod docstring'i:
+    # drawRoute/drawRouteMulti AYNI önizleme katmanını paylaşıyor, ayrı ayrı
+    # çağrılırsa biri diğerini SİLERDİ).
+    _tam_bilgi = self._tum_gorev_rotasini_ciz(koseler, _rota)
+
+    self._area_gen_lbl.setText(
+      f"✓ 4 köşe üretildi — {uzun:.1f} m × {genis:.1f} m ({uzun*genis:.0f} m²), "
+      f"taraf: {'sağ' if sag else 'sol'} (dik yön {perp:.1f}°), "
+      f"direk arası {D:.1f} m.{_rota_bilgi}{_tam_bilgi}")
+
+  # Direk 2'nin kapı-geçiş uzatma payı ve bitiş bacağının direk-kaçınma
+  # payı: İHA'nın Task2Tuning VARSAYILANLARI (gate_pole2_round_margin_m,
+  # return_pole_clear_m). YKİ paneli bu ikisi için widget GÖNDERMİYOR —
+  # yani gerçek uçuşta İHA da kendi varsayılanını kullanır; önizleme aynı
+  # sabitleri kullanarak TUTARLI kalır. YKİ operatörden bunları toplamaya
+  # başlarsa buradaki sabitler de o alanlardan okunmalı.
+  _GATE_MARGIN_M = 10.0
+  _RETURN_CLEAR_M = 25.0
+
+  def _tum_gorev_rotasini_ciz(self, koseler, kaplama_rota) -> str:
+    """Kalkıştan inişe TÜM görev rotasını (bilinen kısımlarıyla) çizer.
+
+    NEDEN (2026-09-10, operatör isteği): "kalkış noktasının iniş noktasına
+    kadar olan tüm rotayı planla" — önceden yalnız kaplama deseni
+    gösteriliyordu. Segmentler missions/teknofest_task2.py::_run'ın GERÇEK
+    sırasını izler: Direk1 → Direk2(+kapı payı) → tek-hat tarama girişi →
+    tek-hat tarama → [kaplama, hedef bulunamazsa yedek] → bitiş bacağı →
+    iniş. Matematik (compute_scanline/pole_clear_route) geometry.py'nin
+    BİREBİR PORTUDUR (route_math.py, parite testiyle 0.000 mm doğrulandı).
+
+    NEDEN TEK draw_route_multi ÇAĞRISI: JS'te drawRoute/drawRouteMulti AYNI
+    önizleme katmanını (`prv`) paylaşıyor ve ikisi de clearRoute() ile
+    başlıyor — ayrı ayrı çağrılsalar biri diğerini SİLERDİ. Kaplama deseni
+    ve alan çevresi de bu yüzden BURADA, tek segments listesinde.
+
+    DÜRÜSTLÜK SINIRI: bırakma sonrası bitiş bacağı GERÇEKTE aracın SON
+    bırakma konumundan başlar (canlı tespite bağlı, ÖNCEDEN bilinemez) —
+    burada tarama hattının ÇIKIŞ noktasından başladığı VARSAYILIR, bu bir
+    YAKLAŞIKLIKTIR. Kalkış/iniş yalnızca operatör bir iniş noktası
+    SEÇTİYSE çizilir (şartname s.1731: kalkış/iniş aynı bölge varsayılır);
+    seçilmediyse bu uçlar ATLANIR — bilinmeyen bir konum İCAT EDİLMEZ.
+
+    Dönüş: etikete eklenecek kısa bilgi metni ("" olabilir).
+    """
+    if not self._pole1 or not self._pole2:
+      return ""
+    try:
+      p1, p2 = self._pole1, self._pole2
+      alt = float(self._scan_alt.value())
+      segments: list[dict] = []
+
+      brg12 = _bearing(p1["lat"], p1["lon"], p2["lat"], p2["lon"])
+      pole2_kapi = _offset_point(p2["lat"], p2["lon"], brg12, self._GATE_MARGIN_M)
+
+      land_pt = None
+      try:
+        _llat = self._land_lat.text().strip()
+        _llon = self._land_lon.text().strip()
+        if _llat and _llon:
+          land_pt = (float(_llat), float(_llon))
+      except (AttributeError, ValueError):
+        land_pt = None
+
+      if land_pt:
+        segments.append({"pts": [land_pt, (p1["lat"], p1["lon"])],
+                         "color": _MAP_TRANSIT_COLOR, "label": "Kalkış → Direk 1"})
+
+      segments.append({"pts": [(p1["lat"], p1["lon"]), pole2_kapi],
+                       "color": _MAP_GATE_COLOR, "label": "Direk 1 → Direk 2 (kapı)"})
+
+      wps_ll = [{"lat": a, "lon": o} for a, o in koseler]
+      scanline = compute_scanline(wps_ll)
+      tarama_son = pole2_kapi
+      if scanline:
+        giris = (scanline["entry"]["lat"], scanline["entry"]["lon"])
+        cikis = (scanline["exit"]["lat"], scanline["exit"]["lon"])
+        segments.append({"pts": [pole2_kapi, giris],
+                         "color": _MAP_TRANSIT_COLOR, "label": "Direk 2 → Tarama girişi"})
+        segments.append({"pts": [giris, cikis],
+                         "color": _MAP_ROUTE_COLOR, "label": "Tek-hat tarama (1. geçiş)"})
+        tarama_son = cikis
+
+      # Kaplama deseni (hedef 1. geçişte bulunamazsa yedek) + alanın kapalı
+      # çevresi — ÖNCEDEN draw_route/draw_route_extra ile AYRI çiziliyordu.
+      if len(kaplama_rota) >= 2:
+        segments.append({"pts": list(kaplama_rota), "color": _MAP_ROUTE_COLOR,
+                         "label": "Tam kaplama (yedek)", "dash": "2,5"})
+      segments.append({"pts": list(koseler) + [koseler[0]],
+                       "color": _MAP_AREA_COLOR, "label": "Tarama alanı", "dash": "7,7"})
+
+      _bitis_bilgi = ""
+      if land_pt:
+        poles_ll = [(p1["lat"], p1["lon"]), (p2["lat"], p2["lon"])]
+        ara = pole_clear_route(tarama_son, land_pt, poles_ll, self._RETURN_CLEAR_M)
+        segments.append({"pts": [tarama_son] + ara + [land_pt],
+                         "color": _MAP_LAND_COLOR, "label": "Bitiş bacağı → İniş",
+                         "dash": "3,6"})
+        _bitis_bilgi = " · Kalkış/iniş dahil TAM rota."
+      else:
+        _bitis_bilgi = (" · İniş noktası seçilmedi — kalkış/dönüş bacağı "
+                        "gösterilmiyor (RTL kalkış noktasına döner).")
+
+      if segments:
+        self._map.draw_route_multi(segments, fit=True)
+      return _bitis_bilgi
+    except Exception as exc:
+      logger.warning("Tüm görev rotası önizlemesi çizilemedi: %s", exc)
+      return ""
+
   @pyqtSlot(float, float)
   def _add_wp(self, lat: float, lon: float):
     """Harita tıklaması: seçime göre Direk 1/2, sabit kanat pisti ya da tarama köşesi ekle."""
     t = self._sel_target.currentText()
     if t == self._SEL_POLE1:
-      self._pole1 = {"lat": lat, "lon": lon}
-      self._map.draw_circle(lat, lon, 3, _MAP_POLE1_COLOR)
-      self._update_pole_lbl()
+      # Sözlüğe DOĞRUDAN yazılmaz: alanlara yazılır, textChanged →
+      # _direkleri_alanlardan_oku sözlüğü + haritayı tazeler (tek yol).
+      self._p1_lat.setText(f"{lat:.7f}")
+      self._p1_lon.setText(f"{lon:.7f}")
     elif t == self._SEL_POLE2:
-      self._pole2 = {"lat": lat, "lon": lon}
-      self._map.draw_circle(lat, lon, 3, _MAP_POLE2_COLOR)
-      self._update_pole_lbl()
+      self._p2_lat.setText(f"{lat:.7f}")
+      self._p2_lon.setText(f"{lon:.7f}")
+    elif t == self._SEL_LAND:
+      self._land_lat.setText(f"{lat:.7f}")
+      self._land_lon.setText(f"{lon:.7f}")
+      self._map.draw_circle(lat, lon, 2, _MAP_LAND_COLOR)
     elif t == self._SEL_FINISH_A:
       # Görev 1'deki desenle aynı: tıklama koordinat alanlarına yazılır;
       # işaretçi self._wps'e EKLENMEZ — Görev 2'de _wps tarama poligonu
@@ -2700,10 +3286,13 @@ class TargetDropMissionTab(_BaseMissionTab):
       self._red_area_wps.append({"lat": lat, "lon": lon})
       self._map.draw_circle(lat, lon, 3, _MAP_RED_AREA_COLOR)
       self._update_hedef_bolge_lbl()
+      # Bölge alanın dışına taşıyorsa tarama alanını BÜYÜT (bkz. NEDEN).
+      self._hedef_bolgesine_gore_tazele()
     elif t == self._SEL_BLUE_AREA:
       self._blue_area_wps.append({"lat": lat, "lon": lon})
       self._map.draw_circle(lat, lon, 3, _MAP_BLUE_AREA_COLOR)
       self._update_hedef_bolge_lbl()
+      self._hedef_bolgesine_gore_tazele()
     else:
       super()._add_wp(lat, lon)
 
@@ -2845,6 +3434,17 @@ class TargetDropMissionTab(_BaseMissionTab):
     if self._pole2:
       params["pole2"] = self._pole2
 
+    # ── İNİŞ NOKTASI — İSTEĞE BAĞLI (2026-09-10) ──────────────────────────
+    # Görev 1'deki `land_pos` ile BİREBİR aynı anahtar/format; firmware
+    # tarafı da aynı doğrulamayı yapıyor (missions/teknofest_task2.py).
+    # Boş/geçersizse alan HİÇ gönderilmez → firmware eski davranışı sürdürür
+    # (RTL ya da finish_land_not_rtl ile bulunduğu yere iniş).
+    try:
+      params["land_pos"] = {"lat": float(self._land_lat.text().strip()),
+                            "lon": float(self._land_lon.text().strip())}
+    except (TypeError, ValueError):
+      pass
+
     # ── Pist başlangıç/bitiş çizgisi — İSTEĞE BAĞLI (2026-08-30 denetimi) ─
     # Görev 1'in finish_a/finish_b alanlarının birebir muadili; anahtar
     # adları ve format Görev 1 ile AYNI ({"lat": float, "lon": float}) —
@@ -2948,8 +3548,7 @@ class InfinityMissionTab(_BaseMissionTab):
   _SEL_TAKEOFF = "Kalkış Noktası"
   _SEL_POLE1  = "Direk 1"
   _SEL_POLE2  = "Direk 2"
-  _SEL_FINISH_A = "Pist Çizgisi Ucu A"
-  _SEL_FINISH_B = "Pist Çizgisi Ucu B"
+  _SEL_LAND  = "İniş Noktası (opsiyonel)"
   _SEL_WP   = "Normal Waypoint"
 
   # Şartname Görev 1 uçuşu 5 dk (300 s) — kronometre bütçe varsayılanı
@@ -2969,9 +3568,10 @@ class InfinityMissionTab(_BaseMissionTab):
     _lbl_map = QLabel("Harita tıklaması:"); _lbl_map.setStyleSheet(_SL)
     sel_row.addWidget(_lbl_map)
     self._sel_target = QComboBox()
+    # Pist Ucu A/B seçenekleri kaldırıldı (2026-09-09) — rota artık yalnız
+    # iki direğe bağlı, pist çizgisi koordinatı hiçbir yerde kullanılmıyor.
     self._sel_target.addItems([
-      self._SEL_TAKEOFF, self._SEL_POLE1, self._SEL_POLE2,
-      self._SEL_FINISH_A, self._SEL_FINISH_B, self._SEL_WP
+      self._SEL_TAKEOFF, self._SEL_POLE1, self._SEL_POLE2, self._SEL_LAND, self._SEL_WP
     ])
     guard_wheel(self._sel_target)  # kaydırma tıklama hedefini değiştirmesin
     sel_row.addWidget(self._sel_target, 1)
@@ -3003,29 +3603,34 @@ class InfinityMissionTab(_BaseMissionTab):
       row.setColumnStretch(1, 1)
       return row, lat_e, lon_e
 
-    r0, self._tkf_lat, self._tkf_lon = _mk_coord_row("Kalkış:")
+    # ── PİST UCU A/B ALANLARI KALDIRILDI (2026-09-09, operatör kararı) ──────
+    # Eskiden burada "Pist Ucu A/B" koordinatları da isteniyordu ve şartnamenin
+    # ek yarım turu + dönüş bacağı BUNLARA BAĞLIYDI. Artık İHA tarafında ikisi
+    # de KOŞULSUZ uygulanıyor; çizgi-geçiş tespiti ise tamamen kaldırıldı
+    # (gerçek uçuşta güvenilmez çıktı — hat kalkış noktasının üzerinden
+    # geçtiği için işaret değişimi ancak varış anında olabiliyordu). Rota
+    # artık YALNIZCA iki direk koordinatına bağlı; kalkış/iniş noktası da
+    # aracın ARM anındaki GERÇEK konumu (hakem nereye koyarsa orası).
+    r0, self._tkf_lat, self._tkf_lon = _mk_coord_row("Kalkış (opsiyonel, önizleme):")
     r1, self._p1_lat, self._p1_lon = _mk_coord_row("Direk 1:")
     r2, self._p2_lat, self._p2_lon = _mk_coord_row("Direk 2:")
-    r3, self._fa_lat, self._fa_lon = _mk_coord_row("Pist Ucu A:")
-    r4, self._fb_lat, self._fb_lon = _mk_coord_row("Pist Ucu B:")
+    # ── İNİŞ NOKTASI — OPSİYONEL (2026-09-09, operatör isteği) ────────────
+    # NEDEN: kalkış noktası ARTIK OTOMATİK (ARM anındaki gerçek konum,
+    # yukarıdaki _tkf_lat yalnız ÖNİZLEME). Şartname "İniş yeri takım
+    # inisiyatifinde" diyor (Şekil 6 doğrulaması, DEVİR §1) — operatör
+    # kalkıştan FARKLI bir yere inmek isteyebilir (ör. daha geniş/güvenli
+    # bir alan). Boş bırakılırsa ESKİ davranış aynen sürer: dönüş bacağı
+    # kalkış noktasına gider (companion tarafında `land_pos` hiç
+    # gönderilmez — bkz. _on_send).
+    r3, self._land_lat, self._land_lon = _mk_coord_row("İniş (opsiyonel):")
     lay.addLayout(r0)
     lay.addLayout(r1)
     lay.addLayout(r2)
     lay.addLayout(r3)
-    lay.addLayout(r4)
-    # NEDEN (DEVIR §0o): şartname, 2 tur tamamlandıktan sonra "direk 2'nin
-    # arka tarafından geçerek dışından dönüş" yapılıp "pist başlangıç/bitiş
-    # çizgisinden geçerek" görevin sonlandırılmasını İSTER — bu çizgi kalkış
-    # noktasından AYRI bir kavramdır (bir NOKTA değil, aracın fiilen İÇİNDEN
-    # GEÇMESİ gereken bir HAT). İki uç nokta olarak tanımlanır; İHA bu hattı
-    # geçtiğini konum-tarafı testiyle doğrular. İsteğe bağlı bırakıldı
-    # (boşsa İHA eski davranışa — RTL/LOITER — döner) ki hazır olmayan
-    # takımlar/sahalar Görev 1'i eskisi gibi uçurabilsin.
     _fin_note = QLabel(
-      "Pist çizgisi (isteğe bağlı): 2 tur bittikten sonra araç, direk 2'yi "
-      "son kez dışından dolanıp bu hattı geçerek kalkış noktasına iner "
-      "(kalkış = iniş noktası). Boş bırakılırsa eski davranış (doğrudan "
-      "RTL/LOITER) kullanılır.")
+      "Rota yalnız Direk 1 / Direk 2'ye bağlıdır. Kalkış alanı SADECE harita "
+      "önizlemesi içindir — araç görevde ARM olduğu GERÇEK konumdan kalkar ve "
+      "2 tur + direk 2'nin son dolanmasından sonra oraya dönüp LAND ile iner.")
     _fin_note.setStyleSheet(_SL)
     _fin_note.setWordWrap(True)
     lay.addWidget(_fin_note)
@@ -3184,6 +3789,30 @@ class InfinityMissionTab(_BaseMissionTab):
     _lbl_cross = QLabel("Merkez Geçiş Hız Oranı:"); _lbl_cross.setStyleSheet(_SL)
     form.addRow(_lbl_cross, self._inf_cross_mult)
 
+    # ── PAPYON DESENİ (2026-09-08) ──────────────────────────────────────
+    # NEDEN: companion iki canlı desen matematiği biliyor — Lemniscate
+    # (∞ eğrisi, eğrilik hiçbir yerde sıfır değil) ve Papyon (direkte sıkı
+    # yay + aralarda düz tam gaz, bkz. infinity_flight.py PapyonTrajectory).
+    # `infinity_pattern` alanı GÖNDERİLMEZSE companion "lemniskat"a düşer
+    # (infinity_flight.py:1143) — bu arayüzde o alanı yazan HİÇBİR kontrol
+    # yoktu, yani bugüne kadar HİÇBİR canlı uçuş papyonu kullanamamıştı.
+    # D=150 m'de ölçülen kazanç: lemniskat ~210 s → papyon (banka 10°,
+    # r=15, düz hız 14 m/s) ~177 s (bkz. workspace/sim/gazebo kampanya
+    # sonuçları, 2026-09-07/08). Varsayılan KAPALI — göndermemek eski
+    # davranışı AYNEN korur (bu sekmedeki diğer isteğe-bağlı alanlarla
+    # (turn_radius_m, finish_a/b) AYNI desen).
+    self._inf_papyon_cb = QCheckBox("🦋 Papyon deseni (otomatik — ölçüldü ~%15-20 daha hızlı, D≥90 m gerekir)")
+    self._inf_papyon_cb.setChecked(False)
+    self._inf_papyon_cb.setToolTip(
+        "İşaretlenirse companion'a infinity_pattern=otomatik gönderilir:\n"
+        "companion direk mesafesinden (D) kendi yarıçap/düz-hız/banka\n"
+        "değerlerini türetir ve D≥90 m ise Papyon (direkte sıkı yay + aralarda\n"
+        "düz tam gaz), D<90 m ise Lemniscate uçar — 'papyon' değil 'otomatik'\n"
+        "gönderilir çünkü ham 'papyon' düz hızı 12 m/s'ye düşürür (ölçülen\n"
+        "ve doğrulanan değer 14 m/s, yalnızca otomatik moddan gelir).\n"
+        "İşaretsizken davranış AYNEN eskisi gibi (Lemniscate).")
+    form.addRow(self._inf_papyon_cb)
+
     # tekerlek koruması: paneli kaydırırken sayısal alanlar bozulmasın
     guard_wheel(self._inf_algo, self._inf_alt, self._inf_laps, self._inf_accel,
                 self._inf_bank, self._inf_radius, self._inf_lookahead,
@@ -3236,8 +3865,7 @@ class InfinityMissionTab(_BaseMissionTab):
     """
     super()._apply_tab_constraints()
     for _e in (self._tkf_lat, self._tkf_lon, self._p1_lat, self._p1_lon,
-               self._p2_lat, self._p2_lon, self._fa_lat, self._fa_lon,
-               self._fb_lat, self._fb_lon):
+               self._p2_lat, self._p2_lon, self._land_lat, self._land_lon):
       _e.textChanged.connect(lambda *_: self._refresh_inf_preview())
     self._inf_algo.currentIndexChanged.connect(lambda *_: self._refresh_inf_preview())
     for _s in (self._inf_alt, self._inf_laps, self._sp_crz,
@@ -3271,63 +3899,98 @@ class InfinityMissionTab(_BaseMissionTab):
     except ValueError:
       tkf = ((p1["lat"] + p2["lat"]) / 2.0, (p1["lon"] + p2["lon"]) / 2.0)
 
-    algo = "LEMNISCATE" if "Lemniscate" in self._inf_algo.currentText() else "DUBINS"
+    # İniş noktası: OPSİYONEL. Girilmediyse dönüş bacağı kalkışa gider
+    # (eski davranış, companion tarafında da `land_pos` gönderilmezse
+    # AYNI — bkz. _on_send ve infinity_flight.py _transit_to_takeoff).
     try:
-      route, loop_v, cross_v, radius = build_infinity_route(
-        p1, p2, float(self._sp_crz.value()), int(self._inf_laps.value()), algo,
-        turn_radius_override=float(self._inf_radius.value()),
-        cross_speed_mult=float(self._inf_cross_mult.value()),
-        bank_design_deg=float(self._inf_bank.value()))
-    except Exception as exc:
-      return None, f"Rota üretilemedi: {exc}"
+      land = (float(self._land_lat.text()), float(self._land_lon.text()))
+    except ValueError:
+      land = tkf
+
+
+    # ── PAPYON — önizleme = fiilen uçulan rota (2026-09-08) ────────────────
+    # NEDEN ÖNCELİKLİ: "🦋 Papyon deseni" işaretliyken companion'a
+    # infinity_pattern=otomatik gidiyor (bkz. checkbox NEDEN bloğu) ve D≥90 m
+    # ise companion SIKI yay + düz tam gaz uçuyor — _inf_algo (LEMNISCATE/
+    # DUBINS) o zaman companion'ı HİÇ etkilemiyor, yalnızca aşağıdaki eski
+    # dal etkiliyordu. Düzeltme öncesi (ölçüldü, D=153 m): önizleme R≈55.7 m
+    # (D/2.75) çiziyordu, companion r≈15.3 m uçuyordu — 3.6× fark, süre
+    # tahmini de aynı oranda YANLIŞTI. turn_radius_m/_inf_radius BİLEREK
+    # kullanılmaz: companion'ın papyon dalı "papyon_turn_radius_m" okur,
+    # YKİ o anahtarı hiç göndermez (bkz. infinity_flight.py _oto_al), yani
+    # _inf_radius'un papyon'a canlı uçuşta ZATEN etkisi yok.
+    is_papyon = False
+    oto = None
+    if getattr(self, "_inf_papyon_cb", None) is not None and self._inf_papyon_cb.isChecked():
+      try:
+        oto = compute_papyon_params(dist, bank_deg=float(self._inf_bank.value()),
+                                    v_tavan=14.0)
+      except Exception as exc:
+        return None, f"Rota üretilemedi (papyon): {exc}"
+    # NEDEN "and oto['papyon_uygun']": companion'ın kendi otomatik dalı D<90 m
+    # ise LEMNİSKATA düşer (bkz. infinity_flight.py "_pattern = 'papyon' if
+    # _oto['papyon_uygun'] else 'lemniskat'") — önizleme bunu TAKLİT ETMEZSE
+    # operatör küçük D'de yine papyonun (companion'da hiç uçulmayacak) geniş
+    # olmayan ama YANLIŞ şeklini görür. Küçük D'de aşağıdaki else dalına düşer.
+    if oto is not None and oto["papyon_uygun"]:
+      is_papyon = True
+      # NEDEN +0.5: fa/fb (pist çizgisi) doluysa companion deseni yarım tur
+      # uzatır (aşağıdaki finish_ab/dönüş bacağı bloğuyla AYNI gerekçe) —
+      # burada erken bilinmesi gerekir çünkü eğrinin KENDİSİ bu kadar
+      # üretilmeli, sonradan eklenemez.
+      # +0.5 KOŞULSUZ (2026-09-09): companion ek yarım turu (direk 2'nin son
+      # dolanması) artık her zaman uçuyor — şartname maddesi, koordinat
+      # girişine bağlı değil. Önizleme de bunu her zaman göstermeli.
+      _num_laps_efektif = int(self._inf_laps.value()) + 0.5
+      _PAPYON_N_PER_LAP = 90
+      try:
+        pap_pts = _gen_papyon_pts(p1, p2, _num_laps_efektif, oto["r"],
+                                  n_per_lap=_PAPYON_N_PER_LAP)
+        route = [{"cmd": 82, "lat": la, "lon": lo} for (la, lo) in pap_pts]
+        radius = oto["r"]
+        loop_v = oto["v_yay"]
+        cross_v = oto["v_duz"]
+        algo = "PAPYON"
+      except Exception as exc:
+        return None, f"Rota üretilemedi (papyon): {exc}"
+    else:
+      algo_clean = "LEMNISCATE" if "Lemniscate" in self._inf_algo.currentText() else "DUBINS"
+      try:
+        route, loop_v, cross_v, radius = build_infinity_route(
+          p1, p2, float(self._sp_crz.value()), int(self._inf_laps.value()), algo_clean,
+          turn_radius_override=float(self._inf_radius.value()),
+          cross_speed_mult=float(self._inf_cross_mult.value()),
+          bank_design_deg=float(self._inf_bank.value()))
+      except Exception as exc:
+        return None, f"Rota üretilemedi: {exc}"
+      algo = algo_clean
+      if oto is not None:
+        algo += " (papyon işaretli ama D<90 m — companion lemniskata düşer)"
 
     pts = [(it["lat"], it["lon"]) for it in route if it.get("cmd") == 82]
     if len(pts) < 2:
       return None, "Rota: geçerli nokta üretilemedi."
 
-    # ── ŞARTNAMENİN SON BACAĞI (2026-08-30 denetimi) ──────────────────────
-    # Pist Ucu A/B doluysa gerçek uçuş, desen bittikten sonra direk 2'yi son
-    # kez DIŞINDAN dolanır, pist başlangıç/bitiş çizgisini keser ve kalkış
-    # noktasına iner (companion finish_a/finish_b bacağı). Önizleme bunu HİÇ
-    # çizmiyordu — "önizleme = uçulan rota" sözleşmesi bozuktu. Buradaki
-    # bacak ŞEMATİKTİR: ek dolanmanın tam eğrisi üretilmez; niyet (desen
-    # sonu → direk 2 arkası → pist çizgisi ortası → kalkış) düz parçalarla
-    # gösterilir ve haritada KESİKLİ + ayrı renkte çizilir (drawRouteExtra).
-    finish_leg = None
-    finish_ab = None
-    try:
-      fa = (float(self._fa_lat.text()), float(self._fa_lon.text()))
-      fb = (float(self._fb_lat.text()), float(self._fb_lon.text()))
-    except ValueError:
-      fa = fb = None   # Pist uçları boş → önizleme eski davranışında kalır
-    if fa is not None and fb is not None:
-      # Direk 2'nin "arkası": direk1→direk2 doğrultusunda dönüş yarıçapı
-      # kadar ötesi — ek dolanmanın en dış noktasının kaba temsilcisi.
-      _brg = _bearing(p1["lat"], p1["lon"], p2["lat"], p2["lon"])
-      _behind = _offset_point(p2["lat"], p2["lon"], _brg, max(8.0, radius))
-      _mid_ab = ((fa[0] + fb[0]) / 2.0, (fa[1] + fb[1]) / 2.0)
-      finish_leg = [pts[-1], _behind, _mid_ab, tkf]
-      finish_ab = [fa, fb]
-
-    # Gerçek uçuş yolu kalkıştan başlar ve RTH açıksa oraya döner —
-    # önizlemenin bunu göstermesi gerekir, yoksa operatör kalkış ile ∞
-    # arasındaki geçiş bacağını hiç görmez. Son bacak çiziliyorsa dönüş O
-    # BACAK üzerinden gösterilir; aynı dönüşü ikinci kez düz RTH çizgisi
-    # olarak çizmek iki farklı dönüş yolu varmış izlenimi verirdi.
+    # ── ŞARTNAMENİN SON BACAĞI — KOŞULSUZ (2026-09-09) ─────────────────────
+    # Gerçek uçuş: desen (ek yarım tur DAHİL, yukarıdaki _num_laps_efektif ile
+    # pts BUNU İÇERİYOR — direk 2'nin son dolanması eğrinin kendisinde) biter,
+    # ardından companion kalkış/iniş noktasına TEK DÜZ ÇİZGİYLE döner
+    # (_transit_to_takeoff) ve LAND ile iner. Pist çizgisi kavramı tamamen
+    # kaldırıldı (koordinat girişi yok, çizgi-geçiş tespiti yok) — dönüş
+    # bacağı artık HER ZAMAN çizilir, iki nokta: [desenin bitişi, kalkış].
+    donus_bacagi = [pts[-1], land]
     full = [tkf] + pts
-    if self._rth_cb.isChecked() and finish_leg is None:
-      full.append(tkf)
 
     # Yol uzunluğu ve kaba süre (döngü hızıyla; DUBINS'te düz geçiş daha hızlı
     # olduğu için bu tahmin ÜST sınırdır, uçuş biraz daha kısa sürer).
     length = sum(_haversine(full[i][0], full[i][1], full[i + 1][0], full[i + 1][1])
                  for i in range(len(full) - 1))
-    if finish_leg is not None:
-      # Son bacak da uçulacak yolun parçası — uzunluk/süre tahminine dahil.
+    if donus_bacagi is not None:
+      # Dönüş bacağı da uçulacak yolun parçası — uzunluk/süre tahminine dahil.
       length += sum(
-        _haversine(finish_leg[i][0], finish_leg[i][1],
-                   finish_leg[i + 1][0], finish_leg[i + 1][1])
-        for i in range(len(finish_leg) - 1))
+        _haversine(donus_bacagi[i][0], donus_bacagi[i][1],
+                   donus_bacagi[i + 1][0], donus_bacagi[i + 1][1])
+        for i in range(len(donus_bacagi) - 1))
     # canli_cross_v: CANLI uçuşta gerçekleşecek düz geçiş hızı. Önizleme
     # algoritması LEMNISCATE seçilince build_infinity_route cross_v yerine
     # loop_v döndürüyor (o dalda WP-bazlı hız profili üretilmiyor) ve
@@ -3341,15 +4004,50 @@ class InfinityMissionTab(_BaseMissionTab):
     elif not self._inf_crz_auto.isChecked():
       # Elle tavan: companion min(max(tavan, loop), tavan_max) uyguluyor.
       canli_cross_v = min(max(float(self._sp_crz.value()), loop_v), canli_cross_v)
+    # ── PAPYON ETA DÜZELTMESİ (2026-09-08) ──────────────────────────────────
+    # NEDEN: genel formül (length/loop_v) TÜM yolu YAVAŞ yay hızıyla böler.
+    # Lemniscate/Dubins'te loop_v ile cross_v birbirine yakın olduğu için bu
+    # kabul edilebilir bir ÜST SINIRDI. Papyon'da düz bacak cross_v'de (14
+    # m/s) uçarken loop_v yalnız 5.15 m/s — genel formül papyonu OLDUĞUNDAN
+    # YAVAŞ gösterir (ölçüldü: D=153'te 196 s tahmin, gerçek ~154-177 s).
+    # Doğru tahmin: desenin düz bacakları cross_v'de, yayları loop_v'de,
+    # transit (giriş/çıkış) gerçek uçuşta da loop_v'de (bkz.
+    # PapyonTrajectory.transit_cruise_v = v_arc, infinity_flight.py) —
+    # yalnızca desenin KENDİSİ farklı hızda, transit aynı kalır.
+    eta_s = length / max(0.5, loop_v)
+    if is_papyon:
+      # _num_laps_efektif (yarım tur uzatması dahil) — desen artık gerçek
+      # uçuşla AYNI uzunlukta üretiliyor, süre payı da ona göre bölünmeli.
+      _duz_top = 2.0 * oto["L"] * _num_laps_efektif
+      _yay_top = 2.0 * oto["A"] * _num_laps_efektif
+      _desen_uzunluk = _duz_top + _yay_top
+      _transit_uzunluk = max(0.0, length - _desen_uzunluk)
+      eta_s = (_transit_uzunluk / max(0.5, loop_v)
+              + _duz_top / max(0.5, cross_v)
+              + _yay_top / max(0.5, loop_v))
+
+    # desen_n_tam_tur: TAM turlara (int(_inf_laps)) denk gelen nokta sayısı —
+    # papyon'da desen_n bundan BÜYÜK olabilir (yarım tur uzatması, bkz.
+    # _num_laps_efektif). _inf_tur_parcalari "N. tur" renklerini bu sınıra
+    # göre böler, kalan (varsa) AYRI "Ek yarım tur" parçası olur — aksi
+    # halde tam sayı olmayan desen_n/tur bölümü tur sınırlarını KAYDIRIRDI.
+    desen_n_tam_tur = (_PAPYON_N_PER_LAP * int(self._inf_laps.value())
+                       if is_papyon else len(pts))
+
     return full, {
       "n": len(pts), "length_m": length, "radius": radius,
       "loop_v": loop_v, "cross_v": cross_v, "canli_cross_v": canli_cross_v,
       "dist": dist, "algo": algo,
-      "eta_s": length / max(0.5, loop_v),
-      "finish_leg": finish_leg, "finish_ab": finish_ab,
+      "eta_s": eta_s,
+      "donus_bacagi": donus_bacagi,
       # Tur sınırlarını haritada gösterebilmek için: full = [kalkış] + desen,
       # desen `tur` kez tekrarlanan aynı sekiz çizimidir.
-      "desen_n": len(pts), "tur": int(self._inf_laps.value()),
+      "desen_n": len(pts), "desen_n_tam_tur": desen_n_tam_tur,
+      "tur": int(self._inf_laps.value()),
+      # Turları haritada AYRIŞTIRMAK (bkz. _inf_tur_parcalari) için gereken
+      # kerteriz — her tur AYNI eğriyi tekrarladığından offsetsiz üst üste
+      # biner, operatör 1./2. turu ayırt edemiyordu (2026-09-08 bulgusu).
+      "beta_deg": _bearing(p1["lat"], p1["lon"], p2["lat"], p2["lon"]),
     }
 
   # ── Tur Hızı: otomatik türetme (2026-08-31) ─────────────────────────────
@@ -3401,7 +4099,13 @@ class InfinityMissionTab(_BaseMissionTab):
   def _inf_turetilen_tavan(self):
     """Companion'ın kullanacağı düz-geçiş hız tavanı (m/s) — koordinat
     eksikse None. Formül companion ile AYNI olmalı (ayrı repo, ortak import
-    yok): loop = sqrt(g*R*tan(banka)), tavan = loop*cross_mult."""
+    yok): loop = sqrt(g*R*tan(banka)), tavan = loop*cross_mult.
+
+    PAPYON İSTİSNASI (2026-09-08): bu formül LEMNİSKAT/DUBINS'in D/2.75
+    yarıçapına dayanır ve papyon'da companion'ın gerçekte uçacağı düz hızla
+    (compute_papyon_params'ın v_duz'u, tipik 14 m/s tavanı) İLGİSİZDİR —
+    _inf_route_pts'teki papyon dalıyla AYNI kaynağı kullanmazsa "düz geçiş"
+    etiketi papyon açıkken de yanlış (lemniskat kökenli) bir sayı gösterir."""
     try:
       p1lat = float(self._p1_lat.text()); p1lon = float(self._p1_lon.text())
       p2lat = float(self._p2_lat.text()); p2lon = float(self._p2_lon.text())
@@ -3410,6 +4114,9 @@ class InfinityMissionTab(_BaseMissionTab):
     D = _haversine(p1lat, p1lon, p2lat, p2lon)
     if D < 5.0:
       return None
+    if getattr(self, "_inf_papyon_cb", None) is not None and self._inf_papyon_cb.isChecked():
+      return compute_papyon_params(D, bank_deg=float(self._inf_bank.value()),
+                                   v_tavan=14.0)["v_duz"]
     R = compute_optimal_turn_radius(D, float(self._inf_radius.value()))
     loop_v = compute_ideal_cruise(R, float(self._inf_bank.value()))
     return loop_v * float(self._inf_cross_mult.value())
@@ -3456,11 +4163,23 @@ class InfinityMissionTab(_BaseMissionTab):
   # (mavi/turuncu/mor/camgöbeği/pembe) yanında parlaklık da değişiyor.
   _TUR_RENKLERI = ["#4ade80", "#f59e0b", "#a78bfa", "#22d3ee", "#fb7185"]
   _GIRIS_RENGI = "#94a3b8"
+  _DONUS_RENGI = "#38bdf8"   # dönüş bacağı — tur renklerinden VE giriş/pist-çizgisi yeşilinden ayrık
 
   def _inf_tur_parcalari(self, full: list, info: dict) -> list[dict]:
-    """full listesini [giriş bacağı] + tur tur parçalara böler."""
+    """full listesini FAZ FAZ parçalara böler: Giriş → 1./2. tur → (varsa)
+    Ek yarım tur → Dönüş — her biri ayrı renk, tek düz/kesiksiz iz.
+
+    NEDEN (2026-09-08 operatör bulgusu — "kesikli çizgiler ne, dümdüz rota
+    istiyorum"): eski kod pist çizgisi tanımlıyken 4 noktalı KABA bir şema
+    ekliyordu ("direk 2 arkası" tahmini nokta → pist ortası → kalkış) —
+    gerçek uçuşta hiç var olmayan köşeli bir görünüm veriyordu. Artık `full`
+    (bkz. _inf_route_pts) zaten GERÇEK eğriyi (yarım tur uzatması dahil)
+    taşıyor; burada yalnız FAZLARA ayırıp renklendiriyoruz, uydurma nokta
+    EKLEMİYORUZ."""
     desen_n = int(info.get("desen_n") or 0)
+    desen_n_tam = int(info.get("desen_n_tam_tur") or desen_n)
     tur = max(1, int(info.get("tur") or 1))
+    donus = info.get("donus_bacagi")
     parcalar: list[dict] = []
     if desen_n <= 0 or len(full) < 2:
       return [{"pts": full, "color": _MAP_ROUTE_COLOR, "label": "Rota"}]
@@ -3471,24 +4190,69 @@ class InfinityMissionTab(_BaseMissionTab):
                      "color": self._GIRIS_RENGI, "label": "Giriş bacağı",
                      "dash": "6,5"})
     desen = full[1:1 + desen_n]
-    adim = max(1, desen_n // tur)
+    adim = max(1, desen_n_tam // tur)
+    # ── TUR AYRIŞTIRMA OFSETİ (2026-09-08 operatör bulgusu) ────────────────
+    # NEDEN: her tur MATEMATİKSEL OLARAK aynı eğriyi tekrarlar (∞ deseni
+    # kapalı bir eğridir) — renk farkı tek başına yetmiyordu, harita
+    # zumunda turlar birebir üst üste bindiği için "1. tur nerede bitiyor,
+    # 2. tur nerede giriyor" ayırt edilemiyordu. Yalnız GÖRSEL bir kaydırma:
+    # her tur, direk hattına DİK yönde küçük bir payla itilir (1. tur
+    # kaydırılmaz — o gerçek/otoriter iz). Uçuş verisini/matematiğini
+    # DEĞİŞTİRMEZ, yalnız bu çizim katmanını etkiler.
+    _OFSET_M = 2.5
+    beta = float(info.get("beta_deg", 0.0)) + 90.0
     for i in range(tur):
       bas = i * adim
-      son = desen_n if i == tur - 1 else min(desen_n, (i + 1) * adim)
+      son = desen_n_tam if i == tur - 1 else min(desen_n_tam, (i + 1) * adim)
       if bas >= son:
         continue
       # Turlar bitişik görünsün diye bir sonraki turun ilk noktası eklenir;
       # yoksa renk değişiminde çizgide görsel boşluk kalır.
       dilim = desen[bas:son + (1 if son < desen_n else 0)]
+      if i > 0:
+        dilim = [_offset_point(la, lo, beta, _OFSET_M * i) for (la, lo) in dilim]
       parcalar.append({"pts": dilim,
                        "color": self._TUR_RENKLERI[i % len(self._TUR_RENKLERI)],
                        "label": f"{i + 1}. tur"})
+    # Ek yarım tur (direk 2'nin pist çizgisi öncesi son dolanması) — pist
+    # çizgisi tanımlıysa desen_n, tam turların ötesine (desen_n_tam) uzanır.
+    if desen_n > desen_n_tam:
+      kalan = desen[desen_n_tam:]
+      if kalan:
+        kalan = [_offset_point(la, lo, beta, _OFSET_M * tur) for (la, lo) in kalan]
+        parcalar.append({"pts": kalan,
+                         "color": self._TUR_RENKLERI[tur % len(self._TUR_RENKLERI)],
+                         "label": "Ek yarım tur (direk 2 son dolanma)"})
+    # Dönüş bacağı — desenin GERÇEK bitişinden kalkışa TEK düz çizgi
+    # (_transit_through_finish_line'ın GUIDED düz uçuşuyla AYNI şey).
+    if donus:
+      parcalar.append({"pts": list(donus), "color": self._DONUS_RENGI,
+                       "label": "Dönüş bacağı", "dash": "6,5"})
     return parcalar
+
+  def _draw_poles_if_ready(self):
+    """Direk 1/2 alanları geçerliyse haritaya KALICI markerlarla çizer.
+
+    NEDEN AYRI ÇAĞRI GEREKİR (2026-09-08 operatör bulgusu): Direk 1/2
+    yalnızca harita TIKLANARAK girildiğinde (_add_wp) çiziliyordu — bir
+    PROFİL yüklendiğinde (_apply_params yalnız QLineEdit metnini yazar,
+    haritaya dokunmaz) ya da koordinat elle yapıştırıldığında direkler
+    haritada HİÇ görünmüyordu. _refresh_inf_preview zaten her iki durumda
+    da (profil yükleme, alan değişikliği) tetiklendiği için buradan da
+    çağrılır — set_poles KALICI markerdır, tekrar tekrar çağırmak birikme
+    yaratmaz (bkz. JS setPoles: konumu GÜNCELLER, yeniden eklemez)."""
+    try:
+      lat1, lon1 = float(self._p1_lat.text()), float(self._p1_lon.text())
+      lat2, lon2 = float(self._p2_lat.text()), float(self._p2_lon.text())
+    except ValueError:
+      return
+    self._map.set_poles(lat1, lon1, lat2, lon2)
 
   def _refresh_inf_preview(self, fit: bool = False):
     """Rota önizlemesini haritaya çizer ve özet etiketini günceller."""
     if not hasattr(self, "_inf_prev_lbl"):
       return
+    self._draw_poles_if_ready()
     # Kutuyu ÖNCE senkronla: _inf_route_pts() tur hızını kutudan okur,
     # sonra senkronlamak önizlemeyi bir adım geride bırakırdı.
     self._sync_inf_cruise()
@@ -3504,16 +4268,23 @@ class InfinityMissionTab(_BaseMissionTab):
       # NEDEN TUR TUR (2026-09-03 operatör isteği): "1. tur nerede bitiyor,
       # 2. tur nerede başlıyor" tek renk çizgide görülemiyordu. full listesi
       # [kalkış] + `tur` kez tekrarlanan desen; aynı sırayla dilimlenir.
+      # 2026-09-08: Giriş/tur(lar)/ek yarım tur/Dönüş HEPSİ artık
+      # _inf_tur_parcalari'nin döndürdüğü FAZLAR olarak TEK ÇAĞRIDA çiziliyor
+      # (bkz. o fonksiyonun NEDEN'i) — ayrı bir "şematik son bacak" katmanı
+      # kalmadı, drawRouteExtra burada yalnız GERÇEK pist çizgisini (A-B,
+      # düz, hakemin geçiş kontrolü yaptığı hat) ekliyor.
+      #
+      # kesisim=False (2026-09-08 operatör bulgusu): "Rota kendini kesiyor"
+      # ✕ işareti TEK bir sürekli eğri varsayar (sekizde tek, beklenen
+      # kesişim = merkez). Turları ayırt edilsin diye eklediğimiz görsel
+      # ofset (bkz. _inf_tur_parcalari _OFSET_M) turları birbirinden HAFİFÇE
+      # kaydırdığı için artık AYNI eğrinin ofsetli kopyaları birbirini
+      # onlarca yerde "kesiyor" — hepsi YAPAY (ölçüldü: 12/12 işaret
+      # SEGMENTLER ARASI, hiçbiri bir segmentin kendi içinde değil). Gerçek
+      # uçuşta bu kesişimlerin hiçbiri yok; dedektör artık kendi ofset
+      # düzeltmemizle çelişiyor ve sinyal değil gürültü üretiyor.
       self._map.draw_route_multi(self._inf_tur_parcalari(pts, info),
-                                 ok_araligi=5, kesisim=True, fit=fit)
-      # Son bacak: pist çizgisi (düz, A-B hattı) + şematik bitiş bacağı
-      # (kesikli). draw_route_multi önizleme katmanını sıfırladığı için
-      # ekler ONDAN SONRA çizilmeli (draw_route_extra temizlemez, ekler).
-      if info.get("finish_ab"):
-        self._map.draw_route_extra(list(info["finish_ab"]), _MAP_FINISH_COLOR)
-      if info.get("finish_leg"):
-        self._map.draw_route_extra(list(info["finish_leg"]),
-                                   _MAP_FINISH_COLOR, dash="7,7")
+                                 ok_araligi=5, kesisim=False, fit=fit)
     except Exception:
       logger.exception("Görev 1 rota önizlemesi çizilemedi")
     _eta = info["eta_s"]
@@ -3526,8 +4297,8 @@ class InfinityMissionTab(_BaseMissionTab):
       + (f", düz geçiş {info['canli_cross_v']:.1f} m/s"
          if info.get("canli_cross_v", 0.0) > info["loop_v"] + 0.05 else "")
       + f".  İrtifa {self._inf_alt.value():.0f} m."
-      + ("  Son bacak (direk 2 ek dolanması + pist çizgisi geçişi) haritada "
-         "kesikli yeşille ŞEMATİK çizildi." if info.get("finish_leg") else
+      + ("  Ek yarım tur + dönüş bacağı (mavi, kesikli) haritada gerçek "
+         "güzergâhla çizildi." if info.get("donus_bacagi") else
          "  Pist Ucu A/B boş — şartnamenin son bacağı çizilmedi (araç düz "
          "RTL/LOITER ile bitirir)."))
 
@@ -3622,6 +4393,7 @@ class InfinityMissionTab(_BaseMissionTab):
       self._wps.append({"lat": lat, "lon": lon, "alt": 0, "type": "DIREK 1", "idx": len(self._wps)})
       self._refresh_map()
       self._refresh_table()
+      self._draw_poles_if_ready()
     elif t == self._SEL_POLE2:
       self._p2_lat.setText(f"{lat:.7f}")
       self._p2_lon.setText(f"{lon:.7f}")
@@ -3630,20 +4402,12 @@ class InfinityMissionTab(_BaseMissionTab):
       self._wps.append({"lat": lat, "lon": lon, "alt": 0, "type": "DIREK 2", "idx": len(self._wps)})
       self._refresh_map()
       self._refresh_table()
-    elif t == self._SEL_FINISH_A:
-      self._fa_lat.setText(f"{lat:.7f}")
-      self._fa_lon.setText(f"{lon:.7f}")
-      self._wps = [w for w in self._wps if w["type"] != "PIST UCU A"]
-      self._wps.append({"lat": lat, "lon": lon, "alt": 0, "type": "PIST UCU A", "idx": len(self._wps)})
-      self._refresh_map()
-      self._refresh_table()
-    elif t == self._SEL_FINISH_B:
-      self._fb_lat.setText(f"{lat:.7f}")
-      self._fb_lon.setText(f"{lon:.7f}")
-      self._wps = [w for w in self._wps if w["type"] != "PIST UCU B"]
-      self._wps.append({"lat": lat, "lon": lon, "alt": 0, "type": "PIST UCU B", "idx": len(self._wps)})
-      self._refresh_map()
-      self._refresh_table()
+      self._draw_poles_if_ready()
+    elif t == self._SEL_LAND:
+      self._land_lat.setText(f"{lat:.7f}")
+      self._land_lon.setText(f"{lon:.7f}")
+      self._map.draw_circle(lat, lon, 2, _MAP_LAND_COLOR)
+      self._refresh_inf_preview()
     else:
       super()._add_wp(lat, lon)
 
@@ -3706,6 +4470,11 @@ class InfinityMissionTab(_BaseMissionTab):
       "lookahead_m":              self._inf_lookahead.value(),
       "infinity_cross_speed_mult": self._inf_cross_mult.value(),
     })
+    # İSTEĞE BAĞLI (bkz. checkbox NEDEN bloğu) — işaretsizken alan hiç
+    # gönderilmez, companion "lemniskat" varsayılanına düşer (eski davranış).
+    if getattr(self, "_inf_papyon_cb", None) is not None \
+        and self._inf_papyon_cb.isChecked():
+      params["infinity_pattern"] = "otomatik"
     # ── GÖREV SÜRE BÜTÇESİ (mission_time_budget_s) ────────────────────────
     # 0 / 60 s altı → alan gönderilmez; companion yol uzunluğundan kendi
     # güvenli tavanını türetir (infinity_flight.py:1155-1168 NEDEN bloğu).
@@ -3716,33 +4485,20 @@ class InfinityMissionTab(_BaseMissionTab):
     # AYNI "isteğe bağlı alan" deseni).
     if self._inf_radius.value() > 0.0:
       params["turn_radius_m"] = self._inf_radius.value()
-    # Pist başlangıç/bitiş çizgisi — İSTEĞE BAĞLI (DEVIR §0o). İki uç da
-    # girilmemişse alan hiç gönderilmez; İHA tarafı bunu "eski davranış"
-    # (doğrudan RTL/LOITER, ek yarım tur/hat-geçişi YOK) olarak yorumlar —
-    # geriye dönük uyumluluk, hazır olmayan sahalar için görevi bozmaz.
+    # ── İNİŞ NOKTASI — OPSİYONEL (2026-09-09) ──────────────────────────────
+    # Boşsa HİÇ gönderilmez → companion eski davranışı sürdürür (dönüş
+    # bacağı kalkışa gider, bkz. infinity_flight.py `_takeoff_pos`).
+    # Doluysa companion dönüş bacağını BU noktaya yönlendirir; kalkış
+    # noktası (ARM anındaki gerçek konum) bundan ETKİLENMEZ.
     try:
-      fa = {"lat": float(self._fa_lat.text()), "lon": float(self._fa_lon.text())}
-      fb = {"lat": float(self._fb_lat.text()), "lon": float(self._fb_lon.text())}
-      params["finish_a"] = fa
-      params["finish_b"] = fb
+      land_lat = float(self._land_lat.text())
+      land_lon = float(self._land_lon.text())
+      params["land_pos"] = {"lat": land_lat, "lon": land_lon}
     except ValueError:
-      # 2026-08-30 şartname denetimi: eskiden burada sessizce yutuluyordu
-      # (`pass`) ve operatör son bacağın atlanacağını FARK ETMEDEN görevi
-      # gönderebiliyordu. Alan isteğe bağlı OLMAYA devam ediyor (hazır
-      # olmayan saha için bilinçli atlama hâlâ mümkün) ama atlama artık
-      # AÇIK ONAY gerektiriyor — varsayılan buton 'Hayır' (DURDUR/RTL
-      # onayıyla aynı desen, bkz. top_bar._on_drop_click).
-      reply = QMessageBox.question(
-        self, "Pist Çizgisi Boş",
-        "Pist Ucu A/B boş ya da geçersiz — şartnamenin son bacağı\n"
-        "(direk 2 arkasından dönüş + bitiş çizgisi geçişi) ATLANACAK,\n"
-        "araç eski davranışla (doğrudan RTL/LOITER) bitirecek.\n\n"
-        "Yine de gönderilsin mi?",
-        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        QMessageBox.StandardButton.No,
-      )
-      if reply != QMessageBox.StandardButton.Yes:
-        return
+      pass
+    # Pist Ucu A/B GÖNDERİLMİYOR (2026-09-09): şartnamenin son bacağı (direk 2
+    # arkasından dönüş) İHA tarafında artık KOŞULSUZ uygulanıyor, çizgi-geçiş
+    # tespiti ise tamamen kaldırıldı. Onay penceresi de bu yüzden gereksizleşti.
     # BUG FIX: self._wps yalnızca harita işaretçilerini (DIREK 1/2) içerir —
     # bunlar uçuş rotası WP'si değildir. Companion, pole1/pole2'den ∞ rotayı üretir.
     params["waypoints"] = []

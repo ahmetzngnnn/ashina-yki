@@ -489,6 +489,16 @@ class HUDWidget(QWidget):
         self._ekf_flags   = 0
         self._flight_mode = "---"
         self._armed       = False
+        # Bağlantı durumu — NEDEN: update_telemetry çağrılmayı KESİNCE (FC/RFD
+        # linki koptuğunda) HUD son gerçek tutum/irtifa/batarya/GPS değerlerinde
+        # sonsuza dek donup kalıyordu, hiçbir görsel değişiklik olmadan — "canlı"
+        # görünen ama tamamen bayat bir uçuş göstergesi. set_connection_status()
+        # main_window'daki mavlink_worker.connection_changed sinyaline bağlanır.
+        self._link_ok = True
+
+    def set_connection_status(self, bagli: bool) -> None:
+        self._link_ok = bagli
+        self.update()
 
     @pyqtSlot(dict)
     def update_telemetry(self, data: dict) -> None:
@@ -762,6 +772,19 @@ class HUDWidget(QWidget):
         p.setFont(QFont("Courier New", 7))
         p.drawText(w - 32, by + 42, f"#{tick}")
 
+        # ── Bağlantı yok uyarısı — göz ardı edilemez, üstteki tutum/irtifa/
+        # batarya/GPS değerlerinin BAYAT olduğunu açıkça söyler (üzerlerini
+        # kapatmaz, "son bilinen değer" olarak okunabilir kalır).
+        if not self._link_ok:
+            p.fillRect(0, 0, w, h, QColor(0, 0, 0, 130))
+            p.setPen(QPen(QColor(HUD_CRIT), 2))
+            p.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
+            uyari = "⚠ BAĞLANTI YOK — GÖSTERİLEN DEĞERLER ESKİ"
+            fm = QFontMetrics(p.font())
+            uyari_w = fm.horizontalAdvance(uyari)
+            p.fillRect(cx - uyari_w // 2 - 10, cy - 16, uyari_w + 20, 32, QColor(0, 0, 0, 200))
+            p.drawText(cx - uyari_w // 2, cy + 6, uyari)
+
         p.end()
 
 
@@ -825,6 +848,11 @@ class QuickDataWidget(QWidget):
         # heading: ham float yerine tam derece (0-359). ÖNCEDEN str() ile 15 ondalık
         # gösteriliyordu ("20.1747259...").
         self._value_labels["heading"].setText(f"{int(round(float(data.get('heading', 0)))) % 360}°")
+
+    def set_no_data(self) -> None:
+        """Bağlantı koptuğunda çağrılır — sayılar donuk kalmasın."""
+        for lbl in self._value_labels.values():
+            lbl.setText("—")
 
 
 # ── Harita Widget ─────────────────────────────────────────────────────────────
@@ -1086,6 +1114,10 @@ class DashboardView(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._last_detection_time = None
+        # ARM durumu — YKİ yeniden başlatma kapısı bunu okur (bkz.
+        # _on_yki_restart_clicked). Bağlantı koptuğunda BİLEREK sıfırlanmaz:
+        # son bilinen "ARM'lı" bilgisiyle uyarmak, hiç uyarmamaktan güvenlidir.
+        self._son_armed = False
         # Fix: kart referansları — eskiyenler layout'tan çıkarılıp silinsin
         self._ai_cards: list = []
         # Fix: yol haritası son uygulanan durum listesi (gereksiz stylesheet parse'ı önler)
@@ -1291,6 +1323,21 @@ class DashboardView(QWidget):
         cgl.addWidget(b_mode_sel)
 
         ll.addWidget(cmd_grp)
+
+        # ── YER İSTASYONU (YKİ) — ARACA DOKUNMAZ ─────────────────────────
+        # NEDEN AYRI KUTU (2026-09-05): bu düğme ARACI değil, YKİ'nin KENDİSİNİ
+        # yeniden başlatır. Yukarıdaki "Hızlı Komutlar" kutusuna konsaydı
+        # ARM/LAND/RTL'in yanında durur ve baskı altında uçuş komutu sanılabilirdi.
+        gcs_grp = QGroupBox("Yer İstasyonu (YKİ)")
+        ggl = QVBoxLayout(gcs_grp)
+        self._btn_yki_restart = QPushButton("YKİ'yi Yeniden Başlat")
+        self._btn_yki_restart.setToolTip(
+            "YKİ uygulamasını kapatıp yeniden açar ve artakalan YKİ süreçlerini "
+            "temizler. ARACA DOKUNMAZ — uçuş bilgisayarı ve FC etkilenmez."
+        )
+        self._btn_yki_restart.clicked.connect(self._on_yki_restart_clicked)
+        ggl.addWidget(self._btn_yki_restart)
+        ll.addWidget(gcs_grp)
 
         # TOF Durum Makinesi (Daha sonra sekmeye eklenecek)
 
@@ -2052,6 +2099,46 @@ class DashboardView(QWidget):
             return
         self.send_command.emit(_MV.mavlink.MAV_CMD_NAV_LAND, [0, 0, 0, 0, 0, 0, 0])
 
+    def _on_yki_restart_clicked(self) -> None:
+        """YKİ'yi yeniden başlatır (araca dokunmaz). Operatör talebi 2026-09-05."""
+        from PyQt6.QtWidgets import QMessageBox
+        from core import yki_yeniden_baslat
+
+        # ARM'LIYKEN AYRI KAPI: yeniden başlatma sırasında ~10 sn boyunca
+        # telemetri ekranı ve komut arayüzü YOK olur. Araç havadayken bu,
+        # operatörün RTL/LAND gönderebileceği yolu geçici olarak kapatır.
+        if self._son_armed:
+            cevap = QMessageBox.warning(
+                self, "ARAÇ ARM'LI — YKİ yeniden başlatılsın mı?",
+                "⚠ ARAÇ ŞU AN ARM'LI (motorlar çalışıyor olabilir).\n\n"
+                "YKİ yeniden başlarken telemetri ve komut arayüzü ~10 saniye "
+                "KAPALI kalır; bu süre boyunca YKİ'den RTL/LAND gönderemezsiniz.\n"
+                "(Kumanda ve FC'nin kendi failsafe'leri etkilenmez.)\n\n"
+                "Yine de yeniden başlatılsın mı?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+        else:
+            cevap = QMessageBox.question(
+                self, "YKİ'yi Yeniden Başlat",
+                "YKİ kapanıp yeniden açılacak, artakalan YKİ süreçleri "
+                "temizlenecek (~10 sn).\n\n"
+                "ARACA DOKUNULMAZ: uçuş bilgisayarı, FC ve servolar etkilenmez.\n\n"
+                "Devam edilsin mi?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+        if cevap != QMessageBox.StandardButton.Yes:
+            return
+
+        self._btn_yki_restart.setEnabled(False)
+        self._btn_yki_restart.setText("Yeniden başlatılıyor…")
+        ok, mesaj = yki_yeniden_baslat.yeniden_baslat()
+        if not ok:
+            self._btn_yki_restart.setEnabled(True)
+            self._btn_yki_restart.setText("YKİ'yi Yeniden Başlat")
+            QMessageBox.critical(self, "Yeniden başlatılamadı", mesaj)
+
     def _set_mode(self, mode: int) -> None:
         if _MV is None:
             return
@@ -2108,7 +2195,29 @@ class DashboardView(QWidget):
         except Exception:
             logger.exception("Dashboard FC home işaretçisi güncellenemedi")
 
+    @pyqtSlot(bool)
+    def on_connection_changed(self, bagli: bool) -> None:
+        """FC/RFD900 (mavlink_worker) linki değişince çağrılır.
+
+        NEDEN: main_window ÖNCEDEN bu sinyali dashboard'a HİÇ bağlamıyordu —
+        top_bar ve saha_testi_view gibi diğer görünümler bağlantı kopunca
+        kendini "veri yok"a çekerken, ana Dashboard'daki yapay ufuk/irtifa/
+        hız/batarya/GPS/ARM göstergeleri son gerçek değerde SONSUZA KADAR
+        donup kalıyordu — hiçbir görsel değişiklik olmadan, "canlı ve
+        sağlıklı" görünen ama tamamen bayat bir uçuş ekranı.
+        """
+        self._hud.set_connection_status(bagli)
+        if not bagli:
+            self._quick_data.set_no_data()
+            self._hw_seen["rssi"] = False
+            self._hw_seen["loss"] = False
+            self._rssi_bar.setValue(0)
+            self._rssi_bar.setFormat("—")
+            self._loss_bar.setValue(0)
+            self._loss_bar.setFormat("—")
+
     def update_telemetry(self, data: dict) -> None:
+        self._son_armed = bool(data.get("armed", False))
         self._quick_data.update_telemetry(data)
         self._hud.update_telemetry(data)
         self.update_track3d(data)

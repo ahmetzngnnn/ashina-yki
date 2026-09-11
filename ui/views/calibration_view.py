@@ -595,9 +595,11 @@ class CalibrationView(QWidget):
 
         # Alt paneller _build_ui içinde kurulur; kurulmazsa None kalır
         self._sensor_view = None
+        self._camera_view = None
         self._motor_view = None
         self._modes_view = None
         self._preflight_view = None
+        self._servo_drop_view = None
 
         self._build_ui()
         self._install_wheel_guards()
@@ -752,6 +754,23 @@ class CalibrationView(QWidget):
             self._tabs.addTab(_hata_sekmesi("Sensör & Seviye", exc), "Sensör & Seviye")
 
         try:
+            from ui.views.camera_cal_view import CameraCalView
+            self._camera_view = CameraCalView()
+            self._tabs.addTab(self._camera_view, "Kamera")
+        except Exception as exc:
+            logger.exception("Kamera kalibrasyon paneli kurulamadı")
+            self._tabs.addTab(_hata_sekmesi("Kamera", exc), "Kamera")
+
+        try:
+            from ui.views.camera_mount_cal_view import CameraMountCalView
+            self._camera_mount_view = CameraMountCalView()
+            self._tabs.addTab(self._camera_mount_view, "Kamera Montaj Yönü")
+        except Exception as exc:
+            logger.exception("Kamera montaj yönü paneli kurulamadı")
+            self._tabs.addTab(_hata_sekmesi("Kamera Montaj Yönü", exc),
+                              "Kamera Montaj Yönü")
+
+        try:
             from ui.views.motor_test_view import MotorTestView
             self._motor_view = MotorTestView(self._kanal)
             self._tabs.addTab(self._motor_view, "⚠ Motor Test")
@@ -766,6 +785,15 @@ class CalibrationView(QWidget):
         except Exception as exc:
             logger.exception("Uçuş modları paneli kurulamadı")
             self._tabs.addTab(_hata_sekmesi("Uçuş Modları", exc), "Uçuş Modları")
+
+        try:
+            from ui.views.servo_drop_test_view import ServoDropTestView
+            self._servo_drop_view = ServoDropTestView(self._kanal)
+            self._tabs.addTab(self._servo_drop_view, "⚠ Yük Bırakma Servo Testi")
+        except Exception as exc:
+            logger.exception("Yük bırakma servo test paneli kurulamadı")
+            self._tabs.addTab(_hata_sekmesi("Yük Bırakma Servo Testi", exc),
+                              "⚠ Yük Bırakma Servo Testi")
 
         try:
             from ui.views.preflight_check_view import PreflightCheckView
@@ -823,7 +851,8 @@ class CalibrationView(QWidget):
             # durumunu da temizler.
             self._compass_active = False
         for panel in (self._sensor_view, self._motor_view,
-                      self._modes_view, self._preflight_view):
+                      self._modes_view, self._preflight_view,
+                      self._servo_drop_view):
             fn = getattr(panel, "on_connection_changed", None)
             if callable(fn):
                 try:
@@ -1958,6 +1987,24 @@ class CalibrationView(QWidget):
         self._rc_status_set("Durum: Ekran değerleri sıfırlandı (FC'ye yazılmadı)")
 
     @pyqtSlot(dict)
+    def on_rpi_status(self, data: dict) -> None:
+        """companion (RPi) status yayını — main_window.rpi_worker'dan gelir.
+
+        NEDEN AYRI: bu, `update_telemetry`'nin aldığı DOĞRUDAN MAVLink
+        telemetrisinden (armed vb.) FARKLI bir kanaldır — yalnız companion
+        yayınında var olan alanlar (ör. servo_state.red_drop_pwm_open,
+        config.json'dan gelir) buradan geçer. `rpi_status_updated` sekme
+        görünürlüğünden BAĞIMSIZ (dashboard'daki kullanımıyla AYNI), yani
+        Kalibrasyon sekmesi arka plandayken de etiketler güncel kalır.
+        """
+        if not isinstance(data, dict) or self._servo_drop_view is None:
+            return
+        try:
+            self._servo_drop_view.update_rpi_status(data.get("servo_state", {}) or {})
+        except Exception:
+            logger.exception("Servo bırakma test paneli rpi_status işleme hatası")
+
+    @pyqtSlot(dict)
     def update_telemetry(self, data: dict):
         # Alt panellere dağıt. NEDEN: main_window telemetriyi YALNIZCA GÖRÜNÜR
         # sekmeye veriyor (_dispatch_telemetry) ve gördüğü widget bu sınıftır;
@@ -1968,7 +2015,8 @@ class CalibrationView(QWidget):
             self._armed = _armed_yeni
             self._guncelle_reboot_butonu()
 
-        for panel in (self._sensor_view, self._motor_view, self._modes_view):
+        for panel in (self._sensor_view, self._motor_view, self._modes_view,
+                      self._servo_drop_view):
             fn = getattr(panel, "update_telemetry", None)
             if callable(fn):
                 try:

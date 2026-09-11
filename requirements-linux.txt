@@ -26,6 +26,11 @@ folium>=0.14.0
 requests>=2.31.0
 cryptography>=41.0.0
 pyserial>=3.5
+# GercekGorevPaneli "Testi Başlat" butonu — araç Pi'de ashina-iha.service'i
+# durdurup tools/human_guided_bench.py'yi uzaktan başlatmak için (bkz.
+# core/vehicle_bench_control.py). Parola YALNIZCA bellekte tutulur, hiçbir
+# dosyaya yazılmaz.
+paramiko>=3.4.0
 # F9P baz istasyonu yapılandırması (tools/f9p_base_config.py — UBX-CFG-VALSET/
 # NAV-SVIN). Çalışma anındaki RTK aktarımı (core/rtk_gps_worker.py) BUNA
 # İHTİYAÇ DUYMAZ (ham RTCM3 çerçeveleme elle yapılıyor, yeni bağımlılık yok) —

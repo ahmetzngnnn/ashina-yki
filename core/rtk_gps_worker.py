@@ -33,6 +33,13 @@ logger = logging.getLogger(__name__)
 
 _RECONNECT_DELAY_S = 3.0
 _EMIT_MIN_INTERVAL_S = 0.4   # UI'ya en fazla ~2.5 Hz besle
+# 2026-09-06 denetimde bulundu: F9P donup (USB enumere kalır ama veri
+# üretmeyi bırakırsa) `serial.Serial(..., timeout=0.3)` istisna ATMADAN
+# sürekli boş dönüyordu — panel "● bağlı / RTK FIXED" ve ESKİ koordinatları
+# SONSUZA KADAR canlıymış gibi göstermeye devam ediyordu (izole testle
+# doğrulandı). Aynı hata sınıfı `rpi_status_worker.py`'de bulunup
+# `_STALE_TIMEOUT_S` ile düzeltilmişti, bu dosyaya hiç yayılmamıştı.
+_STALE_TIMEOUT_S = 10.0
 # Bu süreden uzun süre RTCM çerçevesi gelmezse baz istasyonu "pasif" sayılır
 # (survey-in sürüyor, F9P henüz TMODE'a geçmedi, ya da bağlantı sorunlu).
 _RTCM_ACTIVE_TIMEOUT_S = 5.0
@@ -193,14 +200,20 @@ class RtkGpsWorker(QThread):
                 self._send_cold_start(s)
                 self._cold_start_sent = True
             buf = bytearray()
+            last_data_ts = time.monotonic()
             while not self.isInterruptionRequested():
                 try:
                     chunk = s.read(4096)
                 except Exception:
                     break
                 if chunk:
+                    last_data_ts = time.monotonic()
                     buf += chunk
                     self._drain_buffer(buf)
+                elif time.monotonic() - last_data_ts > _STALE_TIMEOUT_S:
+                    logger.warning("RTK GPS %.0f s süredir sessiz — bağlantı "
+                                   "koptu sayılıp yeniden bağlanılıyor", _STALE_TIMEOUT_S)
+                    break
                 self._maybe_emit()
                 self._maybe_emit_base_status()
         self.connected_changed.emit(False)

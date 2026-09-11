@@ -510,6 +510,10 @@ class MainWindow(QMainWindow):
         self.rpi_worker.rpi_connected.connect(self.top_bar.set_rpi_connection_status)
         self.rpi_worker.rpi_connected.connect(self._on_rpi_connection_changed)
         self.rpi_worker.rpi_status_updated.connect(self._on_rpi_status)
+        # Yük bırakma servo test paneli (Kalibrasyon sekmesi) — config.json'daki
+        # pwm_open/pwm_close'u göstermek için. Sekme görünürlüğünden bağımsız
+        # (dashboard'un rpi_status kullanımıyla aynı desen).
+        self.rpi_worker.rpi_status_updated.connect(self._calib_view.on_rpi_status)
         self.rpi_worker.rpi_connected.connect(
             self._saha_testi_view.on_companion_changed)
         self.rpi_worker.health_alert.connect(self._saha_testi_view.on_health_alert)
@@ -552,6 +556,12 @@ class MainWindow(QMainWindow):
         w.telemetry_updated.connect(self._dispatch_telemetry)
         w.connection_changed.connect(self.top_bar.set_connection_status)
         w.connection_changed.connect(self._on_connection_changed)
+        # NEDEN (2026-09-04, denetimde bulundu): top_bar ve saha_testi_view
+        # bağlantı kopunca kendini "veri yok"a çekerken, ana Dashboard'un
+        # HUD'u (tutum/irtifa/hız/batarya/GPS/ARM) ve Hızlı Veri paneli hiç
+        # bağlı değildi — link koptuğunda son gerçek değerlerde SONSUZA KADAR
+        # donup kalıyordu, "canlı" görünen ama tamamen bayat bir uçuş ekranı.
+        w.connection_changed.connect(self._dashboard.on_connection_changed)
         w.param_received.connect(self._advanced_view.update_param)
         w.param_received.connect(self._tuning_view.update_param)
         w.log_entry_received.connect(self._syslog_view.on_log_entry)
@@ -589,6 +599,11 @@ class MainWindow(QMainWindow):
         w.connection_changed.connect(self._saha_testi_view.on_connection_changed)
         w.status_text_received.connect(self._saha_testi_view.on_status_text)
         self._saha_testi_view.send_command.connect(w.send_command)
+        # Otonom hizalama testi (GercekGorevPaneli): "güncel konum" ayrı bir
+        # MAVLink bağlantısı AÇMADAN, bu akıştan SÜREKLİ (görünür sekme şartı
+        # olmadan) biriktirilir — bkz. core/otonom_align_test.py 2026-09-05
+        # notu (gerçek donanımda seri/RFD900 tek bağlantı kabul eder).
+        w.telemetry_updated.connect(self._saha_testi_view.gorev_paneli.on_telemetry_position)
         # AutoTune paneli: eksen maskesi/agresiflik FC'ye YAZILIR ve FC'nin
         # gerçek değerleri geri okunur; AUTOTUNE ilerlemesi STATUSTEXT'ten gelir.
         w.connection_changed.connect(self._autotune_view.on_connection_changed)
@@ -624,6 +639,12 @@ class MainWindow(QMainWindow):
         self._tuning_view.set_param.connect(w.set_param)
         self._advanced_view.set_param.connect(w.set_param)
         self._advanced_view.request_params.connect(w.request_parameters)
+        # Eksik parametre tamamlama: worker'daki `request_param_index` ve
+        # `param_ilerleme` ZATEN vardı ama Gelişmiş görünüm bunlara bağlı
+        # değildi — tam liste RFD900A üzerinden eksik iniyor ve eksik olduğu
+        # arayüzde HİÇ görünmüyordu (operatör bildirimi, 2026-09-04).
+        self._advanced_view.request_param_index.connect(w.request_param_index)
+        w.param_ilerleme.connect(self._advanced_view.on_param_progress)
         self._dashboard.send_command.connect(w.send_command)
         self._dashboard.ned_velocity_cmd.connect(w.send_ned_velocity)
         self._mission_view.write_mission.connect(w.upload_mission)
@@ -1784,6 +1805,7 @@ class MainWindow(QMainWindow):
             self.mavlink_worker, self.ai_worker,
             self.video_worker, self.tts_worker, self.rpi_worker,
             self._saha_testi_view.video_worker,
+            self._saha_testi_view.gorev_paneli.video_worker,
         ]
         if self.ntrip_worker is not None:
             workers_to_stop.append(self.ntrip_worker)

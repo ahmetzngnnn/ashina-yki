@@ -78,9 +78,19 @@ from typing import Any, Mapping, Optional
 # DİKKAT — buradaki gerilim→yüzde eşlemesi (25.2 V=%100, 21.0 V=%0) ile FC'nin
 # bildirdiği KALAN YÜZDE AYRI ŞEYLERDİR. FC yüzdesi harcanan mAh sayımıdır ve
 # akım sensörü (BATT_AMP_PERVLT) kalibre EDİLMEDİĞİ sürece güvenilmezdir:
-# 2026-09-03'te 23.06 V'ta %10 raporladı, gerilim ~%49 diyordu. İHA'nın
-# batarya failsafe'i (failsafe_manager, %10'da MANDALLI kritik) FC yüzdesini
-# kullanır — kalibrasyon yapılana kadar sahte kritik beklenmelidir.
+# 2026-09-03'te 23.06 V'ta %10 raporladı, gerilim ~%49 diyordu.
+# 2026-09-06 DÜZELTME — BU NOT BAYATTI: aşağıdaki paragraf "İHA'nın batarya
+# failsafe'i FC yüzdesini kullanır" diyordu; bu 2026-09-03/04'teki karara
+# (bkz. yukarıdaki not) kadar doğruydu. GÜNCEL DURUM (`IHA/core/
+# failsafe_manager.py::BatteryWatcher.update()` doğrulandı): karar TAMAMEN
+# GERİLİME dayanıyor, `battery_pct` (FC yüzdesi) yalnızca operatöre gösterilen
+# log/mesaj metnine ekleniyor (`pct_not = f", FC %{battery_pct}"`) — hiçbir
+# eşik/karar dalında OKUNMUYOR. Yani FC yüzdesinin kalibrasyonsuz olması
+# artık İHA'nın uçuş kararını ETKİLEMİYOR; kalan tek risk (ayrı ve daha
+# düşük öncelikli) FC'nin KENDİ dahili failsafe'inin (BATT_FS_LOW_ACT/
+# BATT_FS_CRT_ACT, ArduPilot parametreleri) hangi kaynağı kullandığıdır —
+# o, ArduPilot'un kendi BATT_MONITOR yapılandırmasına bağlıdır, bu dosyanın
+# veya failsafe_manager.py'nin kapsamı dışındadır.
 HUCRE_SAYISI = 6
 HUCRE_DOLU_V = 4.20      # tam dolu LiPo hücresi (üretici üst sınırı)
 HUCRE_BOS_V  = 3.50      # "boş" kabulü — kullanıcı kararı (bkz. dosya başlığı)

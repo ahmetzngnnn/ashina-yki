@@ -44,6 +44,12 @@ DEFAULTS: dict = {
     # dinliyor, yalnızca localhost değil). Gerçek uçuş/yarışma öncesi rastgele
     # bir dizgiyle DOLDURUN ve companion tarafında da AYNI değeri girin.
     "companion_auth_token":   "",
+    # SSH ile araç Pi'de komut çalıştırmak için (GercekGorevPaneli "Testi
+    # Başlat" düğmesi — bkz. core/vehicle_bench_control.py). auth_token gibi
+    # düz metin: yalnızca APPDATA'daki settings.json'a yazılmalı, REPO
+    # şablonunda ("" varsayılan) BOŞ kalmalı. Boşsa panel operatöre bir kerelik sorar.
+    "companion_ssh_user":     "ash",
+    "companion_ssh_password": "",
     "companion_status_port":  5602,
     "companion_video_port":   8081,          # İşlenmiş video (görev sırasında, vision annotated)
     "companion_video_raw_port": 8080,        # Ham kamera (her zaman açık)
@@ -213,6 +219,14 @@ class GCSConfig:
     @property
     def companion_auth_token(self) -> str:
         return str(self._data.get("companion_auth_token", "") or "")
+
+    @property
+    def companion_ssh_user(self) -> str:
+        return str(self._data.get("companion_ssh_user", "ash") or "ash")
+
+    @property
+    def companion_ssh_password(self) -> str:
+        return str(self._data.get("companion_ssh_password", "") or "")
 
     @property
     def companion_status_port(self) -> int:

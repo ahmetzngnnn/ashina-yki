@@ -131,11 +131,22 @@ class AdvancedView(QWidget):
     start_ntrip = pyqtSignal(str, int, str, str, str)  # host, port, mountpoint, user, pass
     stop_ntrip  = pyqtSignal()                          # NTRIP durdur
     request_params = pyqtSignal()  # parametre listesi talep et
+    # Tek parametreyi SIRA NUMARASIYLA iste (eksik tamamlama).
+    # NEDEN: worker'da `request_param_index()` ve `param_ilerleme(index,count)`
+    # ZATEN vardı ama bu görünüm onlara HİÇ bağlı değildi — tam parametre
+    # listesi RFD900A üzerinden eksik iniyor ve eksik olduğu görünmüyordu
+    # (`ParamDeposu`'nun tamamlama mantığı yalnız diğer panellerde kullanılıyor).
+    request_param_index = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._param_cache: dict = {}
         self._modified_params: dict = {}
+        # Eksik parametre takibi: FC'nin bildirdiği toplam ve gelen sıra
+        # numaraları. Hangi indekslerin gelmediği ancak böyle bilinir —
+        # ad listesiyle bilinemez, çünkü gelmeyen parametrenin adı da yoktur.
+        self._param_total: int = 0
+        self._param_seen: set[int] = set()
         # NTRIP durum etiketinin SON durumu token olarak saklanır — tema
         # değişince aynı durum yeni paletle yeniden boyanabilsin diye.
         self._ntrip_status_token: str = "idle"
@@ -264,10 +275,28 @@ class AdvancedView(QWidget):
         btn_write.setObjectName("primaryButton")
         btn_write.clicked.connect(self._write_modified)
 
+        # Eksik parametreleri tek tek yeniden iste (ArduPilot kayıp PARAM_VALUE'yu
+        # KENDİLİĞİNDEN tekrarlamaz; GCS sıra numarasıyla sormak zorundadır).
+        self._btn_eksik = QPushButton("Eksikleri İste")
+        self._btn_eksik.setToolTip(
+            "FC'nin bildirdiği toplam ile gelen parametreleri karşılaştırır, "
+            "gelmeyenleri sıra numarasıyla tek tek yeniden ister."
+        )
+        self._btn_eksik.clicked.connect(self._on_request_missing)
+        self._btn_eksik.setEnabled(False)
+
         search_row.addWidget(self._search_box)
         search_row.addWidget(btn_refresh)
+        search_row.addWidget(self._btn_eksik)
         search_row.addWidget(btn_write)
         layout.addLayout(search_row)
+
+        # Durum bandı: kaç parametre alındı, kaçı eksik, süzgeç kaçını gösteriyor.
+        # NEDEN: operatör listenin EKSİK olduğunu hiçbir yerden göremiyordu;
+        # aradığı parametre "yok" mu yoksa "inmemiş" mi ayırt edilemiyordu.
+        self._param_status = QLabel("Parametre listesi henüz istenmedi.")
+        self._param_status.setObjectName("mutedLabel")
+        layout.addWidget(self._param_status)
 
         # Model ve View
         self._param_model = QStandardItemModel()
@@ -278,6 +307,17 @@ class AdvancedView(QWidget):
         self._proxy_model.setSourceModel(self._param_model)
         self._proxy_model.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self._proxy_model.setFilterKeyColumn(-1)  # Tüm sütunlarda ara
+        # ── ARAMA HATASI DÜZELTMESİ (operatör bildirimi: "parametreyi yazıyorum
+        # çıkmıyor, var olsa bile bulamıyorum") ────────────────────────────────
+        # NEDEN: bu ağaç İKİ SEVİYELİ (kategori → parametre). QSortFilterProxyModel
+        # varsayılanı bir satırı KENDİSİ eşleşmiyorsa reddeder ve reddedilen bir
+        # ÜST satırın ALTINDAKİLERİ hiç değerlendirmez. Yani "TKOFF" yazıldığında
+        # parametre ağaçta VAR olsa bile, kategori adı eşleşmediği için çocuk
+        # satırlar süzgece hiç girmiyordu — arama kutusu pratikte yalnızca
+        # kategori adlarında çalışıyordu.
+        # Özyinelemeli süzgeç: alt satırlardan biri eşleşirse ÜST satır da kabul
+        # edilir, böylece parametre kendi kategorisiyle birlikte görünür.
+        self._proxy_model.setRecursiveFilteringEnabled(True)
 
         self._tree = QTreeView()
         self._tree.setModel(self._proxy_model)
@@ -329,6 +369,15 @@ class AdvancedView(QWidget):
 
     def _on_search(self, text: str) -> None:
         self._proxy_model.setFilterFixedString(text)
+        # NEDEN: özyinelemeli süzgeç eşleşen çocuğun KATEGORİSİNİ gösterir ama
+        # kategori KAPALI geldiği için operatör yine parametreyi göremiyordu
+        # ("var olsa bile bulamıyorum" şikâyetinin ikinci yarısı). Arama
+        # etkinken ağaç açılır, arama temizlenince eski toplu görünüme döner.
+        if text.strip():
+            self._tree.expandAll()
+        else:
+            self._tree.collapseAll()
+        self._update_param_status()
 
     def _on_refresh_params(self) -> None:
         """Parametre listesini talep eder — kanal yoksa açıkça söyler."""
@@ -442,6 +491,76 @@ class AdvancedView(QWidget):
         self._param_model.appendRow([cat_item])
         return cat_item
 
+    @pyqtSlot(int, int)
+    def on_param_progress(self, index: int, count: int) -> None:
+        """Worker'ın `param_ilerleme(param_index, param_count)` sinyali.
+
+        Yalnız SAYAR — hiçbir istek göndermez, hiçbir satırı değiştirmez.
+        Eksik tamamlama operatörün açık isteğiyle (`Eksikleri İste`) çalışır;
+        RFD900A linkinde kendiliğinden başlayan bir tamamlama turu, süren
+        indirmeyi boğabilirdi.
+        """
+        if count > 0:
+            self._param_total = int(count)
+        if index >= 0:
+            self._param_seen.add(int(index))
+        self._update_param_status()
+
+    def _eksik_indeksler(self) -> list[int]:
+        """FC toplam bildirdiyse gelmeyen sıra numaraları; bildirmediyse boş."""
+        if self._param_total <= 0:
+            return []
+        return [i for i in range(self._param_total) if i not in self._param_seen]
+
+    def _update_param_status(self) -> None:
+        if not hasattr(self, "_param_status"):
+            return
+        alinan = len(self._param_cache)
+        if self._param_total <= 0:
+            self._param_status.setText(
+                f"{alinan} parametre alındı — FC toplam sayıyı henüz bildirmedi."
+            )
+            self._btn_eksik.setEnabled(False)
+        else:
+            eksik = self._eksik_indeksler()
+            if eksik:
+                self._param_status.setText(
+                    f"{alinan} / {self._param_total} alındı — <b>{len(eksik)} EKSİK</b>. "
+                    f"Aradığın parametre listede yoksa önce “Eksikleri İste”ye bas."
+                )
+            else:
+                self._param_status.setText(
+                    f"{alinan} / {self._param_total} alındı — liste TAM."
+                )
+            self._btn_eksik.setEnabled(bool(eksik))
+        # Süzgeç etkinse kaç satır göründüğünü de söyle (aramanın gerçekten
+        # çalıştığını operatörün görmesi için).
+        _ara = self._search_box.text().strip() if hasattr(self, "_search_box") else ""
+        if _ara:
+            _gorunen = 0
+            for r in range(self._proxy_model.rowCount()):
+                _gorunen += self._proxy_model.rowCount(self._proxy_model.index(r, 0))
+            self._param_status.setText(
+                self._param_status.text() + f"  ·  “{_ara}” için {_gorunen} eşleşme."
+            )
+
+    def _on_request_missing(self) -> None:
+        eksik = self._eksik_indeksler()
+        if not eksik:
+            return
+        if not self._signal_connected(self.request_param_index):
+            QMessageBox.warning(
+                self, "Bağlantı Yok",
+                "Eksik parametreler istenemedi: komut kanalı bağlı değil."
+            )
+            return
+        for i in eksik:
+            self.request_param_index.emit(int(i))
+        self._param_status.setText(
+            f"{len(eksik)} eksik parametre yeniden istendi — yanıtlar geldikçe "
+            f"liste dolacak."
+        )
+
     @pyqtSlot(str, float)
     def update_param(self, name: str, value: float) -> None:
         self._param_cache[name] = value
@@ -460,6 +579,10 @@ class AdvancedView(QWidget):
         name_item.setEditable(False)
         val_item = QStandardItem(f"{value:.6g}")
         cat_item.appendRow([name_item, val_item])
+        self._update_param_status()
+        # Süzgeç açıkken yeni gelen satır kapalı kategori altında gizli kalmasın.
+        if self._search_box.text().strip():
+            self._tree.expandAll()
 
     # ── NTRIP Sekmesi ─────────────────────────────────────────────────────────
     def _ntrip_tab(self) -> QWidget:

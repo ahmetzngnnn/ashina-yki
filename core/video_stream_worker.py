@@ -292,5 +292,16 @@ class VideoStreamWorker(QThread):
 
     def stop(self) -> None:
         self.requestInterruption()
-        if not self.wait(3000):
+        # 2026-09-06 denetimde bulundu: sabit 3000 ms bekleme, MJPEG okuma
+        # soketinin kendi zaman aşımından (_open_timeout, varsayılan 5.0 s)
+        # KISAYDI — kaynak başlık gönderip donarsa `req.read()` temiz bir
+        # şekilde ~5 s'de kendi kendine çıkardı ama biz 3 s'de pes edip
+        # `terminate()` ile thread'i syscall ORTASINDA öldürüyorduk (bu
+        # sınıftaki DİĞER tüm worker'lar sınırlı `wait()` kullanır, yalnız
+        # burası `terminate()`e düşüyordu). Bekleme artık okuma zaman
+        # aşımından payıyla UZUN — temiz çıkışa gerçek bir şans tanınır.
+        _bekleme_ms = max(3000, int(self._open_timeout * 1000) + 1000)
+        if not self.wait(_bekleme_ms):
+            logger.error("VideoStreamWorker %d ms'de temiz kapanmadı — "
+                        "terminate() son çare olarak kullanılıyor", _bekleme_ms)
             self.terminate()

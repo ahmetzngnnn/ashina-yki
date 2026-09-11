@@ -343,5 +343,11 @@ class AISocketWorker(QThread):
         self._enqueue({"action": "abort_test"}, high_priority=True)
 
     def stop(self) -> None:
+        # SÜRESİZ wait() KALDIRILDI (2026-09-06 denetimde bulundu — aynı
+        # sınıf hata `ntrip_worker.py`'de 2026-09-03'te bulunup düzeltilmişti,
+        # bu dosya o taramadan kaçmış). `closeEvent()` (GUI thread) burayı
+        # çağırır; companion yavaş/yanıt vermezse (izole testle 19.53 s
+        # bloke olduğu doğrulandı) TÜM YKİ arayüzü donuyordu. Kardeş
+        # worker'ların "donmuşsa devam et" bandıyla aynı: 5000 ms.
         self.requestInterruption()
-        self.wait()
+        self.wait(5000)
