@@ -647,6 +647,7 @@ from core.route_math import (  # noqa: F401
     _haversine, _bearing, _offset_point, _gen_lemniscate_pts, _gen_dubins_pts, compute_optimal_turn_radius, compute_ideal_cruise, build_infinity_route, infinity_to_qgc_wpl, _estimate_battery,
     _gen_papyon_pts, compute_papyon_params, gen_coverage_path, swath_width_m,
     compute_scanline, pole_clear_route, segment_pole_dist_m,
+    _ll_to_local, _local_to_ll,
 )
 
 # ── Temel Görev Sekmesi ───────────────────────────────────────────────────────
@@ -2366,6 +2367,30 @@ class TargetDropMissionTab(_BaseMissionTab):
     self._auto_cb = QCheckBox("Otonom Bırakma (Tespit → Anında Bırak)")
     self._auto_cb.setChecked(True)
     lay.addWidget(self._auto_cb)
+    # NEDEN (2026-09-12, operatör kararı — hız önceliği, riski bilerek kabul
+    # etti): companion tarafında blind_drop_enable eklendi (tuning.py NEDEN'i)
+    # — GATE_RUN (Direk1→Direk2) biter bitmez tarama/hizalama/kimlik
+    # doğrulamaya HİÇ girmeden iki yükü sırayla bırakır, doğrudan iniş
+    # noktasına gider. Varsayılan KAPALI, işaretlenmezse davranış AYNEN
+    # eskisi (tarama+hizalama+kimlik kapısı).
+    self._blind_drop_cb = QCheckBox(
+        "⚡ KÖR BIRAKMA — hedef ARANMAZ, direk turu biter bitmez iki yük "
+        "sırayla bırakılır, doğrudan iniş (0 puan riski — şartname kör "
+        "bırakmayı saymıyor)")
+    lay.addWidget(self._blind_drop_cb)
+    # NEDEN (2026-09-12, operatör kararı — AYNI tur): kör bırakma rotasını
+    # companion'ın GUIDED/Python state machine'i YERİNE ArduCopter'ın kendi
+    # AUTO mission yürütücüsüyle uçurma isteği — "GUIDED'a al, ARM et,
+    # TAKEOFF ver, sonra AUTO'ya al, drone uçsun". Servo tetikleme de mission
+    # İÇİNE (MAV_CMD_DO_SET_SERVO) gömülüyor; FC, companion'ın hiçbir
+    # müdahalesi olmadan mission sırasına göre servoyu KENDİSİ tetikler —
+    # üstteki KÖR BIRAKMA'dan bile daha az denetimli. Yalnız üstteki
+    # işaretliyken anlamlı (companion tarafında AND ile kontrol edilir).
+    # Varsayılan KAPALI.
+    self._blind_drop_auto_cb = QCheckBox(
+        "🛩 OTOPİLOT (AUTO) İLE UÇUR — rota+bırakma+iniş FC'nin kendi "
+        "mission yürütücüsünde, companion müdahale edemez")
+    lay.addWidget(self._blind_drop_auto_cb)
     self._bonus_cb = QCheckBox("Bonus Görev 3: Yükü yerden al → ikinci hedefe taşı")
     lay.addWidget(self._bonus_cb)
 
@@ -2581,16 +2606,17 @@ class TargetDropMissionTab(_BaseMissionTab):
       "  k > 1 → ERKEN iniş (yolun başında hızlı alçalır)\n"
       "  k = 1 → doğrusal (kalan mesafeyle orantılı)\n"
       "  k < 1 → GEÇ iniş (irtifayı korur, son metrelerde iner)")
-    self._ap_fill = _dsb(0.4, 1.0, 0.8, 0.05, "", 2)
+    self._ap_fill = _dsb(0.4, 1.0, 0.97, 0.05, "", 2)  # 2026-09-12: firmware varsayılanıyla HİZALANDI (tuning.py). Panel eski değeri gönderiyor ve firmware düzeltmesini SESSİZCE EZİYORDU.
     self._ap_fill.setToolTip(
       "Hizalama tabanında hedefin kadrajı kaplama oranı.\n"
       "1.0 = hedef kadrajı tam doldurur (en alçak geçerli irtifa).\n"
-      "0.8 = %25 kenar payı — rüzgâr/yalpa ile hedef kenara kaysa da kırpılmaz.")
+      "0.97 = operatör gözlemine göre (kırmızı 1.60 m'de kadraj iyi\n"
+      "doluyor, taşmıyor) — eski 0.8 payı (%25) gereğinden yüksekti.")
     # 2026-08-30: 'Gimbal hedefi kademeli izlesin' kutusu KALDIRILDI —
     # parametresi (approach_gimbal_track) firmware'de ZATEN ölüydü ve
     # gimbal söküldüğü için kavramın kendisi de kalmadı.
 
-    self._ap_floor_red = _dsb(0.0, 20.0, 2.0, 0.5, " m", 1)  # 2026-08-31: firmware varsayılanıyla HİZALANDI (tuning.py). Panel eski değeri gönderiyor ve firmware düzeltmesini SESSİZCE EZİYORDU.
+    self._ap_floor_red = _dsb(0.0, 20.0, 0.0, 0.5, " m", 1)  # 2026-09-12: firmware varsayılanıyla YENİDEN HİZALANDI (tuning.py). Sabit 2.0 m, operatör "kadraja tam sığacak, en düşük irtifa" isteğiyle 0=OTOMATİK'e çekildi (mavi ile aynı desen).
     # kırmızı üçgen çevrel çapı 0.577 m
     self._ap_floor_blue = _dsb(0.0, 20.0, 0.0, 0.5, " m", 1)  # 2026-09-11: firmware varsayılanıyla YENİDEN HİZALANDI (tuning.py, K1 Parça A). 5.0 m, kamera IMX708'e değişip VFOV daraldıktan (51.85°→40.75°) SONRA da sabit kalmıştı; mavi altıgen kadrajın %107.7'sini kaplıyordu (pay NEGATİF). 0=OTOMATİK'e çekildi — bkz. aşağıdaki tooltip, panel bunu zaten destekliyordu.
     # mavi altıgen 2.0 m'ye inince KADRAJDAN TAŞTI (kullanıcı gözlemi)
@@ -3152,6 +3178,82 @@ class TargetDropMissionTab(_BaseMissionTab):
       f"taraf: {'sağ' if sag else 'sol'} (dik yön {perp:.1f}°), "
       f"direk arası {D:.1f} m.{_rota_bilgi}{_tam_bilgi}")
 
+  # Hedef bölgesi tahmini VARSA genel alanı ona göre daraltırken bırakılacak
+  # güvenlik payı (m) — kamera yer izine yakın, keyfi değil: küçük hedefin
+  # (kırmızı üçgen) sınır çizgisine TAM oturması, kadraj kenarında kalan bir
+  # komşu hedefi görev dışına atmasın diye.
+  _DARALTMA_PAY_M = 15.0
+
+  def _hedef_bolgelerine_gore_daralt(self):
+    """Genel tarama alanını (self._wps) MEVCUT SINIRLARI İÇİNDE kalacak
+    şekilde, işaretlenmiş hedef bölgesi tahminlerine (kırmızı+mavi) göre
+    daraltır — alanın kendisini DEĞİŞTİRMEZ, yalnızca köşelerini içe çeker.
+
+    NEDEN (2026-09-12, operatör isteği): "mevcut tarama alanı kalsın, ben
+    işaretlediğim iki hedef bölge tahminine göre sadece köşelerden daraltma
+    yapsın". Güvenlik ağı (İHA'nın TAM KAPLAMA fazı) MEVCUT genel alanın
+    dışına asla ÇIKMAZ — daraltma yalnızca İÇE doğru, hedef bölgelerini
+    (+ pay) kapsayan en küçük dikdörtgene. Direk hattı (P1→P2) eksenine
+    paralel köşeler üretir — `_uret_tarama_alani` ile AYNI yönelim, İHA
+    tarafının `fixed_axis_bearing_deg` beklentisiyle tutarlı kalır (bkz.
+    IHA/missions/task2/geometry.py::generate_coverage_path NEDEN'i — eksen
+    TAHMİN edilirse gürültüye duyarlı "çapraz tarama" arızası geri gelir).
+
+    Hedef bölgesi genel alanın TAMAMEN dışındaysa (geçersiz daraltma)
+    genel alana DOKUNMAZ — sessizce hiçbir şey yapmaz, güvenli tarafta kalır.
+    """
+    if not self._pole1 or not self._pole2 or len(self._wps) < 3:
+      return
+    hedef_pts = list(self._red_area_wps) + list(self._blue_area_wps)
+    if not hedef_pts:
+      return
+
+    p1, p2 = self._pole1, self._pole2
+    brg = _bearing(p1["lat"], p1["lon"], p2["lat"], p2["lon"])
+    rad = math.radians(brg)
+    ref_lat, ref_lon = p1["lat"], p1["lon"]
+
+    def to_uv(lat, lon):
+      x, y = _ll_to_local(lat, lon, ref_lat, ref_lon)   # x=Doğu, y=Kuzey (m)
+      u = x * math.sin(rad) + y * math.cos(rad)          # Direk hattı ekseni
+      v = x * math.cos(rad) - y * math.sin(rad)          # dik eksen
+      return u, v
+
+    def to_ll(u, v):
+      x = u * math.sin(rad) + v * math.cos(rad)
+      y = u * math.cos(rad) - v * math.sin(rad)
+      return _local_to_ll(x, y, ref_lat, ref_lon)
+
+    genel_uv = [to_uv(w["lat"], w["lon"]) for w in self._wps]
+    g_umin = min(p[0] for p in genel_uv); g_umax = max(p[0] for p in genel_uv)
+    g_vmin = min(p[1] for p in genel_uv); g_vmax = max(p[1] for p in genel_uv)
+
+    hedef_uv = [to_uv(w["lat"], w["lon"]) for w in hedef_pts]
+    h_umin = min(p[0] for p in hedef_uv); h_umax = max(p[0] for p in hedef_uv)
+    h_vmin = min(p[1] for p in hedef_uv); h_vmax = max(p[1] for p in hedef_uv)
+
+    pay = self._DARALTMA_PAY_M
+    yeni_umin = max(g_umin, h_umin - pay)
+    yeni_umax = min(g_umax, h_umax + pay)
+    yeni_vmin = max(g_vmin, h_vmin - pay)
+    yeni_vmax = min(g_vmax, h_vmax + pay)
+    if yeni_umin >= yeni_umax or yeni_vmin >= yeni_vmax:
+      return  # geçersiz (hedef bölgesi genel alanın dışında) — dokunma
+
+    kose_uv = [(yeni_umin, yeni_vmin), (yeni_umax, yeni_vmin),
+               (yeni_umax, yeni_vmax), (yeni_umin, yeni_vmax)]
+    # NEDEN alt/idx (2026-09-12 hata düzeltmesi): _refresh_map/_refresh_table
+    # BÜTÜN wp'lerde "alt" ve "idx" anahtarlarını KOŞULSUZ okur (bkz. _add_wp,
+    # satır ~1453). Bu alanlar eksik bırakılınca "Görev Gönder" tam bu
+    # fonksiyonu çağırdığı anda KeyError: 'alt' ile PATLIYORDU (görev hiç
+    # başlamıyordu) — alt, _add_wp'nin KULLANDIĞI AYNI kuralla belirleniyor.
+    alt = self._alt_spin.value() if self._uni_cb.isChecked() else 30.0
+    self._wps = [{"lat": la, "lon": lo, "alt": alt, "type": "WAYPOINT", "idx": i}
+                 for i, (la, lo) in enumerate(to_ll(u, v) for u, v in kose_uv)]
+    self._alan_otomatikti = True
+    self._refresh_map()
+    self._refresh_table()
+
   # Direk 2'nin kapı-geçiş uzatma payı ve bitiş bacağının direk-kaçınma
   # payı: İHA'nın Task2Tuning VARSAYILANLARI (gate_pole2_round_margin_m,
   # return_pole_clear_m). YKİ paneli bu ikisi için widget GÖNDERMİYOR —
@@ -3296,17 +3398,16 @@ class TargetDropMissionTab(_BaseMissionTab):
     else:
       super()._add_wp(lat, lon)
 
-  def _on_send(self):
-    # Tarama alanı bir poligon olmalı → en az 3 köşe (waypoint)
-    if len(self._wps) < 3:
-      QMessageBox.warning(
-        self, "Görev",
-        "Tarama alanı için en az 3 köşe (waypoint) gereklidir.\n"
-        "Kalkış noktası araçtan otomatik alınır; siz yalnızca tarama "
-        "bölgesinin köşelerini işaretleyin."
-      )
-      return
+  def _blind_drop_release_value(self) -> float:
+    """Kör bırakma (AUTO) mission'ında yük bırakma servoları eklensin mi.
 
+    Varsayılan AÇIK (1.0) — normal Görev 2 sekmesinde kör bırakma açılırsa
+    eskisi gibi iki yük de bırakılır. FinalMissionTab bunu KAPALI (0.0)
+    override eder — 2026-09-13 operatör kararı: "bırakma yapmayacağız."
+    """
+    return 1.0
+
+  def _on_send(self):
     if self._home_lat is None or self._home_lon is None:
       QMessageBox.warning(
         self, "Görev",
@@ -3328,6 +3429,31 @@ class TargetDropMissionTab(_BaseMissionTab):
         "Şartname s.1737-1738: hedef tespiti 2. direği dışarıdan almadan "
         "yapılamaz — direk koordinatları zorunludur.\n\n"
         "Haritada 'Direk 1' / 'Direk 2' seçerek noktalara tıklayın."
+      )
+      return
+
+    # ── TARAMA ALANI: MEVCUTSA KORU, YOKSA OTOMATİK ÜRET, SONRA HEDEF
+    # BÖLGELERİNE GÖRE DARALT (2026-09-12, operatör isteği) ────────────────
+    # NEDEN sıra bu şekilde: "mevcut tarama alanı kalsın, ben işaretlediğim
+    # iki hedef bölge tahminine göre sadece köşelerden daraltma yapsın,
+    # sonra görev gönder dediğimde başka bir şey sormasın." Elle çizilmiş
+    # bir alan varsa (self._wps zaten dolu) ona DOKUNULMAZ — yalnızca
+    # daraltılır. Hiç yoksa Direk hattından (mevcut _area_inset/near/far/
+    # side ayarlarıyla, "standart" alan) sessizce üretilir; operatöre soru
+    # sorulmaz (sessiz=True). Daraltma hedef bölgesi yoksa hiçbir şey
+    # yapmaz — eski davranış (elle çizilmiş/üretilmiş alan aynen gönderilir)
+    # BİREBİR korunur.
+    if len(self._wps) < 3:
+      self._uret_tarama_alani(sessiz=True)
+    self._hedef_bolgelerine_gore_daralt()
+
+    # Otomatik üretim de (Direk'ler geçersiz/çakışık girildiyse) başarısız
+    # kalabilir — bu GÜVENLİK AĞI olarak kalır, normal şartlarda tetiklenmez.
+    if len(self._wps) < 3:
+      QMessageBox.warning(
+        self, "Görev",
+        "Tarama alanı üretilemedi (Direk koordinatlarını kontrol edin).\n"
+        "Haritada tarama bölgesinin köşelerini elle de işaretleyebilirsiniz."
       )
       return
 
@@ -3410,6 +3536,9 @@ class TargetDropMissionTab(_BaseMissionTab):
       # Mod
       "autonomous_drop":     self._auto_cb.isChecked(),
       "bonus_mission":       self._bonus_cb.isChecked(),
+      "blind_drop_enable":   (1.0 if self._blind_drop_cb.isChecked() else 0.0),
+      "blind_drop_auto_mode_enable": (1.0 if self._blind_drop_auto_cb.isChecked() else 0.0),
+      "blind_drop_release_enable": self._blind_drop_release_value(),
       # Donanım
       "gpio_pins": {
           "drop1": self._pin_drop1.value(),
@@ -3500,15 +3629,14 @@ class TargetDropMissionTab(_BaseMissionTab):
         _eksik.append(f"{_ad} ({len(_lst)} köşe)")
         continue
       _bolgeler[_renk] = list(_lst)
-    if _eksik:
-      QMessageBox.warning(
-        self, "Tahmini Hedef Bölgesi Eksik",
-        "Şu bölge(ler) için 3'ten az köşe işaretlendi ve GÖNDERİLMEYECEK:\n  "
-        + ", ".join(_eksik) +
-        "\n\nYa en az 3 köşe işaretleyin ya da işaretleri temizleyin. "
-        "Bölge gönderilmezse o renk için TÜM ALAN taranır (görev yine çalışır, "
-        "yalnızca daha uzun sürer)."
-      )
+    # NEDEN popup YOK (2026-09-12, operatör isteği — "görev gönder dediğimde
+    # başka bir şey sormasın"): eksik bölge ENGELLEYİCİ değildi zaten (o renk
+    # için tüm alan taranır, görev yine çalışır) — sadece bilgilendirme
+    # amaçlıydı. Artık sessizce log'a yazılıyor, gönderimi KESMİYOR/DURDURMUYOR.
+    if _eksik and hasattr(self, "_log_view_hata"):
+      self._log_view_hata(
+        "Tahmini hedef bölgesi eksik (3'ten az köşe), tüm alan taranacak: "
+        + ", ".join(_eksik))
     if _bolgeler:
       params["target_areas"] = _bolgeler
 
@@ -3535,6 +3663,67 @@ class TargetDropMissionTab(_BaseMissionTab):
       self.target_detected.emit(resp)
     elif status == "ok":
       logger.debug("Companion görev yanıtı: %s", resp)
+
+
+# ── Sekme: Final Görev — Direk2 dönüşü + otopilot ile en hızlı iniş ────────
+class FinalMissionTab(TargetDropMissionTab):
+  """Final Görev (2026-09-12, operatör kararı — kalıcı/varsayılan hızlı mod).
+
+  Tarama/hedef arama YOK. Direk2'yi (GATE_RUN ile AYNI round-margin/side-
+  offset mantığıyla) dönüp, doğrudan iniş noktasına giden rota TAMAMEN
+  ArduCopter'ın kendi AUTO mission yürütücüsünde uçulur — companion yalnızca
+  GUIDED/ARM/TAKEOFF'u yapar, sonra AUTO'ya geçip FC'nin kendi (WPNAV'a
+  göre) en iyi hızına bırakır. Operatörün tarifi: "araç guided arm takeoff
+  auto yapsın land yapsın, otopilotun yapacağı en iyi hız ile".
+
+  2026-09-13 GÜNCELLEMESİ (operatör: "bırakma yapmayacağız, o olmayacak"):
+  YÜK BIRAKMA KALDIRILDI — bu sekme artık SADECE rotayı (kalkış→Direk2
+  dolaşma→iniş) en hızlı şekilde uçurur, servo TETİKLENMEZ. Operatör bu
+  sekmede yalnız İniş Noktası'nı seçip "Görev Gönder" der, sonra yardımcı
+  PC'den "Görev Başlat"a basar.
+
+  NEDEN TargetDropMissionTab'DAN MİRAS (yeniden yazmak yerine): mission
+  gönderim mantığı (_on_send — direkler zorunlu kapısı, tarama alanı
+  otomatik üretimi, home kontrolü, tüm parametre eşlemesi) zaten doğru ve
+  test edilmiş; bu sekmenin TEK farkı blind_drop_enable/blind_drop_auto_
+  mode_enable'ın HER ZAMAN açık ve KİLİTLİ, blind_drop_release_enable'ın
+  HER ZAMAN KAPALI olması — operatör bu sekmede bunları değiştiremez,
+  sekmenin var oluş amacı bu. companion tarafında blind_drop_enable/
+  blind_drop_auto_mode_enable açıkken tarama/vizyon/kimlik doğrulama akışının
+  TAMAMI zaten atlanıyor (bkz. teknofest_task2.py::run(), blind_drop_enable
+  NEDEN'i) — miras alınan tarama-alanı otomatik üretimi mission'a eklense de
+  İHA tarafında hiç okunmaz, zararsız.
+
+  Kendi PROFİL grubunu appdata'da ayrı tutar (_profile_key = sınıf adı) —
+  TargetDropMissionTab'ın profilleriyle karışmaz.
+  """
+
+  def _blind_drop_release_value(self) -> float:
+    return 0.0
+
+  def _build_specific_controls(self):
+    super()._build_specific_controls()
+    _uyari = QLabel(
+        "🏁 <b>FİNAL GÖREV</b> — hedef ARANMAZ, YÜK BIRAKILMAZ. Direk 2 "
+        "dönülür dönülmez (GATE_RUN bitince) ArduCopter'ın kendi OTOPİLOT "
+        "(AUTO) modunda, en hızlı şekilde doğrudan iniş noktasına gidilip "
+        "iniş yapılır. Bu sekmede yalnızca Direk 1/2 ve İniş Noktası'nı "
+        "işaretleyip \"Görev Gönder\"e basmanız yeterli — tarama/hedef/"
+        "vizyon ayarları bu modda kullanılmaz.")
+    _uyari.setWordWrap(True)
+    _uyari.setObjectName("mutedLabel")
+    self._right_lay.insertWidget(0, _uyari)
+
+  def _apply_tab_constraints(self):
+    super()._apply_tab_constraints()
+    for _cb in (self._blind_drop_cb, self._blind_drop_auto_cb):
+      _cb.setChecked(True)
+      _cb.setEnabled(False)
+    self._blind_drop_cb.setToolTip(
+        "Final Görev'de her zaman AÇIK — bu sekmenin tanımı budur.")
+    self._blind_drop_auto_cb.setToolTip(
+        "Final Görev'de her zaman AÇIK — rota+iniş FC'nin AUTO mission "
+        "yürütücüsünde, en hızlı otopilot rotası. Yük bırakılmaz.")
 
 
 # ── Sekme 6: Sonsuz () Uçuş — TÜBİTAK Görev 1 ──────────────────────────────
@@ -4527,13 +4716,15 @@ class MissionPanelView(QWidget):
 
     self._target_drop_tab = TargetDropMissionTab()
     self._infinity_tab  = InfinityMissionTab()
+    self._final_tab    = FinalMissionTab()
 
     self._tabs.addTab(self._target_drop_tab, " Görev 2 — Hedef")
     self._tabs.addTab(self._infinity_tab,  " Görev 1 — Sonsuz")
+    self._tabs.addTab(self._final_tab,    "🏁 Final Görev")
 
     lay.addWidget(self._tabs)
 
-    _all_tabs = (self._target_drop_tab, self._infinity_tab)
+    _all_tabs = (self._target_drop_tab, self._infinity_tab, self._final_tab)
 
     for tab in _all_tabs:
       tab.mission_ready_to_send.connect(self.mission_ready_to_send)
@@ -4555,7 +4746,7 @@ class MissionPanelView(QWidget):
 
   @pyqtSlot(dict)
   def update_telemetry(self, data: dict):
-    for tab in (self._target_drop_tab, self._infinity_tab):
+    for tab in (self._target_drop_tab, self._infinity_tab, self._final_tab):
       tab.update_telemetry(data)
 
   @pyqtSlot(float, float, float)
@@ -4567,7 +4758,7 @@ class MissionPanelView(QWidget):
     doğru olmalı — operatör görev sekmesini açmadan önce araç kalkmış
     olabilir. Bu yuva doğrudan worker sinyaline bağlıdır, sekmeden bağımsız.
     """
-    for tab in (self._target_drop_tab, self._infinity_tab):
+    for tab in (self._target_drop_tab, self._infinity_tab, self._final_tab):
       try:
         tab.on_home_position(lat, lon, alt)
       except Exception:
@@ -4580,7 +4771,7 @@ class MissionPanelView(QWidget):
 
   # ── Görev kronometresi köprüsü (bkz. _BaseMissionTab kronometre bloğu) ────
   def _clock_tabs(self):
-    return (self._target_drop_tab, self._infinity_tab)
+    return (self._target_drop_tab, self._infinity_tab, self._final_tab)
 
   @pyqtSlot()
   def notify_mission_started(self) -> None:
